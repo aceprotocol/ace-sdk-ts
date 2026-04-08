@@ -1,0 +1,46 @@
+export {
+  // Types
+  type ACEIdentity,
+  type SigningScheme,
+  type IdentityTier,
+  type HardwareBacking,
+  type RegistrationFile,
+  type SigningConfig,
+  type Capability,
+  type PricingInfo,
+  type ChainInfo,
+  type AgentProfile,
+  type ProfilePricing,
+  type DiscoverQuery,
+  type DiscoverAgent,
+  type DiscoverResult,
+  type ACEMessage,
+  type MessageType,
+  type EncryptionEnvelope,
+  type SignatureEnvelope,
+  type RfqBody,
+  type OfferBody,
+  type AcceptBody,
+  type RejectBody,
+  type InvoiceBody,
+  type ReceiptBody,
+  type DeliverBody,
+  type ConfirmBody,
+  type InfoBody,
+  type TextBody,
+  // Type guards
+  isEconomicType,
+  isSystemType,
+  isSocialType,
+  ECONOMIC_TYPES,
+  SYSTEM_TYPES,
+  SOCIAL_TYPES,
+} from './types.js';
+
+export { SoftwareIdentity, type SoftwareIdentityExport, type SoftwareIdentityBinaryExport, computeACEId, toBase64, fromBase64, secp256k1Address } from './identity.js';
+export { computeConversationId, encrypt, decrypt, getACEDHSalt, MAX_PAYLOAD_SIZE, MAX_PLAINTEXT_SIZE } from './encryption.js';
+export { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
+export { createMessage, parseMessage, parseMessageFromRegistration, validateBody, type CreateMessageOptions, type ParsedMessage, type ParseMessageOptions, type ParseMessageFromRegistrationOptions } from './messages.js';
+export { validateRegistrationFile, validateACEId, verifyRegistrationId, fetchRegistrationFile, getRegistrationSigningPublicKey, getRegistrationEncryptionPublicKey, validateProfile, type FetchRegistrationFileOptions } from './discovery.js';
+export { checkTimestampFreshness, validateMessageId, ReplayDetector } from './security.js';
+export { ThreadStateMachine, InvalidTransitionError, validateThreadId, type ThreadState, type ThreadSnapshot } from './state-machine.js';

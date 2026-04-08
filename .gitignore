@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+
+# Secrets & key material
+.env
+.env.*
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+identity-export.json
+.idea/
