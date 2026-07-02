@@ -1,6 +1,7 @@
 import bs58 from 'bs58';
-import type { AgentProfile, RegistrationFile } from './types.js';
+import type { AgentProfile, RegistrationFile, SigningScheme } from './types.js';
 import { computeACEId, fromBase64, secp256k1Address } from './identity.js';
+import { buildSignData, encodePayload, verifySignature, decodeSignature } from './signing.js';
 import { constantTimeEqual, CONTROL_CHAR_PATTERN } from './utils.js';
 
 const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
@@ -137,6 +138,111 @@ export function getRegistrationSigningPublicKey(reg: RegistrationFile): Uint8Arr
  */
 export function getRegistrationEncryptionPublicKey(reg: RegistrationFile): Uint8Array {
   return fromBase64(reg.signing.encryptionPublicKey);
+}
+
+// === Encryption-key binding (relay-sourced peer keys) ===
+//
+// `aceId` self-certifies only the SIGNING key (aceId === sha256(signingKey)). The
+// X25519 ENCRYPTION key is separate — on its own it is an unauthenticated claim.
+// A relay routes ciphertext and is untrusted by design, so it could hand a client
+// its own X25519 key and read messages the client believes are end-to-end
+// encrypted. The binding below is the proof that closes that gap: the exact
+// signature the relay already requires at registration, verifiable with nothing
+// but the identity's own signing key.
+
+/** Shape of a `GET /v1/peer` response or a `/v1/discover` agent entry. */
+export interface RelayPeerResponse {
+  aceId: string;
+  scheme: SigningScheme;
+  encryptionPublicKey: string;
+  signingPublicKey: string;
+  registrationSignature?: string;
+  registeredAt?: number;
+}
+
+/** A peer's public keys AFTER the identity + encryption-key binding are verified. */
+export interface VerifiedPeer {
+  aceId: string;
+  scheme: SigningScheme;
+  signingPublicKey: Uint8Array;
+  encryptionPublicKey: Uint8Array;
+}
+
+/**
+ * Verify that `encryptionPublicKey` was authorized by `aceId`.
+ *
+ * The binding is identical to what `POST /v1/register` signs:
+ *   buildSignData('register', aceId, timestamp,
+ *                 encodePayload(encryptionPublicKey, signingPublicKey))
+ * signed by the identity's signing key. This also re-checks
+ * `aceId === sha256(signingPublicKey)`, so `true` means: this exact X25519 key was
+ * signed by the key that defines this identity.
+ *
+ * `encryptionPublicKey` / `signingPublicKey` MUST be the Base64 wire strings (the
+ * signature commits to those strings). Returns `false` on any malformed input.
+ */
+export function verifyEncryptionKeyBinding(
+  aceId: string,
+  scheme: SigningScheme,
+  encryptionPublicKey: string,
+  signingPublicKey: string,
+  timestamp: number,
+  signature: string,
+): boolean {
+  if (scheme !== 'ed25519' && scheme !== 'secp256k1') return false;
+  if (!Number.isInteger(timestamp)) return false;
+  try {
+    const signingPubBytes = fromBase64(signingPublicKey);
+    // The signing key must be the one that defines this identity.
+    if (computeACEId(signingPubBytes) !== aceId) return false;
+    const payload = encodePayload(encryptionPublicKey, signingPublicKey);
+    const signData = buildSignData('register', aceId, timestamp, payload);
+    const sigBytes = decodeSignature(signature, scheme);
+    return verifySignature(signData, sigBytes, scheme, signingPubBytes);
+  } catch {
+    // Malformed key/signature bytes → treat as failed verification.
+    return false;
+  }
+}
+
+/**
+ * Build a {@link VerifiedPeer} from a relay `GET /v1/peer` or `/v1/discover` entry.
+ *
+ * Throws if the binding signature is absent or fails — a relay that substitutes an
+ * X25519 key cannot produce a passing binding, so a VerifiedPeer can only be
+ * obtained for a genuine key. Use its keys with {@link parseMessageFromPeer}.
+ */
+export function verifyPeerResponse(data: RelayPeerResponse): VerifiedPeer {
+  const { aceId, scheme, encryptionPublicKey, signingPublicKey, registrationSignature, registeredAt } = data;
+
+  if (typeof aceId !== 'string' || !validateACEId(aceId)) {
+    throw new Error(`Invalid peer aceId: '${String(aceId).slice(0, 80)}'`);
+  }
+  if (scheme !== 'ed25519' && scheme !== 'secp256k1') {
+    throw new Error(`Unsupported peer signing scheme: '${String(scheme).slice(0, 32)}'`);
+  }
+  if (typeof encryptionPublicKey !== 'string' || typeof signingPublicKey !== 'string') {
+    throw new Error('Peer response signingPublicKey/encryptionPublicKey must be strings');
+  }
+  if (registrationSignature === undefined || registeredAt === undefined) {
+    throw new Error(
+      'Peer response is missing the encryption-key binding (registrationSignature/registeredAt); ' +
+      'its encryptionPublicKey cannot be trusted. Without the binding a relay could substitute ' +
+      'its own X25519 key and read messages meant to be end-to-end encrypted.',
+    );
+  }
+  if (!verifyEncryptionKeyBinding(aceId, scheme, encryptionPublicKey, signingPublicKey, registeredAt, registrationSignature)) {
+    throw new Error(
+      'Peer encryption-key binding failed verification: the encryptionPublicKey is not signed by ' +
+      "this identity's signing key (possible key substitution / relay MITM).",
+    );
+  }
+  return {
+    aceId,
+    scheme,
+    signingPublicKey: fromBase64(signingPublicKey),
+    encryptionPublicKey: fromBase64(encryptionPublicKey),
+  };
 }
 
 const TAG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
@@ -367,6 +473,9 @@ export async function fetchRegistrationFile(
     response = await fetch(url, {
       headers: { Accept: 'application/json' },
       signal: controller.signal,
+      // Never follow redirects — a redirect target would bypass the SSRF host
+      // check above (e.g. 302 to http://169.254.169.254). fetch throws on 3xx.
+      redirect: 'error',
     });
   } catch (e) {
     if (e instanceof Error && e.name === 'AbortError') {

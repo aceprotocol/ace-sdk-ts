@@ -35,6 +35,7 @@ interface Vectors {
         conversationId: string;
         messageId: string;
         threadId: string;
+        ephemeralPubKey: string;
         ciphertext: string;
       };
       signDataHex: string;
@@ -109,6 +110,7 @@ describe('Cross-Language Interop Vectors (V1)', () => {
 
     const messagePayload = encodePayload(
       mp.type, mp.to, mp.conversationId, mp.messageId, mp.threadId,
+      fromBase64(mp.ephemeralPubKey),
       fromBase64(mp.ciphertext),
     );
     const signData = buildSignData(sd.action, sd.aceId, sd.timestamp, messagePayload);

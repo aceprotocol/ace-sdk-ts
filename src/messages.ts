@@ -11,6 +11,7 @@ import {
   verifyRegistrationId,
   getRegistrationSigningPublicKey,
   getRegistrationEncryptionPublicKey,
+  type VerifiedPeer,
 } from './discovery.js';
 import { ThreadStateMachine } from './state-machine.js';
 
@@ -67,9 +68,17 @@ function buildSignedMessagePayload(
   conversationId: string,
   messageId: string,
   threadId: string | undefined,
+  ephemeralPubKey: Uint8Array,
   payload: Uint8Array,
 ): Uint8Array {
-  return encodePayload(type, to, conversationId, messageId, normalizeThreadId(threadId), payload);
+  // ephemeralPubKey is signed too: it is what the recipient uses to derive the
+  // decryption key, so it is part of the sender's commitment. Omitting it would
+  // let a relay swap the ephemeral key (garbling the message) without breaking
+  // the signature.
+  return encodePayload(
+    type, to, conversationId, messageId, normalizeThreadId(threadId),
+    ephemeralPubKey, payload,
+  );
 }
 
 // === Schema Validation ===
@@ -321,6 +330,7 @@ export async function createMessage(
     conversationId,
     messageId,
     opts.threadId,
+    ephemeralPubKey,
     payload,
   );
   const signData = buildSignData('message', fromId, timestamp, messagePayload);
@@ -457,12 +467,14 @@ export async function parseMessage(
     );
   }
   const payloadBytes = fromBase64(msg.encryption.payload);
+  const ephemeralPubKey = fromBase64(msg.encryption.ephemeralPubKey);
   const messagePayload = buildSignedMessagePayload(
     msg.type,
     msg.to,
     msg.conversationId,
     msg.messageId,
     msg.threadId,
+    ephemeralPubKey,
     payloadBytes,
   );
   const signData = buildSignData('message', msg.from, msg.timestamp, messagePayload);
@@ -486,8 +498,8 @@ export async function parseMessage(
     throw new Error('Signature verification failed');
   }
 
-  // 5. Decrypt body via identity's decrypt method (pipeline step 5)
-  const ephemeralPubKey = fromBase64(msg.encryption.ephemeralPubKey);
+  // 5. Decrypt body via identity's decrypt method (pipeline step 5) —
+  // ephemeralPubKey was decoded and signature-verified above.
   let decrypted: Uint8Array;
   try {
     decrypted = await receiver.decrypt(
@@ -562,4 +574,25 @@ export async function parseMessageFromRegistration(
       senderEncryptionPubKey: getRegistrationEncryptionPublicKey(senderRegistration),
     },
   );
+}
+
+/**
+ * Safe path for messages whose sender keys came from a relay.
+ *
+ * `sender` must be a {@link VerifiedPeer} — obtainable only after its encryption-key
+ * binding was verified — so the recipient never trusts a relay-substituted X25519
+ * key. `conversationId` is recomputed from the verified keys and must match.
+ */
+export async function parseMessageFromPeer(
+  msg: ACEMessage,
+  receiver: ACEIdentity,
+  sender: VerifiedPeer,
+  opts: ParseMessageFromRegistrationOptions,
+): Promise<ParsedMessage> {
+  return parseMessage(msg, receiver, sender.signingPublicKey, {
+    stateMachine: opts.stateMachine,
+    expectedScheme: sender.scheme,
+    replayDetector: opts.replayDetector,
+    senderEncryptionPubKey: sender.encryptionPublicKey,
+  });
 }

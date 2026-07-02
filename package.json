@@ -1,6 +1,6 @@
 {
   "name": "@ace-protocol/sdk",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "description": "ACE Protocol SDK — Agent Commerce Engine for agent-to-agent commerce messaging",
   "type": "module",
   "main": "dist/index.js",

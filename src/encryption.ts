@@ -77,6 +77,20 @@ function validatePublicKey(pubKey: Uint8Array): void {
 }
 
 /**
+ * Root safeguard against small-order public keys. X25519 clamps the private
+ * scalar to a multiple of the cofactor, so any low-order input point collapses
+ * the shared secret to all-zeros. Rejecting an all-zero secret therefore catches
+ * every small-subgroup case regardless of the point blocklist above.
+ */
+function rejectDegenerateSharedSecret(sharedSecret: Uint8Array): void {
+  let acc = 0;
+  for (const b of sharedSecret) acc |= b;
+  if (acc === 0) {
+    throw new Error('ECDH produced a degenerate (all-zero) shared secret; refusing to proceed (small-order public key)');
+  }
+}
+
+/**
  * Encrypt plaintext for a recipient.
  * Returns ephemeral public key + encrypted payload (nonce || ciphertext || tag).
  */
@@ -99,6 +113,7 @@ export async function encrypt(
 
   // 2. ECDH shared secret
   const sharedSecret = x25519.getSharedSecret(ephemeralPriv, recipientPubKey);
+  rejectDegenerateSharedSecret(sharedSecret);
 
   // 3. HKDF key derivation
   const convIdBytes = _encoder.encode(conversationId);
@@ -165,6 +180,7 @@ export async function decrypt(
 
   // 1. ECDH shared secret
   const sharedSecret = x25519.getSharedSecret(recipientPrivKey, ephemeralPubKey);
+  rejectDegenerateSharedSecret(sharedSecret);
 
   // 2. HKDF key derivation
   const convIdBytes = _encoder.encode(conversationId);

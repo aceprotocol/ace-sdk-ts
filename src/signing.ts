@@ -10,6 +10,16 @@ const _encoder = new TextEncoder();
 // Unified domain prefix — action field provides domain separation
 const _DOMAIN_PREFIX = _encoder.encode('ace.v1');
 
+// secp256k1 curve order N and N/2 — used to enforce canonical low-S signatures.
+const _SECP256K1_ORDER = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const _SECP256K1_HALF_ORDER = _SECP256K1_ORDER >> 1n;
+
+function _bytesToBigIntBE(bytes: Uint8Array): bigint {
+  let x = 0n;
+  for (const b of bytes) x = (x << 8n) | BigInt(b);
+  return x;
+}
+
 /** Encode a string as length-prefixed bytes: [len(4 BE)] || UTF-8(str) */
 function encodeLengthPrefixed(field: string): Uint8Array[] {
   const bytes = _encoder.encode(field);
@@ -128,6 +138,20 @@ export function verifySignature(
     const v = signature[64];
     if (v !== 0 && v !== 1) {
       return false; // Only recovery bits 0 and 1 are valid for secp256k1
+    }
+
+    // Reject out-of-range and non-canonical (high-S) signatures. ECDSA is
+    // malleable: (r, s) and (r, n - s) recover the same key, so accepting high-S
+    // lets an observer re-mint a valid signature with different bytes and slip
+    // past signature-keyed replay protection. Low-S makes the bytes canonical
+    // (matches how all ACE SDKs sign).
+    const r = _bytesToBigIntBE(signature.slice(0, 32));
+    const s = _bytesToBigIntBE(signature.slice(32, 64));
+    if (r < 1n || r >= _SECP256K1_ORDER) {
+      return false;
+    }
+    if (s < 1n || s > _SECP256K1_HALF_ORDER) {
+      return false;
     }
 
     // Recover public key (signData is already SHA-256 digest from buildSignData)
