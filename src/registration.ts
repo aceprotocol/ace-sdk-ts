@@ -5,14 +5,56 @@ import { ACEError } from './errors.js';
 import { decodeB64, decodeSignature, encodeSignature, isACEId, toBase64, wireInt } from './encoding.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
-  bindingSignData, decodeEncryptionKey, decodeSigningKey, mintPeer, validateProfile, type VerifiedPeer,
+  bindingSignData, decodeEncryptionKey, decodeSigningKey, mintPeer, validateProfile, verifyRegistrationFile,
+  type VerifiedPeer,
 } from './discovery.js';
 import { KEM_PUBLIC_KEY_SIZE, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
-import { buildSignData, computeACEId, encodePayload, verifySignature } from './signing.js';
-import type { ACEIdentity, AgentProfile, RegistrationRequest } from './types.js';
+import { buildSignData, computeACEId, encodePayload, signingAddress, verifySignature } from './signing.js';
+import type {
+  ACEIdentity, AgentProfile, Capability, ChainInfo, HardwareBacking, IdentityTier, RegistrationFile, RegistrationRequest,
+} from './types.js';
 import { isSigningScheme } from './types.js';
 
 const KEEP = Symbol('keep');
+
+/**
+ * Build the registration file (02) of any identity, software or hardware-backed; throws
+ * `invalid_registration` if the inputs are invalid.
+ */
+export function createRegistrationFile(identity: ACEIdentity, opts: {
+  name: string;
+  endpoint: string;
+  description?: string;
+  tier?: IdentityTier;
+  hardwareBacking?: HardwareBacking;
+  capabilities?: Capability[];
+  settlement?: string[];
+  chains?: ChainInfo[];
+}): RegistrationFile {
+  if (typeof opts !== 'object' || opts === null) throw new ACEError('invalid_argument', 'options are required');
+  const scheme = identity.getSigningScheme();
+  const signingPublicKey = identity.getSigningPublicKey();
+  const reg: RegistrationFile = {
+    ace: '1.0',
+    id: identity.getACEId(),
+    name: opts.name,
+    endpoint: opts.endpoint,
+    tier: opts.tier ?? 0,
+    signing: {
+      scheme,
+      address: signingAddress(scheme, signingPublicKey),
+      encryptionPublicKey: toBase64(identity.getEncryptionPublicKey()),
+    },
+  };
+  if (scheme === 'secp256k1') reg.signing.signingPublicKey = toBase64(signingPublicKey);
+  if (opts.description !== undefined) reg.description = opts.description;
+  if (opts.hardwareBacking !== undefined) reg.hardwareBacking = opts.hardwareBacking;
+  if (opts.capabilities !== undefined) reg.capabilities = opts.capabilities;
+  if (opts.settlement !== undefined) reg.settlement = opts.settlement;
+  if (opts.chains !== undefined) reg.chains = opts.chains;
+  verifyRegistrationFile(reg, { pinnedAt: 0 });
+  return reg;
+}
 
 /** The `register-request` payload (02). `profile`: KEEP, null, or a validated profile. */
 function registrationPayload(encB64: string, sigB64: string, scheme: string, profile: AgentProfile | null | typeof KEEP): Uint8Array {

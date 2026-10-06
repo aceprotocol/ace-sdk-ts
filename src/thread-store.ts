@@ -2,9 +2,10 @@
 
 import { ACEError } from './errors.js';
 import {
-  canonicalStateBytes, codePointLength, CONTROL_CHAR_RE, isACEId, pairKey, parseStateBytes, wireInt,
+  canonicalStateBytes, codePointLength, CONTROL_CHAR_RE, isACEId, pairKey, parseStateBytes, sha256Hex, wireInt,
 } from './encoding.js';
 import { decodeEnvelope, envelopeKnownFields } from './envelope.js';
+import { MAX_OPEN_THREADS_PER_PEER } from './limits.js';
 import {
   isTerminalState, ThreadStateMachine, type ThreadHistoryEntry, type ThreadSnapshot, type ThreadState,
 } from './state-machine.js';
@@ -30,6 +31,23 @@ const PRUNE_INTERVAL_SECONDS = 3600;
 
 export function threadKey(conversationId: string, threadId: string): string {
   return `threads/${pairKey(conversationId, threadId)}.json`;
+}
+
+const INDEX_PREFIX = 'threads/index/';
+
+/** Internal: the per-peer open-thread index (`threads/index/<sha256(peerAceId)>.json`). */
+export function threadIndexKey(peerAceId: string): string {
+  return `${INDEX_PREFIX}${sha256Hex(peerAceId)}.json`;
+}
+
+/** A thread record key (`threads/<64 hex>.json`), not an index file. */
+function isRecordKey(key: string): boolean {
+  return !key.startsWith(INDEX_PREFIX);
+}
+
+/** Index entry: the record key without `.json`. */
+function indexEntry(recordKey: string): string {
+  return recordKey.slice(0, -'.json'.length);
 }
 
 export function isRequestId(v: unknown): v is string {
@@ -109,8 +127,11 @@ export function compareHistories(a: ThreadHistoryEntry[], b: ThreadHistoryEntry[
 /**
  * Persistent economic thread state. Each record is validated on load by replaying its
  * history (`ThreadStateMachine.fromState`); a record that fails is `storage_failed` and is
- * never reset. Writes prune terminal threads without a pending send whose last entry is
- * older than 30 days.
+ * never reset. Writes prune threads without a pending send whose last entry is older than
+ * 30 days and that are terminal, or non-terminal without any local entry (04 § Retention).
+ * A per-peer index of non-terminal threads (`threads/index/`) bounds the open threads per
+ * peer at `MAX_OPEN_THREADS_PER_PEER`. The index is written so that a crash can only leave
+ * extra entries, which are reconciled when the bound is reached.
  */
 export class ThreadStore {
   readonly localAceId: string;
@@ -143,9 +164,17 @@ export class ThreadStore {
   async remove(conversationId: string, threadId: string): Promise<boolean> {
     return this.withLock(async () => {
       const key = threadKey(conversationId, threadId);
-      const exists = (await this.#store.read(key)) !== null;
-      if (exists) await this.#store.delete(key);
-      return exists;
+      const raw = await this.#store.read(key);
+      if (raw === null) return false;
+      let peer: string | null = null;
+      try {
+        peer = this.#decode(parseStateBytes(raw, key), key).snapshot.peerAceId;
+      } catch {
+        // a corrupt record leaves at most an extra index entry, reconciled at the bound
+      }
+      await this.#store.delete(key);
+      if (peer !== null) await this.#setOpen(peer, key, false);
+      return true;
     });
   }
 
@@ -180,6 +209,7 @@ export class ThreadStore {
   async listRecords(): Promise<ThreadRecord[]> {
     const out: ThreadRecord[] = [];
     for (const key of await this.#store.list('threads/')) {
+      if (!isRecordKey(key)) continue;
       const raw = await this.#store.read(key);
       if (raw === null) continue;
       const rec = this.#decode(parseStateBytes(raw, key), key);
@@ -204,12 +234,78 @@ export class ThreadStore {
       threadId: s.threadId,
       version: 1,
     };
-    await this.#store.write(threadKey(s.conversationId, s.threadId), canonicalStateBytes(doc));
+    const key = threadKey(s.conversationId, s.threadId);
+    const open = !isTerminalState(s.state);
+    if (open) await this.#setOpen(s.peerAceId, key, true); // index first: a crash leaves only an extra entry
+    await this.#store.write(key, canonicalStateBytes(doc));
+    if (!open) await this.#setOpen(s.peerAceId, key, false);
     await this.#maybePrune();
   }
 
-  async deleteRecord(conversationId: string, threadId: string): Promise<void> {
-    await this.#store.delete(threadKey(conversationId, threadId));
+  async deleteRecord(snapshot: ThreadSnapshot): Promise<void> {
+    const key = threadKey(snapshot.conversationId, snapshot.threadId);
+    await this.#store.delete(key);
+    await this.#setOpen(snapshot.peerAceId, key, false);
+  }
+
+  /**
+   * The number of non-terminal threads held with `peerAceId` (caller holds the lock). At the
+   * bound the index is reconciled against the records first, dropping stale entries.
+   */
+  async openThreadCount(peerAceId: string): Promise<number> {
+    const open = await this.#readIndex(peerAceId);
+    if (open.length < MAX_OPEN_THREADS_PER_PEER) return open.length;
+    const live: string[] = [];
+    for (const entry of open) {
+      const key = `${entry}.json`;
+      const raw = await this.#store.read(key);
+      if (raw === null) continue;
+      try {
+        const rec = this.#decode(parseStateBytes(raw, key), key);
+        if (rec.snapshot.peerAceId !== peerAceId || isTerminalState(rec.snapshot.state)) continue;
+      } catch {
+        // a corrupt record still counts: it is never reset or discarded
+      }
+      live.push(entry);
+    }
+    if (live.length !== open.length) await this.#writeIndex(peerAceId, live);
+    return live.length;
+  }
+
+  /**
+   * Throw `limit_exceeded` if a new thread with `peerAceId` would exceed
+   * `MAX_OPEN_THREADS_PER_PEER` (caller holds the lock).
+   */
+  async checkCanOpen(peerAceId: string): Promise<void> {
+    if ((await this.openThreadCount(peerAceId)) >= MAX_OPEN_THREADS_PER_PEER) {
+      throw new ACEError('limit_exceeded', `open thread limit ${MAX_OPEN_THREADS_PER_PEER} reached for this peer`);
+    }
+  }
+
+  async #readIndex(peerAceId: string): Promise<string[]> {
+    const key = threadIndexKey(peerAceId);
+    const raw = await this.#store.read(key);
+    if (raw === null) return [];
+    const doc = parseStateBytes(raw, key) as Record<string, unknown>;
+    if (typeof doc !== 'object' || doc === null || doc.version !== 1 || !Array.isArray(doc.open)
+      || !doc.open.every((e) => typeof e === 'string' && e.startsWith('threads/'))) {
+      throw new ACEError('storage_failed', `${key}: invalid open-thread index`);
+    }
+    return doc.open as string[];
+  }
+
+  async #writeIndex(peerAceId: string, open: string[]): Promise<void> {
+    const key = threadIndexKey(peerAceId);
+    if (open.length === 0) await this.#store.delete(key);
+    else await this.#store.write(key, canonicalStateBytes({ open: [...open].sort(), version: 1 }));
+  }
+
+  async #setOpen(peerAceId: string, recordKey: string, open: boolean): Promise<void> {
+    const entry = indexEntry(recordKey);
+    const cur = await this.#readIndex(peerAceId);
+    const has = cur.includes(entry);
+    if (open === has) return;
+    await this.#writeIndex(peerAceId, open ? [...cur, entry] : cur.filter((e) => e !== entry));
   }
 
   async #maybePrune(): Promise<void> {
@@ -217,6 +313,7 @@ export class ThreadStore {
     if (this.#lastPrune !== null && now - this.#lastPrune < PRUNE_INTERVAL_SECONDS) return;
     this.#lastPrune = now;
     for (const key of await this.#store.list('threads/')) {
+      if (!isRecordKey(key)) continue;
       const raw = await this.#store.read(key);
       if (raw === null) continue;
       let rec: ThreadRecord;
@@ -225,10 +322,11 @@ export class ThreadStore {
       } catch {
         continue; // never reset or delete a corrupt record
       }
-      const h = rec.snapshot.history;
-      if (rec.pending === null && isTerminalState(rec.snapshot.state) && h[h.length - 1].timestamp < now - THREAD_RETENTION_SECONDS) {
-        await this.#store.delete(key);
-      }
+      const s = rec.snapshot;
+      const h = s.history;
+      if (rec.pending !== null || h[h.length - 1].timestamp >= now - THREAD_RETENTION_SECONDS) continue;
+      // terminal, or non-terminal with no local entry (no local obligation exists)
+      if (isTerminalState(s.state) || !h.some((e) => e.from === this.localAceId)) await this.deleteRecord(s);
     }
   }
 

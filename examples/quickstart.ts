@@ -1,5 +1,5 @@
 import {
-  SoftwareIdentity, createMessage, parseMessage, verifyRegistrationFile,
+  SoftwareIdentity, createMessage, createRegistrationFile, parseMessage, verifyRegistrationFile,
   ThreadStateMachine, ReplayDetector, MemoryStore, RelayClient, PeerStore, Outbox, Inbox,
   type ParsedMessage,
 } from '../src/index.js';
@@ -8,9 +8,10 @@ import {
 export async function local(): Promise<ParsedMessage> {
   const alice = await SoftwareIdentity.generate('ed25519');
   const bob = await SoftwareIdentity.generate('secp256k1');
-  // Peers are verified bindings; here from each other's registration files.
-  const alicePeer = verifyRegistrationFile(alice.toRegistrationFile({ name: 'Alice', endpoint: 'https://alice.example/ace' }));
-  const bobPeer = verifyRegistrationFile(bob.toRegistrationFile({ name: 'Bob', endpoint: 'https://bob.example/ace' }));
+  // Peers are verified bindings; here from each other's registration files
+  // (createRegistrationFile works for any ACEIdentity, hardware-backed ones included).
+  const alicePeer = verifyRegistrationFile(createRegistrationFile(alice, { name: 'Alice', endpoint: 'https://alice.example/ace' }));
+  const bobPeer = verifyRegistrationFile(createRegistrationFile(bob, { name: 'Bob', endpoint: 'https://bob.example/ace' }));
 
   const message = await createMessage({
     sender: alice, recipient: bobPeer, type: 'rfq', threadId: 'translation-1',
@@ -43,20 +44,19 @@ export async function overRelay(relayUrl: string): Promise<ParsedMessage[]> {
   await outbox.deliver(pending.requestId, (env) => relay.send(env));
 
   // Bob drains his relay inbox; onMessage must persist its effect idempotently.
-  const received: ParsedMessage[] = [];
   const bobStore = new MemoryStore();
   const inbox = await Inbox.open({
     identity: bob, store: bobStore, peers: new PeerStore({ store: bobStore, relay }),
-    onMessage: (m) => { received.push(m); },
+    onMessage: async (m) => { /* persist m, keyed by (m.from, m.messageId) */ },
   });
   try {
-    const result = await inbox.pull(relay);
-    if (result.blocked) throw result.blocked;
-    // For live delivery: for await (const outcome of inbox.follow(relay, { signal })) { ... }
+    const { outcomes, blocked } = await inbox.pull(relay);
+    if (blocked) throw blocked;
+    // Live: for await (const outcome of inbox.follow(relay, { signal, onLive: () => console.log('live') })) { ... }
+    return outcomes.flatMap((o) => (o.kind === 'delivered' ? [o.message] : []));
   } finally {
     await inbox.close();
   }
-  return received;
 }
 
 export const parsed = await local();

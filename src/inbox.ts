@@ -26,11 +26,39 @@ export type ReceiveOutcome =
   | { kind: 'quarantined'; error: ACEError; fingerprint: string | null }
   | { kind: 'retryable'; error: ACEError };
 
-export interface PullResult {
-  delivered: number;
-  duplicates: number;
-  quarantined: number;
-  blocked: ACEError | null;
+/**
+ * The result of `Inbox.pull`: every non-retryable outcome in relay order, and the error that
+ * stopped the drain (a retryable outcome or a fetch error), or null when the inbox is drained.
+ */
+export class PullResult {
+  readonly outcomes: ReceiveOutcome[];
+  readonly blocked: ACEError | null;
+
+  constructor(outcomes: ReceiveOutcome[], blocked: ACEError | null) {
+    this.outcomes = outcomes;
+    this.blocked = blocked;
+  }
+
+  /** The delivered messages, in order. */
+  get messages(): ParsedMessage[] {
+    return this.outcomes.flatMap((o) => (o.kind === 'delivered' ? [o.message] : []));
+  }
+
+  get delivered(): number {
+    return countKind(this.outcomes, 'delivered');
+  }
+
+  get duplicates(): number {
+    return countKind(this.outcomes, 'duplicate');
+  }
+
+  get quarantined(): number {
+    return countKind(this.outcomes, 'quarantined');
+  }
+}
+
+function countKind(outcomes: ReceiveOutcome[], kind: ReceiveOutcome['kind']): number {
+  return outcomes.reduce((n, o) => n + (o.kind === kind ? 1 : 0), 0);
 }
 
 export interface InboxOptions {
@@ -194,9 +222,9 @@ export class Inbox {
     return Math.max(0, this.#now() - this.#offline);
   }
 
-  /** The persisted cursor for a relay, or null. */
-  cursor(relayUrl: string): string | null {
-    return this.#cursors[normalizeRelayUrl(relayUrl)] ?? null;
+  /** The persisted cursor for `relay` (keyed by its normalized `baseUrl`), or null. */
+  cursor(relay: RelayClient): string | null {
+    return this.#cursors[relay.baseUrl] ?? null;
   }
 
   /** Verify and commit one envelope. Calls are serialized. */
@@ -206,41 +234,58 @@ export class Inbox {
 
   /**
    * Drain the relay inbox from the persisted cursor. Stops at the first retryable outcome (or
-   * fetch error) and returns it as `blocked`.
+   * fetch error) and returns its error as `blocked`; `outcomes` holds every other outcome.
    */
   async pull(relay: RelayClient, o: { limit?: number } = {}): Promise<PullResult> {
-    const limit = o.limit ?? MAX_INBOX_PAGE;
-    const result: PullResult = { delivered: 0, duplicates: 0, quarantined: 0, blocked: null };
-    let since = this.cursor(relay.baseUrl) ?? '-';
+    const outcomes: ReceiveOutcome[] = [];
+    const drain = this.#drain(relay, o.limit ?? MAX_INBOX_PAGE);
+    for (;;) {
+      const next = await drain.next();
+      if (next.done) return new PullResult(outcomes, next.value);
+      if (next.value.kind !== 'retryable') outcomes.push(next.value);
+    }
+  }
+
+  /** Yield each outcome of a drain (a retryable one last); return the blocking error or null. */
+  async *#drain(relay: RelayClient, limit: number): AsyncGenerator<ReceiveOutcome, ACEError | null, undefined> {
+    let since = this.cursor(relay) ?? '-';
     for (;;) {
       let page;
       try {
         page = await relay.fetchInbox(this.#identity, { since, limit });
       } catch (e) {
-        result.blocked = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'inbox fetch failed', { cause: e });
-        return result;
+        return e instanceof ACEError ? e : new ACEError('relay_unavailable', 'inbox fetch failed', { cause: e });
       }
       for (const entry of page.entries) {
         const out = await this.receive(entry.message, { kind: 'relay', relayUrl: relay.baseUrl, streamId: entry.streamId });
-        if (out.kind === 'delivered') result.delivered++;
-        else if (out.kind === 'duplicate') result.duplicates++;
-        else if (out.kind === 'quarantined') result.quarantined++;
-        else {
-          result.blocked = out.error;
-          return result;
-        }
+        yield out;
+        if (out.kind === 'retryable') return out.error;
         since = entry.streamId;
       }
-      if (page.entries.length < limit) return result;
+      if (page.entries.length < limit) return null;
     }
   }
 
-  /** `pull`, then stream live events; throws the error of a blocked pull or retryable outcome (after yielding it). */
-  async *follow(relay: RelayClient, o: { signal?: AbortSignal } = {}): AsyncGenerator<ReceiveOutcome, void, undefined> {
-    const r = await this.pull(relay);
-    if (r.blocked) throw r.blocked;
-    const since = this.cursor(relay.baseUrl) ?? undefined;
-    for await (const ev of relay.listen(this.#identity, { since, signal: o.signal })) {
+  /**
+   * Yield the outcomes of an initial `pull`, then of live events. `onLive` runs once the initial
+   * pull is done and the event stream is connected, and again after each reconnect. A retryable
+   * outcome is yielded, then its error thrown; a failed inbox fetch is thrown.
+   */
+  async *follow(
+    relay: RelayClient, o: { signal?: AbortSignal; onLive?: () => void } = {},
+  ): AsyncGenerator<ReceiveOutcome, void, undefined> {
+    const drain = this.#drain(relay, MAX_INBOX_PAGE);
+    for (;;) {
+      const next = await drain.next();
+      if (next.done) {
+        if (next.value !== null) throw next.value;
+        break;
+      }
+      yield next.value;
+      if (o.signal?.aborted) return;
+    }
+    const since = this.cursor(relay) ?? undefined;
+    for await (const ev of relay.listen(this.#identity, { since, signal: o.signal, onOpen: o.onLive })) {
       const out = await this.receive(ev.message, { kind: 'relay', relayUrl: relay.baseUrl, streamId: ev.streamId });
       yield out;
       if (out.kind === 'retryable') throw out.error;
@@ -376,6 +421,8 @@ export class Inbox {
         parsed = await parseMessage(env, this.#identity, peer, {
           threads: machine, replay: tr, floor: this.#floor(), clock: this.#clock,
         });
+        // a verified message that opens a thread is bounded per peer (04 § Open-thread bound)
+        if (economic && record === null) await this.#threads.checkCanOpen(env.from);
       } catch (e) {
         const err = e instanceof ACEError ? e : new ACEError('identity_unavailable', 'receive failed', { cause: e });
         if (err.code === 'replay') return { kind: 'duplicate', from: env.from, messageId: env.messageId };

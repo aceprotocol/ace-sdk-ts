@@ -222,6 +222,18 @@ describe('RelayClient', () => {
     await until(() => relay.openListens === 0);
   });
 
+  it('listen: onOpen runs per connection; an exception from it ends the iteration (no reconnect)', async () => {
+    const a = await registered('a');
+    relay.dropListens = 2;
+    let opens = 0;
+    const boom = new Error('host hook failed');
+    await expect((async () => {
+      for await (const _ of a.relay!.listen(a.identity, { onOpen: () => { if (++opens === 3) throw boom; } })) { /* none */ }
+    })()).rejects.toBe(boom);
+    expect(opens).toBe(3);
+    expect(relay.requests.filter(([, p]) => p === '/v1/listen').length).toBe(3);
+  });
+
   it('listen: abort during a backoff sleep resolves promptly', async () => {
     const a = await registered('a');
     relay.inject.push({ path: '/v1/listen', status: 503, code: 'down', headers: { 'Retry-After': '30' } });
@@ -315,27 +327,55 @@ describe('end to end over the relay', () => {
       await alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
     }
     const inbox = await bob.open();
-    expect(await inbox.pull(bob.relay!, { limit: 2 })).toEqual({ delivered: 3, duplicates: 0, quarantined: 0, blocked: null });
-    expect(inbox.cursor(bob.relay!.baseUrl)).toBe('1003-0');
-    expect(await inbox.pull(bob.relay!)).toEqual({ delivered: 0, duplicates: 0, quarantined: 0, blocked: null });
+    const first = await inbox.pull(bob.relay!, { limit: 2 });
+    expect(first.blocked).toBeNull();
+    expect(first.outcomes.map((o) => o.kind)).toEqual(['delivered', 'delivered', 'delivered']);
+    expect(first.messages.map((m) => m.body)).toEqual([{ message: 'm0' }, { message: 'm1' }, { message: 'm2' }]);
+    expect([first.delivered, first.duplicates, first.quarantined]).toEqual([3, 0, 0]);
+    expect(inbox.cursor(bob.relay!)).toBe('1003-0');
+    const again = await inbox.pull(bob.relay!);
+    expect([again.outcomes, again.blocked]).toEqual([[], null]);
+
+    // follow: initial-pull outcomes first, then live; onLive after the pull and after each reconnect
+    for (const m of ['q0', 'q1']) {
+      const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: m } });
+      await alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
+    }
     const rfq = await alice.outbox.stage({ recipient: bobPeer, type: 'rfq', body: { need: 'gpu' }, threadId: 'deal' });
     const ctrl = new AbortController();
-    const outcomes: ReceiveOutcome[] = [];
-    const following = (async () => {
-      for await (const o of inbox.follow(bob.relay!, { signal: ctrl.signal })) {
-        outcomes.push(o);
-        ctrl.abort();
+    const events: string[] = [];
+    let sentRfq: Promise<void> | null = null;
+    const onLive = () => {
+      events.push('live');
+      if (sentRfq === null) sentRfq = alice.outbox.deliver(rfq.requestId, (env) => alice.relay!.send(env));
+    };
+    for await (const o of inbox.follow(bob.relay!, { signal: ctrl.signal, onLive })) {
+      events.push(o.kind === 'delivered' ? `${o.message.type}:${JSON.stringify(o.message.body)}` : o.kind);
+      if (o.kind === 'delivered' && o.message.type === 'rfq') {
+        relay.drainAfter = 0; // the next event drains the stream: a reconnect
+        const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: 'after' } });
+        await alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
       }
-    })();
-    await alice.outbox.deliver(rfq.requestId, (env) => alice.relay!.send(env));
-    await following;
-    expect(outcomes.map((o) => o.kind)).toEqual(['delivered']);
-    expect(bob.host.calls.length).toBe(4);
-    expect(inbox.cursor(bob.relay!.baseUrl)).toBe('1004-0');
+      if (o.kind === 'delivered' && o.message.type === 'text' && (o.message.body as { message: string }).message === 'after') ctrl.abort();
+    }
+    await sentRfq;
+    expect(events).toEqual([
+      'text:{"message":"q0"}', 'text:{"message":"q1"}', 'live', 'rfq:{"need":"gpu"}', 'live', 'text:{"message":"after"}',
+    ]);
+    expect(bob.host.calls.length).toBe(7);
+    expect(inbox.cursor(bob.relay!)).toBe('1007-0');
     // pull blocked by a retryable failure
     relay.inject.push({ path: '/v1/inbox', status: 503, code: 'down' });
     const r = await inbox.pull(bob.relay!);
     expect(r.blocked?.code).toBe('relay_unavailable');
+    expect(r.outcomes).toEqual([]);
+    // follow throws a failed initial pull
+    relay.inject.push({ path: '/v1/inbox', status: 503, code: 'down' });
+    let live = 0;
+    await expectCode((async () => {
+      for await (const _ of inbox.follow(bob.relay!, { onLive: () => live++ })) { /* none */ }
+    })(), 'relay_unavailable');
+    expect(live).toBe(0);
     await inbox.close();
   });
 });

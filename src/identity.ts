@@ -7,10 +7,8 @@ import { decodeB64, toBase64 } from './encoding.js';
 import { decryptWithSeed, generateKemSeed, kemPublicKeyFromSeed } from './encryption.js';
 import { KEM_SEED_SIZE } from './limits.js';
 import { computeACEId, signingAddress } from './signing.js';
-import { verifyRegistrationFile } from './discovery.js';
-import type {
-  ACEIdentity, Capability, ChainInfo, HardwareBacking, IdentityTier, RegistrationFile, SigningScheme,
-} from './types.js';
+import { createRegistrationFile } from './registration.js';
+import type { ACEIdentity, RegistrationFile, SigningScheme } from './types.js';
 import { isSigningScheme } from './types.js';
 
 export interface SoftwareIdentityExport {
@@ -122,37 +120,9 @@ export class SoftwareIdentity implements ACEIdentity {
     return { aceId: this.#aceId, scheme: this.#scheme, address: this.getAddress() };
   }
 
-  /** Build this identity's registration file; throws `invalid_registration` if the inputs are invalid. */
-  toRegistrationFile(opts: {
-    name: string;
-    endpoint: string;
-    description?: string;
-    tier?: IdentityTier;
-    hardwareBacking?: HardwareBacking;
-    capabilities?: Capability[];
-    settlement?: string[];
-    chains?: ChainInfo[];
-  }): RegistrationFile {
-    const reg: RegistrationFile = {
-      ace: '1.0',
-      id: this.#aceId,
-      name: opts.name,
-      endpoint: opts.endpoint,
-      tier: opts.tier ?? 0,
-      signing: {
-        scheme: this.#scheme,
-        address: this.getAddress(),
-        encryptionPublicKey: toBase64(this.#encryptionPublicKey),
-      },
-    };
-    if (this.#scheme === 'secp256k1') reg.signing.signingPublicKey = toBase64(this.#signingPublicKey);
-    if (opts.description !== undefined) reg.description = opts.description;
-    if (opts.hardwareBacking !== undefined) reg.hardwareBacking = opts.hardwareBacking;
-    if (opts.capabilities !== undefined) reg.capabilities = opts.capabilities;
-    if (opts.settlement !== undefined) reg.settlement = opts.settlement;
-    if (opts.chains !== undefined) reg.chains = opts.chains;
-    verifyRegistrationFile(reg, { pinnedAt: 0 });
-    return reg;
+  /** Build this identity's registration file (`createRegistrationFile(this, opts)`). */
+  toRegistrationFile(opts: Parameters<typeof createRegistrationFile>[1]): RegistrationFile {
+    return createRegistrationFile(this, opts);
   }
 }
 

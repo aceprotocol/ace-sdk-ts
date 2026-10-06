@@ -3,7 +3,8 @@ import { describe, expect, it } from 'vitest';
 import * as api from '../src/index.js';
 import * as nodeApi from '../src/node.js';
 import {
-  ACEError, ReplayDetector, SoftwareIdentity, ThreadStateMachine, VerifiedPeer, createMessage, createRegistrationRequest,
+  ACEError, ReplayDetector, SoftwareIdentity, ThreadStateMachine, VerifiedPeer, createMessage, createRegistrationFile,
+  createRegistrationRequest,
   decodeEnvelope, fetchRegistrationFile, parseMessage, validateBody, validateProfile, verifyEnvelopeSignature,
   verifyRegistrationFile, verifyRegistrationRequest, type ACEIdentity, type ACEMessage,
 } from '../src/index.js';
@@ -13,6 +14,7 @@ import { expectCode, peerOf, codeOf } from './helpers.js';
 const VALUE_EXPORTS = [
   'ACEError', 'MESSAGE_TYPES', 'ECONOMIC_TYPES', 'isMessageType', 'isEconomicType',
   'MAX_PLAINTEXT_BYTES', 'MAX_PAYLOAD_BYTES', 'MAX_ENVELOPE_BYTES', 'MAX_JSON_DEPTH', 'MAX_THREAD_ID_LENGTH',
+  'MAX_OPEN_THREADS_PER_PEER', 'PullResult', 'createRegistrationFile',
   'TIMESTAMP_WINDOW_SECONDS', 'OFFLINE_WINDOW_SECONDS', 'MAX_REGISTRATION_FILE_BYTES', 'MAX_INBOX_PAGE',
   'KEM_SEED_SIZE', 'KEM_PUBLIC_KEY_SIZE', 'KEM_CIPHERTEXT_SIZE', 'DEFAULT_REPLAY_CAPACITY',
   'SoftwareIdentity', 'computeACEId', 'toBase64', 'fromBase64', 'computeConversationId', 'decryptWithSeed',
@@ -163,6 +165,23 @@ describe('peers and registration', () => {
     expect(codeOf(() => verifyRegistrationFile({ ...reg, endpoint: 'http://a.example' }))).toBe('invalid_registration');
     expect(codeOf(() => verifyRegistrationFile(reg, { pinnedAt: -1 }))).toBe('invalid_argument');
     expect(() => id.toRegistrationFile({ name: 'A\n', endpoint: 'https://a.example' })).toThrow(ACEError);
+  });
+
+  it('createRegistrationFile works for any ACEIdentity (hardware-style wrapper), same as toRegistrationFile', async () => {
+    for (const scheme of ['ed25519', 'secp256k1'] as const) {
+      const sw = await SoftwareIdentity.generate(scheme);
+      const hw: ACEIdentity = { // no SoftwareIdentity behind the interface
+        getACEId: () => sw.getACEId(), getSigningScheme: () => sw.getSigningScheme(),
+        getSigningPublicKey: () => sw.getSigningPublicKey(), getEncryptionPublicKey: () => sw.getEncryptionPublicKey(),
+        sign: (d) => sw.sign(d), decrypt: (k, p, c) => sw.decrypt(k, p, c),
+      };
+      const opts = { name: 'HW', endpoint: 'https://hw.example/ace', tier: 1 as const, hardwareBacking: 'secure-enclave' as const, settlement: ['x402'] };
+      const reg = createRegistrationFile(hw, opts);
+      expect(reg).toEqual(sw.toRegistrationFile(opts));
+      expect(reg.signing.address).toBe(sw.getAddress());
+      expect(verifyRegistrationFile(reg, { pinnedAt: 1 }).aceId).toBe(sw.getACEId());
+      expect(codeOf(() => createRegistrationFile(hw, { name: '', endpoint: 'https://hw.example/ace' }))).toBe('invalid_registration');
+    }
   });
 
   it('profiles: unknown fields dropped, nulls absent, strict pricing', () => {

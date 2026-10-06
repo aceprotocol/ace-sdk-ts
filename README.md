@@ -37,7 +37,7 @@ Requires Node.js >= 20.19.0. `FileStore` is Node-only (`import { FileStore } fro
 
 ```typescript
 import {
-  SoftwareIdentity, createMessage, parseMessage, verifyRegistrationFile,
+  SoftwareIdentity, createMessage, createRegistrationFile, parseMessage, verifyRegistrationFile,
   ThreadStateMachine, ReplayDetector, MemoryStore, RelayClient, PeerStore, Outbox, Inbox,
   type ParsedMessage,
 } from '@ace-protocol/sdk';
@@ -46,9 +46,10 @@ import {
 export async function local(): Promise<ParsedMessage> {
   const alice = await SoftwareIdentity.generate('ed25519');
   const bob = await SoftwareIdentity.generate('secp256k1');
-  // Peers are verified bindings; here from each other's registration files.
-  const alicePeer = verifyRegistrationFile(alice.toRegistrationFile({ name: 'Alice', endpoint: 'https://alice.example/ace' }));
-  const bobPeer = verifyRegistrationFile(bob.toRegistrationFile({ name: 'Bob', endpoint: 'https://bob.example/ace' }));
+  // Peers are verified bindings; here from each other's registration files
+  // (createRegistrationFile works for any ACEIdentity, hardware-backed ones included).
+  const alicePeer = verifyRegistrationFile(createRegistrationFile(alice, { name: 'Alice', endpoint: 'https://alice.example/ace' }));
+  const bobPeer = verifyRegistrationFile(createRegistrationFile(bob, { name: 'Bob', endpoint: 'https://bob.example/ace' }));
 
   const message = await createMessage({
     sender: alice, recipient: bobPeer, type: 'rfq', threadId: 'translation-1',
@@ -81,20 +82,19 @@ export async function overRelay(relayUrl: string): Promise<ParsedMessage[]> {
   await outbox.deliver(pending.requestId, (env) => relay.send(env));
 
   // Bob drains his relay inbox; onMessage must persist its effect idempotently.
-  const received: ParsedMessage[] = [];
   const bobStore = new MemoryStore();
   const inbox = await Inbox.open({
     identity: bob, store: bobStore, peers: new PeerStore({ store: bobStore, relay }),
-    onMessage: (m) => { received.push(m); },
+    onMessage: async (m) => { /* persist m, keyed by (m.from, m.messageId) */ },
   });
   try {
-    const result = await inbox.pull(relay);
-    if (result.blocked) throw result.blocked;
-    // For live delivery: for await (const outcome of inbox.follow(relay, { signal })) { ... }
+    const { outcomes, blocked } = await inbox.pull(relay);
+    if (blocked) throw blocked;
+    // Live: for await (const outcome of inbox.follow(relay, { signal, onLive: () => console.log('live') })) { ... }
+    return outcomes.flatMap((o) => (o.kind === 'delivered' ? [o.message] : []));
   } finally {
     await inbox.close();
   }
-  return received;
 }
 
 export const parsed = await local();
@@ -116,7 +116,8 @@ Economic messages require a `threadId` and follow the transition table of the sp
 
 ### Identity and keys
 
-- `SoftwareIdentity.generate(scheme)`, `SoftwareIdentity.fromExport(data)`, `identity.exportPrivateKey()`, `identity.toRegistrationFile({ name, endpoint, tier?, ... })`
+- `SoftwareIdentity.generate(scheme)`, `SoftwareIdentity.fromExport(data)`, `identity.exportPrivateKey()`, `identity.toRegistrationFile(opts)`
+- `createRegistrationFile(identity, { name, endpoint, description?, tier?, hardwareBacking?, capabilities?, settlement?, chains? })` — the registration file of any `ACEIdentity` (hardware-backed ones included); `invalid_registration` on invalid input
 - `ACEIdentity` — implement it for hardware keys; `decrypt` may use `decryptWithSeed(kemCiphertext, payload, seed, conversationId)`. A non-`ACEError` thrown by `decrypt` is reported as `identity_unavailable` (retryable).
 - `computeACEId`, `computeConversationId`, `kemPublicKeyFromSeed`, `generateKemSeed`, `toBase64`, `fromBase64`
 
@@ -144,10 +145,14 @@ Economic messages require a `threadId` and follow the transition table of the sp
 
 - `ACEStore` — `read` / `write` (atomic) / `delete` / `list` / `lock`; `MemoryStore`, `FileStore(root)`
 - `PeerStore({ store, relay?, ttlSeconds?, clock? })` — `get`, `resolve`, `adopt`, `pinRegistrationFile`, `remove`. A registration file never rotates a pinned encryption key; rotation needs a newer signed relay binding.
-- `Outbox.open({ identity, store })` — repairs threads from crashed receives, then `stage`, `deliver(requestId, transport)`, `resign` (after `envelope_expired`), `abandon`, `pending`
-- `Inbox.open({ identity, store, peers, onMessage })` — `receive(envelope, source)`, `pull(relay)`, `follow(relay)`, `cursor(relayUrl)`, `close`. `onMessage` must persist its effect idempotently keyed by `(from, messageId)`.
-- `ThreadStore({ store, localAceId })` — read access to persisted threads
-- `RelayClient(baseUrl)` — `register`, `unregister`, `lookupPeer`, `discover`, `send`, `fetchInbox`, `listen`, `postIntent`, `listIntents`
+- `Outbox.open({ identity, store })` — repairs threads from crashed receives, then `stage`, `deliver(requestId, transport)`, `resign` (after `envelope_expired`), `abandon`, `pending`. Staging a message that opens a thread with a peer already holding `MAX_OPEN_THREADS_PER_PEER` (1000) non-terminal threads is `limit_exceeded`.
+- `Inbox.open({ identity, store, peers, onMessage })` — `onMessage` must persist its effect idempotently keyed by `(from, messageId)`.
+  - `receive(envelope, source)` → `ReceiveOutcome` (`delivered` / `duplicate` / `quarantined` / `retryable`). A message that would open thread 1001 with one peer is quarantined `limit_exceeded`.
+  - `pull(relay, { limit? })` → `PullResult { outcomes, blocked }`: every non-retryable outcome in relay order, and the error that stopped the drain (or `null`). Convenience getters: `messages`, `delivered`, `duplicates`, `quarantined`.
+  - `follow(relay, { signal?, onLive? })` — async iterable of the initial pull's outcomes, then live ones. `onLive()` runs once the initial pull is done and the event stream is connected, and again after every reconnect. A retryable outcome is yielded, then thrown; a failed inbox fetch is thrown.
+  - `cursor(relay)` — the persisted cursor, keyed by `relay.baseUrl`; `close()`.
+- `ThreadStore({ store, localAceId })` — read access to persisted threads. Keeps a per-peer index of non-terminal threads (`threads/index/`); prunes threads idle for 30 days that are terminal or hold no local message.
+- `RelayClient(baseUrl)` — `baseUrl` is the normalized URL (the cursor key). `register`, `unregister`, `lookupPeer`, `discover`, `send`, `fetchInbox`, `listen(identity, { since?, signal?, onOpen? })`, `postIntent`, `listIntents`
 
 Persisted files follow ace-spec 06 Appendix A (compact JSON, sorted keys), so the Python and Swift SDKs read the same state.
 

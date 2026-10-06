@@ -98,6 +98,10 @@ export class Outbox {
         throw new ACEError('pending_send_conflict', 'the thread already has a different pending send');
       }
       const machine = restoreMachine(local, record?.snapshot ?? null);
+      // a message that opens a thread is bounded per peer (pre-checked before any crypto)
+      if (record === null && machine.allowedTypes(conversationId, o.threadId!, local).includes(o.type)) {
+        await this.#threads.checkCanOpen(o.recipient.aceId);
+      }
       const message = await buildMessage({
         sender: this.#identity, recipient: o.recipient, type: o.type, body: o.body, threads: machine,
         threadId: o.threadId, timestamp: this.#now(),
@@ -166,7 +170,7 @@ export class Outbox {
       const h = rec.snapshot.history;
       const isHead = h[h.length - 1]?.messageId === rec.pending!.message.messageId;
       const snapshot = isHead ? snapshotWithHistory(rec.snapshot, h.slice(0, -1)) : rec.snapshot;
-      if (snapshot === null) await this.#threads.deleteRecord(rec.snapshot.conversationId, rec.snapshot.threadId);
+      if (snapshot === null) await this.#threads.deleteRecord(rec.snapshot);
       else await this.#threads.saveRecord({ snapshot, pending: null });
     });
   }

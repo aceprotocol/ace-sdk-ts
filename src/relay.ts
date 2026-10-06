@@ -116,6 +116,7 @@ function isObj(v: unknown): v is Record<string, unknown> {
 
 /** HTTP client for one relay. Every authenticated call uses a strictly increasing timestamp. */
 export class RelayClient {
+  /** The normalized relay URL; also the key of this relay's persisted inbox cursor. */
   readonly baseUrl: string;
   readonly #fetch: typeof fetch;
   readonly #timeoutMs: number;
@@ -267,16 +268,29 @@ export class RelayClient {
    * a connection idle for 90 s counts as broken. Resumes after the last yielded stream ID.
    * Aborting `signal` ends the iteration promptly — during a stream (even one carrying only
    * heartbeats), a connect or a backoff sleep — and closes the connection; so does the
-   * consumer leaving the loop early (`break` / `return()`).
+   * consumer leaving the loop early (`break` / `return()`). `onOpen` runs each time a
+   * connection is established (the first and every reconnect).
    */
-  async *listen(identity: ACEIdentity, o: { since?: string; signal?: AbortSignal } = {}): AsyncGenerator<ListenEvent, void, undefined> {
+  async *listen(
+    identity: ACEIdentity, o: { since?: string; signal?: AbortSignal; onOpen?: () => void } = {},
+  ): AsyncGenerator<ListenEvent, void, undefined> {
     let since = o.since ?? '-';
     if (since !== '-' && !isStreamId(since)) throw new ACEError('invalid_argument', "since must be '-' or '<ms>-<seq>'");
     const signal = o.signal;
+    // an exception from onOpen ends the iteration as is (it is not a connection failure)
+    let hookFailure: { error: unknown } | null = null;
+    const onOpen = o.onOpen === undefined ? undefined : () => {
+      try {
+        o.onOpen!();
+      } catch (e) {
+        hookFailure = { error: e };
+        throw e;
+      }
+    };
     let failures = 0;
     while (!signal?.aborted) {
       try {
-        for await (const ev of this.#listenOnce(identity, since, signal)) {
+        for await (const ev of this.#listenOnce(identity, since, signal, onOpen)) {
           if (signal?.aborted) return; // checked on every frame, heartbeats included
           failures = 0;
           if (ev === null) continue;
@@ -288,6 +302,7 @@ export class RelayClient {
         failures = 0;
         continue;
       } catch (e) {
+        if (hookFailure !== null) throw (hookFailure as { error: unknown }).error;
         if (signal?.aborted) return;
         const err = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'listen failed', { cause: e });
         if (err.code !== 'relay_unavailable') throw err;
@@ -301,7 +316,9 @@ export class RelayClient {
   }
 
   /** One listen connection: yields events, or null for frames that carry no message. */
-  async *#listenOnce(identity: ACEIdentity, since: string, signal?: AbortSignal): AsyncGenerator<ListenEvent | null, void, undefined> {
+  async *#listenOnce(
+    identity: ACEIdentity, since: string, signal?: AbortSignal, onOpen?: () => void,
+  ): AsyncGenerator<ListenEvent | null, void, undefined> {
     // Linked controller: aborts the fetch (and its body) on caller abort, connect timeout, or
     // generator exit. parseSSE also watches it and cancels the body reader itself, because
     // undici does not always cancel a body that is already streaming.
@@ -330,6 +347,7 @@ export class RelayClient {
       }
       const media = (res!.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
       if (media !== 'text/event-stream' || res!.body === null) throw protocolError('listen response is not an event stream');
+      onOpen?.();
       try {
         for await (const ev of parseSSE(res!.body, LISTEN_IDLE_MS, controller.signal)) {
           if (controller.signal.aborted) return;
