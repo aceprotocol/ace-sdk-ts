@@ -49,19 +49,17 @@ export class ReplayDetector {
   // Stores messageId -> insertion timestamp (Date.now() ms).
   private seen: Map<string, number>;
   private readonly capacity: number;
-  private readonly ttlMs: number;
   readonly ttlSeconds: number;
 
   constructor(capacity: number = 100_000, ttlSeconds: number = MAX_DRIFT_SECONDS) {
     this.capacity = capacity;
     this.ttlSeconds = ttlSeconds;
-    this.ttlMs = ttlSeconds * 1000;
     this.seen = new Map();
   }
 
   /** Remove entries older than TTL. */
   private evictExpired(): void {
-    const cutoff = Date.now() - this.ttlMs;
+    const cutoff = Date.now() - this.ttlSeconds * 1000;
     for (const [id, ts] of this.seen) {
       if (ts <= cutoff) {
         this.seen.delete(id);

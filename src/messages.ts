@@ -442,15 +442,16 @@ export async function parseMessage(
   requireThreadIdForEconomic(msg.type, msg.threadId);
 
   // 2. Timestamp freshness (pipeline step 2 — BEFORE expensive ops)
-  checkTimestampFreshness(msg.timestamp, opts.oldestTimestamp);
-  const offline = opts.oldestTimestamp !== undefined;
-  if (offline) {
+  const { oldestTimestamp } = opts;
+  checkTimestampFreshness(msg.timestamp, oldestTimestamp);
+  const offline = oldestTimestamp !== undefined;
+  if (oldestTimestamp !== undefined) {
     if (!opts.replayDetector) {
       throw new Error('Offline delivery requires a ReplayDetector');
     }
     // Entries must outlive the acceptance window, or an evicted messageId
     // could be replayed while its timestamp is still >= oldestTimestamp.
-    const windowSeconds = Math.floor(Date.now() / 1000) - opts.oldestTimestamp! + MAX_DRIFT_SECONDS;
+    const windowSeconds = Math.floor(Date.now() / 1000) - oldestTimestamp + MAX_DRIFT_SECONDS;
     if (opts.replayDetector.ttlSeconds < windowSeconds) {
       throw new Error(`Offline delivery requires ReplayDetector ttlSeconds >= ${windowSeconds}`);
     }
