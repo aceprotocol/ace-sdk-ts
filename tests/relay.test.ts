@@ -180,6 +180,75 @@ describe('RelayClient', () => {
     expect(listens).toBeGreaterThanOrEqual(4);
   });
 
+  // A fetch that ignores the abort signal: models undici not cancelling an already-streaming body.
+  const deafFetch: typeof fetch = (input, init) => {
+    const { signal: _ignored, ...rest } = init ?? {};
+    return fetch(input, rest);
+  };
+
+  async function until(cond: () => boolean, ms = 2000): Promise<void> {
+    const end = Date.now() + ms;
+    while (!cond()) {
+      if (Date.now() > end) throw new Error('condition not met in time');
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  it('listen: abort during a heartbeat-only stream terminates promptly and closes the connection', async () => {
+    const a = await registered('a');
+    relay.heartbeatMs = 10;
+    const c = new RelayClient(relay.url, { clock: clock.fn, reconnectBaseMs: 5, fetch: deafFetch });
+    const ctrl = new AbortController();
+    const done = (async () => {
+      for await (const _ of c.listen(a.identity, { signal: ctrl.signal })) throw new Error('no messages expected');
+    })();
+    await until(() => relay.openListens === 1);
+    await new Promise((r) => setTimeout(r, 60)); // several heartbeats in flight
+    const t0 = Date.now();
+    ctrl.abort();
+    await done;
+    expect(Date.now() - t0).toBeLessThan(500);
+    await until(() => relay.openListens === 0);
+  });
+
+  it('listen: consumer break closes the connection server-side', async () => {
+    const a = await registered('a');
+    relay.enqueueRaw(a.id, { n: 0 });
+    const c = new RelayClient(relay.url, { clock: clock.fn, reconnectBaseMs: 5, fetch: deafFetch });
+    for await (const ev of c.listen(a.identity)) {
+      expect(ev.message).toEqual({ n: 0 });
+      break;
+    }
+    await until(() => relay.openListens === 0);
+  });
+
+  it('listen: abort during a backoff sleep resolves promptly', async () => {
+    const a = await registered('a');
+    relay.inject.push({ path: '/v1/listen', status: 503, code: 'down', headers: { 'Retry-After': '30' } });
+    const ctrl = new AbortController();
+    const done = (async () => {
+      for await (const _ of a.relay!.listen(a.identity, { signal: ctrl.signal })) { /* none */ }
+    })();
+    await until(() => relay.requests.some(([, p]) => p === '/v1/listen'));
+    await new Promise((r) => setTimeout(r, 30)); // now sleeping ~30 s
+    const t0 = Date.now();
+    ctrl.abort();
+    await done;
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(relay.requests.filter(([, p]) => p === '/v1/listen').length).toBe(1);
+  });
+
+  it('parseSSE: abort ends a pending read and cancels the body', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });
+    const ctrl = new AbortController();
+    const it = parseSSE(body, undefined, ctrl.signal);
+    const next = it.next();
+    ctrl.abort();
+    expect((await next).done).toBe(true);
+    expect(cancelled).toBe(true);
+  });
+
   it('listen: non-retryable status throws its mapped error; repeated failures → relay_unavailable', async () => {
     const stranger = await SoftwareIdentity.generate('ed25519');
     await expectCode((async () => { for await (const _ of client().listen(stranger)) { /* none */ } })(), 'not_registered');

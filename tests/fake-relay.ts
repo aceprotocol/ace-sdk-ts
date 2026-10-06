@@ -26,6 +26,8 @@ export class FakeRelay {
   drainAfter: number | null = null;
   /** Close the next N listen connections right after `connected` (no events). */
   dropListens = 0;
+  /** Live-phase heartbeat interval for listen streams. */
+  heartbeatMs = 200;
   requests: Array<[string, string]> = [];
   authTimestamps: number[] = [];
   url = '';
@@ -41,6 +43,11 @@ export class FakeRelay {
         if (!res.headersSent) this.#error(res, 500, String(e));
       });
     });
+  }
+
+  /** Listen responses the server still holds open (a client disconnect removes it). */
+  get openListens(): number {
+    return this.#open.size;
   }
 
   async start(): Promise<this> {
@@ -242,7 +249,7 @@ export class FakeRelay {
             clearTimeout(t);
             r();
           };
-          const t = setTimeout(w, 200);
+          const t = setTimeout(w, this.heartbeatMs);
           this.#waiters.add(w);
         });
         if (!closed) res.write(': hb\n\n');

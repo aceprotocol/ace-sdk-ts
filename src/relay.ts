@@ -265,7 +265,9 @@ export class RelayClient {
    * min(30 s, max(1, 2, 4 … s, Retry-After)). Any received frame resets the failure count;
    * 10 consecutive failures → `relay_unavailable`; a non-retryable status → its mapped error;
    * a connection idle for 90 s counts as broken. Resumes after the last yielded stream ID.
-   * Aborting `signal` ends the iteration.
+   * Aborting `signal` ends the iteration promptly — during a stream (even one carrying only
+   * heartbeats), a connect or a backoff sleep — and closes the connection; so does the
+   * consumer leaving the loop early (`break` / `return()`).
    */
   async *listen(identity: ACEIdentity, o: { since?: string; signal?: AbortSignal } = {}): AsyncGenerator<ListenEvent, void, undefined> {
     let since = o.since ?? '-';
@@ -275,12 +277,14 @@ export class RelayClient {
     while (!signal?.aborted) {
       try {
         for await (const ev of this.#listenOnce(identity, since, signal)) {
+          if (signal?.aborted) return; // checked on every frame, heartbeats included
           failures = 0;
           if (ev === null) continue;
           yield ev;
           since = ev.streamId;
           if (signal?.aborted) return;
         }
+        if (signal?.aborted) return;
         failures = 0;
         continue;
       } catch (e) {
@@ -298,8 +302,12 @@ export class RelayClient {
 
   /** One listen connection: yields events, or null for frames that carry no message. */
   async *#listenOnce(identity: ACEIdentity, since: string, signal?: AbortSignal): AsyncGenerator<ListenEvent | null, void, undefined> {
+    // Linked controller: aborts the fetch (and its body) on caller abort, connect timeout, or
+    // generator exit. parseSSE also watches it and cancels the body reader itself, because
+    // undici does not always cancel a body that is already streaming.
     const controller = new AbortController();
     const onAbort = () => controller.abort();
+    if (signal?.aborted) return;
     signal?.addEventListener('abort', onAbort, { once: true });
     try {
       let res: Response | null = null;
@@ -323,7 +331,8 @@ export class RelayClient {
       const media = (res!.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
       if (media !== 'text/event-stream' || res!.body === null) throw protocolError('listen response is not an event stream');
       try {
-        for await (const ev of parseSSE(res!.body, LISTEN_IDLE_MS)) {
+        for await (const ev of parseSSE(res!.body, LISTEN_IDLE_MS, controller.signal)) {
+          if (controller.signal.aborted) return;
           if (ev.event === 'drain') return;
           if (ev.event !== 'catchup' && ev.event !== 'message') {
             yield null;
@@ -339,6 +348,7 @@ export class RelayClient {
           yield { streamId: ev.id, message, catchup: ev.event === 'catchup' };
         }
       } catch (e) {
+        if (signal?.aborted) return;
         if (e instanceof ACEError) throw e;
         throw new ACEError('relay_unavailable', 'listen stream broke', { cause: e });
       }
@@ -400,8 +410,12 @@ interface SSEEvent {
  * Internal: a minimal Server-Sent Events parser (HTML Living Standard § 9.2.6) over a byte
  * stream. Lines end in LF, CRLF or CR; `:` lines are comments; an empty line dispatches.
  * A line or event larger than MAX_ENVELOPE_BYTES + 512 is `relay_protocol_error`.
+ * Aborting `signal` ends the iteration at once (pending reads included) and cancels the body;
+ * so does closing the generator early.
  */
-export async function* parseSSE(body: ReadableStream<Uint8Array>, idleMs?: number): AsyncGenerator<SSEEvent, void, undefined> {
+export async function* parseSSE(
+  body: ReadableStream<Uint8Array>, idleMs?: number, signal?: AbortSignal,
+): AsyncGenerator<SSEEvent, void, undefined> {
   const decoder = new TextDecoder('utf-8');
   const reader = body.getReader();
   let buf = '';
@@ -410,15 +424,22 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>, idleMs?: numbe
   let data: string[] = [];
   let dataSize = 0;
   let first = true;
+  const onAbort = () => {
+    reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
   try {
     for (;;) {
-      const { done, value } = await readWithIdle(reader, idleMs);
+      if (signal?.aborted) return;
+      const { done, value } = await readWithIdle(reader, idleMs, signal);
+      if (signal?.aborted) return;
       buf += done ? decoder.decode() : decoder.decode(value, { stream: true });
       if (first && buf.length > 0) {
         if (buf.charCodeAt(0) === 0xfeff) buf = buf.slice(1);
         first = false;
       }
       for (;;) {
+        if (signal?.aborted) return;
         const m = /\r\n|\r|\n/.exec(buf);
         if (m === null) break;
         if (m[0] === '\r' && m.index === buf.length - 1 && !done) break; // CR may precede LF in the next chunk
@@ -454,20 +475,41 @@ export async function* parseSSE(body: ReadableStream<Uint8Array>, idleMs?: numbe
       if (done) return;
     }
   } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
+    signal?.removeEventListener('abort', onAbort);
+    // Do not await: a misbehaving body must not be able to hold up the caller's exit.
+    reader.cancel().catch(() => {});
+    try {
+      reader.releaseLock();
+    } catch {
+      /* a pending read on an old runtime */
+    }
   }
 }
 
-async function readWithIdle(reader: ReadableStreamDefaultReader<Uint8Array>, idleMs?: number): Promise<{ done: boolean; value?: Uint8Array }> {
-  if (idleMs === undefined) return reader.read();
+/** One read, raced against the idle timeout and the abort signal (abort reads as end of stream). */
+async function readWithIdle(
+  reader: ReadableStreamDefaultReader<Uint8Array>, idleMs?: number, signal?: AbortSignal,
+): Promise<{ done: boolean; value?: Uint8Array }> {
+  if (idleMs === undefined && signal === undefined) return reader.read();
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const idle = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new ACEError('relay_unavailable', 'listen connection idle')), idleMs);
-  });
+  let onAbort: (() => void) | undefined;
+  const racers: Array<Promise<{ done: boolean; value?: Uint8Array }>> = [reader.read()];
+  if (idleMs !== undefined) {
+    racers.push(new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new ACEError('relay_unavailable', 'listen connection idle')), idleMs);
+    }));
+  }
+  if (signal !== undefined) {
+    racers.push(new Promise((resolve) => {
+      onAbort = () => resolve({ done: true });
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }));
+  }
   try {
-    return await Promise.race([reader.read(), idle]);
+    return await Promise.race(racers);
   } finally {
     clearTimeout(timer);
+    if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort);
   }
 }
