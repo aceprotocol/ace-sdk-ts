@@ -249,6 +249,9 @@ export class RelayClient {
   async fetchInbox(identity: ACEIdentity, o: { since?: string; limit?: number } = {}): Promise<InboxPage> {
     const since = o.since ?? '-';
     const limit = o.limit ?? MAX_INBOX_PAGE;
+    if (wireInt(limit) === null || limit < 1 || limit > MAX_INBOX_PAGE) {
+      throw new ACEError('invalid_argument', `limit must be an integer in 1..${MAX_INBOX_PAGE}`);
+    }
     const res = await this.#authed(identity, { action: 'inbox', since, limit }, 'GET',
       this.#url('/v1/inbox', { since: since === '-' ? undefined : since, limit: String(limit) }));
     if (!isObj(res) || !Array.isArray(res.messages)) throw protocolError('inbox response must have messages');

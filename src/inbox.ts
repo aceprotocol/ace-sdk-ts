@@ -136,8 +136,8 @@ export class Inbox {
   #heldThreads: (() => Promise<void>) | null = null;
   #closed = false;
   #sinceSweep = 0;
-  /** `quarantine/` record count: listed once, then maintained (this instance holds `receive`). */
-  #quarantineCount: number | null = null;
+  /** `quarantine/` keys: listed once, then maintained (this instance holds `receive`). */
+  #quarantined: Set<string> | null = null;
 
   private constructor(o: InboxOptions, release: () => Promise<void>, replay: ReplayDetector, cursors: Record<string, string>) {
     this.#identity = o.identity;
@@ -247,45 +247,46 @@ export class Inbox {
    * bound memory.
    */
   async pull(relay: RelayClient, o: { limit?: number; maxPages?: number; signal?: AbortSignal } = {}): Promise<PullResult> {
-    const limit = o.limit ?? MAX_INBOX_PAGE;
-    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_INBOX_PAGE) {
-      return new PullResult([], new ACEError('invalid_argument', `limit must be an integer in 1..${MAX_INBOX_PAGE}`));
-    }
-    if (o.maxPages !== undefined && (!Number.isInteger(o.maxPages) || o.maxPages < 1)) {
+    if (o.maxPages !== undefined && (wireInt(o.maxPages) === null || o.maxPages < 1)) {
       return new PullResult([], new ACEError('invalid_argument', 'maxPages must be an integer >= 1'));
     }
     const outcomes: ReceiveOutcome[] = [];
-    const drain = this.#drain(relay, limit, o.maxPages, o.signal);
+    const drain = this.#drain(relay, o.limit ?? MAX_INBOX_PAGE, o.maxPages, o.signal);
     for (;;) {
       const next = await drain.next();
-      if (next.done) return new PullResult(outcomes, next.value.blocked, next.value.hasMore);
+      if (next.done) {
+        const end = next.value;
+        return end === 'stopped' ? new PullResult(outcomes, null, true) : new PullResult(outcomes, end);
+      }
       if (next.value.kind !== 'retryable') outcomes.push(next.value);
     }
   }
 
-  /** Yield each outcome of a drain (a retryable one last); return the blocking error and `hasMore`. */
+  /**
+   * Yield each outcome of a drain (a retryable one last); return the blocking error, null when
+   * drained, or 'stopped' when `maxPages` or `signal` ended it early.
+   */
   async *#drain(
     relay: RelayClient, limit: number, maxPages?: number, signal?: AbortSignal,
-  ): AsyncGenerator<ReceiveOutcome, { blocked: ACEError | null; hasMore: boolean }, undefined> {
+  ): AsyncGenerator<ReceiveOutcome, ACEError | null | 'stopped', undefined> {
     let since = this.cursor(relay) ?? '-';
     for (let pages = 0; ; pages++) {
-      if ((maxPages !== undefined && pages >= maxPages) || signal?.aborted) return { blocked: null, hasMore: true };
+      if ((maxPages !== undefined && pages >= maxPages) || signal?.aborted) return 'stopped';
       let page;
       try {
         page = await relay.fetchInbox(this.#identity, { since, limit });
       } catch (e) {
-        const blocked = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'inbox fetch failed', { cause: e });
-        return { blocked, hasMore: false };
+        return e instanceof ACEError ? e : new ACEError('relay_unavailable', 'inbox fetch failed', { cause: e });
       }
       for (const entry of page.entries) {
         // an aborted caller stops before the next entry; the cursor marks the spot
-        if (signal?.aborted) return { blocked: null, hasMore: true };
+        if (signal?.aborted) return 'stopped';
         const out = await this.receive(entry.message, { kind: 'relay', relayUrl: relay.baseUrl, streamId: entry.streamId });
         yield out;
-        if (out.kind === 'retryable') return { blocked: out.error, hasMore: false };
+        if (out.kind === 'retryable') return out.error;
         since = entry.streamId;
       }
-      if (page.entries.length < limit) return { blocked: null, hasMore: false };
+      if (page.entries.length < limit) return null;
     }
   }
 
@@ -302,8 +303,8 @@ export class Inbox {
     for (;;) {
       const next = await drain.next();
       if (next.done) {
-        if (next.value.blocked !== null) throw next.value.blocked;
-        if (next.value.hasMore) return; // aborted
+        if (next.value === 'stopped') return; // aborted (follow sets no maxPages)
+        if (next.value !== null) throw next.value;
         break;
       }
       yield next.value;
@@ -555,22 +556,22 @@ export class Inbox {
     let reason = error.message;
     if (codePointLength(reason) > 1000) reason = [...reason].slice(0, 1000).join('');
     const key = `quarantine/${fingerprint}.json`;
-    const existed = (await this.#store.read(key)) !== null;
     await this.#store.write(key, canonicalStateBytes({
       code: error.code, envelope: envelopeKnownFields(env), fingerprint, quarantinedAt: this.#now(), reason,
       source: 'relay', version: 1,
     }));
-    if (existed) return fingerprint;
-    // O(1) per insert; the records are listed and read only when the cap is crossed, which
-    // then trims to QUARANTINE_FLOOR (so at most once per 100 inserts).
-    const count = this.#quarantineCount === null ? (await this.#store.list('quarantine/')).length : this.#quarantineCount + 1;
-    this.#quarantineCount = count;
-    if (count > QUARANTINE_CAP) {
-      const keys = await this.#store.list('quarantine/');
+    // listed once per instance; the records are read only when the cap is crossed, which then
+    // trims to QUARANTINE_FLOOR (so at most once per 100 inserts)
+    const keys = this.#quarantined ??= new Set(await this.#store.list('quarantine/'));
+    keys.add(key);
+    if (keys.size > QUARANTINE_CAP) {
       const entries: Array<[number, string]> = [];
       for (const k of keys) {
         const raw = await this.#store.read(k);
-        if (raw === null) continue;
+        if (raw === null) {
+          keys.delete(k);
+          continue;
+        }
         let at = 0;
         try {
           at = wireInt((parseStateBytes(raw, k) as { quarantinedAt?: unknown }).quarantinedAt) ?? 0;
@@ -580,8 +581,10 @@ export class Inbox {
         entries.push([at, k]);
       }
       entries.sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
-      for (const [, k] of entries.slice(0, Math.max(0, entries.length - QUARANTINE_FLOOR))) await this.#store.delete(k);
-      this.#quarantineCount = Math.min(entries.length, QUARANTINE_FLOOR);
+      for (const [, k] of entries.slice(0, Math.max(0, entries.length - QUARANTINE_FLOOR))) {
+        await this.#store.delete(k);
+        keys.delete(k);
+      }
     }
     return fingerprint;
   }

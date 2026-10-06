@@ -24,6 +24,7 @@ export class Host {
 /** Wraps a store; `failAt` makes the Nth write throw storage_failed (not applied). */
 export class CountingStore implements ACEStore {
   writes: string[] = [];
+  lists: string[] = [];
   constructor(readonly inner: ACEStore, public failAt: number | null = null) {}
   read(k: string) { return this.inner.read(k); }
   async write(k: string, v: Uint8Array) {
@@ -34,7 +35,10 @@ export class CountingStore implements ACEStore {
     await this.inner.write(k, v);
   }
   delete(k: string) { return this.inner.delete(k); }
-  list(p: string) { return this.inner.list(p); }
+  list(p: string) {
+    this.lists.push(p);
+    return this.inner.list(p);
+  }
   lock(n: string, o?: { timeoutMs?: number }) { return this.inner.lock(n, o); }
 }
 
@@ -63,11 +67,11 @@ export class Agent {
     return a;
   }
 
-  open(o: { store?: ACEStore; offlineWindowSeconds?: number } = {}): Promise<Inbox> {
+  open(o: { store?: ACEStore; offlineWindowSeconds?: number; onMessage?: Host['fn'] } = {}): Promise<Inbox> {
     const store = o.store ?? this.store;
     return Inbox.open({
       identity: this.identity, store, peers: new PeerStore({ store, relay: this.relay, clock: this.clock.fn }),
-      onMessage: this.host.fn, clock: this.clock.fn, offlineWindowSeconds: o.offlineWindowSeconds,
+      onMessage: o.onMessage ?? this.host.fn, clock: this.clock.fn, offlineWindowSeconds: o.offlineWindowSeconds,
     });
   }
 

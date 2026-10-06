@@ -1,7 +1,7 @@
 // RelayClient against a local fake relay (08-relay); PeerStore; Inbox.pull / follow end to end.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  ACEError, Inbox, MemoryStore, PeerStore, RelayClient, SoftwareIdentity, verifyPeerRecord, type ReceiveOutcome,
+  ACEError, MemoryStore, PeerStore, RelayClient, SoftwareIdentity, verifyPeerRecord, type ReceiveOutcome,
 } from '../src/index.js';
 import { parseSSE } from '../src/relay.js';
 import { toBase64 } from '../src/encoding.js';
@@ -328,9 +328,7 @@ describe('end to end over the relay', () => {
     }
     const ctrl = new AbortController();
     let handed = 0;
-    const inbox = await Inbox.open({
-      identity: bob.identity, store: bob.store, peers: new PeerStore({ store: bob.store, relay: bob.relay, clock: clock.fn }),
-      clock: clock.fn,
+    const inbox = await bob.open({
       onMessage: () => {
         if (++handed === 4) ctrl.abort();
       },

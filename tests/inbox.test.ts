@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   ACEError, Inbox, MemoryStore, Outbox, PeerStore, RelayClient, ReplayDetector, ThreadStateMachine, ThreadStore, createMessage,
-  envelopeFingerprint, type ACEMessage, type ACEStore, type ReceiveSource,
+  envelopeFingerprint, type ACEMessage, type ReceiveSource,
 } from '../src/index.js';
 import { FileStore } from '../src/node.js';
 import { pairKey, stringifySorted } from '../src/encoding.js';
@@ -149,16 +149,7 @@ describe('Inbox', () => {
 
   it('quarantine is capped at 1000 (trimmed to 900) without listing on every insert', async () => {
     const clock = new Clock();
-    let lists = 0;
-    const inner = new MemoryStore();
-    const store: ACEStore = {
-      read: (k) => inner.read(k), write: (k, v) => inner.write(k, v), delete: (k) => inner.delete(k),
-      list: (p) => {
-        if (p === 'quarantine/') lists++;
-        return inner.list(p);
-      },
-      lock: (n, o) => inner.lock(n, o),
-    };
+    const store = new CountingStore(new MemoryStore());
     const alice = await Agent.create('alice', 'ed25519', clock);
     const bob = await Agent.create('bob', 'ed25519', clock, store);
     await alice.pin(bob);
@@ -171,8 +162,8 @@ describe('Inbox', () => {
       const out = await inbox.receive(forged, relaySrc(n + 1));
       expect(out.kind === 'quarantined' && out.error.code).toBe('invalid_signature');
     }
-    expect((await inner.list('quarantine/')).length).toBe(900);
-    expect(lists).toBeLessThanOrEqual(2); // the first insert and the trim
+    expect((await store.inner.list('quarantine/')).length).toBe(900);
+    expect(store.lists.filter((p) => p === 'quarantine/')).toHaveLength(1); // the first insert only
     await inbox.close();
   });
 
