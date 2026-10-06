@@ -5,7 +5,7 @@ import { isEconomicType } from './types.js';
 import { toBase64, fromBase64, computeACEId } from './identity.js';
 import { computeConversationId, encrypt, decodeKemCiphertext, MAX_PAYLOAD_SIZE } from './encryption.js';
 import { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
-import { checkTimestampFreshness, validateMessageId, ReplayDetector, MAX_DRIFT_SECONDS } from './security.js';
+import { checkTimestampFreshness, validateMessageId, ReplayDetector } from './security.js';
 import {
   validateRegistrationFile,
   verifyRegistrationId,
@@ -371,18 +371,18 @@ export interface ParsedMessage<T = Record<string, unknown>> {
 }
 
 export interface ParseMessageOptions {
-  /** Offline lower bound; caller must persist replay state and its sync watermark. */
+  /** Offline acceptance floor; use the same value for every message of one backlog. */
   oldestTimestamp?: number;
   stateMachine: ThreadStateMachine;
   expectedScheme?: SigningScheme;
-  replayDetector?: ReplayDetector;
+  replayDetector: ReplayDetector;
   senderEncryptionPubKey?: Uint8Array;
 }
 
 export interface ParseMessageFromRegistrationOptions {
   oldestTimestamp?: number;
   stateMachine: ThreadStateMachine;
-  replayDetector?: ReplayDetector;
+  replayDetector: ReplayDetector;
 }
 
 export async function parseMessage(
@@ -441,125 +441,95 @@ export async function parseMessage(
 
   requireThreadIdForEconomic(msg.type, msg.threadId);
 
-  // 2. Timestamp freshness (pipeline step 2 — BEFORE expensive ops)
-  const { oldestTimestamp } = opts;
-  checkTimestampFreshness(msg.timestamp, oldestTimestamp);
-  const offline = oldestTimestamp !== undefined;
-  if (oldestTimestamp !== undefined) {
-    if (!opts.replayDetector) {
-      throw new Error('Offline delivery requires a ReplayDetector');
-    }
-    // Entries must outlive the acceptance window, or an evicted messageId
-    // could be replayed while its timestamp is still >= oldestTimestamp.
-    const windowSeconds = Math.floor(Date.now() / 1000) - oldestTimestamp + MAX_DRIFT_SECONDS;
-    if (opts.replayDetector.ttlSeconds < windowSeconds) {
-      throw new Error(`Offline delivery requires ReplayDetector ttlSeconds >= ${windowSeconds}`);
-    }
+  // 2–3. Timestamp freshness, replay horizon and seen check — BEFORE expensive ops
+  checkTimestampFreshness(msg.timestamp, opts.oldestTimestamp);
+  const replayError = () => new Error(`Replay detected: messageId '${msg.messageId}' already processed or below replay horizon`);
+  if (!opts.replayDetector.accepts(msg.messageId, msg.timestamp)) {
+    throw replayError();
   }
 
-  // 3. Replay detection (pipeline step 3 — BEFORE signature verification)
-  // Economic messages REQUIRE replay detection — replaying payment/receipt
-  // messages could cause double-crediting or duplicate fulfillment.
-  if (isEconomicType(msg.type) && !opts.replayDetector) {
-    throw new Error(`Economic message type '${msg.type}' requires a ReplayDetector for security`);
+  // 4. Verify signature BEFORE decryption (pipeline step 4).
+  const estimatedPayloadBytes = estimateBase64DecodedLength(msg.encryption.payload);
+  if (estimatedPayloadBytes > MAX_PAYLOAD_SIZE) {
+    throw new Error(
+      `Payload too large: estimated decoded size ${estimatedPayloadBytes} bytes exceeds max ${MAX_PAYLOAD_SIZE}`,
+    );
   }
-  if (opts.replayDetector) {
-    if (!opts.replayDetector.checkAndReserve(msg.messageId, !offline)) {
-      throw new Error(`Replay detected: messageId '${msg.messageId}' already processed`);
-    }
-  }
-
-  // Replay rule (cross-SDK): a failure BEFORE the signature verifies releases
-  // the reservation (an unsigned envelope must not burn a messageId); once the
-  // signature has verified the reservation is kept on ANY later failure
-  // (decrypt, body schema, state machine) — an authentic message is one-shot
-  // regardless of outcome, so a captured authentic message rejected now cannot
-  // be replayed later when the state allows.
-  let authenticated = false;
+  const payloadBytes = fromBase64(msg.encryption.payload);
+  // Schema check: the X-Wing ciphertext has a fixed size. Rejected before any
+  // signature verification or decapsulation runs.
+  const kemCiphertext = decodeKemCiphertext(msg.encryption.kemCiphertext);
+  const messagePayload = buildSignedMessagePayload(
+    msg.type,
+    msg.to,
+    msg.conversationId,
+    msg.messageId,
+    msg.threadId,
+    kemCiphertext,
+    payloadBytes,
+  );
+  const signData = buildSignData('message', msg.from, msg.timestamp, messagePayload);
+  const sigBytes = decodeSignature(msg.signature.value, msg.signature.scheme);
+  let valid = false;
   try {
-    // 4. Verify signature BEFORE decryption (pipeline step 4).
-    const estimatedPayloadBytes = estimateBase64DecodedLength(msg.encryption.payload);
-    if (estimatedPayloadBytes > MAX_PAYLOAD_SIZE) {
-      throw new Error(
-        `Payload too large: estimated decoded size ${estimatedPayloadBytes} bytes exceeds max ${MAX_PAYLOAD_SIZE}`,
-      );
-    }
-    const payloadBytes = fromBase64(msg.encryption.payload);
-    // Schema check: the X-Wing ciphertext has a fixed size. Rejected before any
-    // signature verification or decapsulation runs.
-    const kemCiphertext = decodeKemCiphertext(msg.encryption.kemCiphertext);
-    const messagePayload = buildSignedMessagePayload(
-      msg.type,
-      msg.to,
-      msg.conversationId,
-      msg.messageId,
-      msg.threadId,
-      kemCiphertext,
-      payloadBytes,
-    );
-    const signData = buildSignData('message', msg.from, msg.timestamp, messagePayload);
-    const sigBytes = decodeSignature(msg.signature.value, msg.signature.scheme);
-    let valid = false;
-    try {
-      valid = verifySignature(signData, sigBytes, msg.signature.scheme, senderSigningPubKey);
-    } catch {
-      // Malformed signature/key bytes → treat as failed verification.
-    }
-    if (!valid) {
-      throw new Error('Signature verification failed');
-    }
-    authenticated = true;
-
-    // 5. Decrypt body via identity's decrypt method (pipeline step 5) —
-    // kemCiphertext was length-checked and signature-verified above.
-    const decrypted = await receiver.decrypt(
-      kemCiphertext,
-      payloadBytes,
-      msg.conversationId,
-    );
-
-    const rawParsed: unknown = JSON.parse(_decoder.decode(decrypted));
-    if (typeof rawParsed !== 'object' || rawParsed === null || Array.isArray(rawParsed)) {
-      throw new Error('Decrypted body must be a JSON object');
-    }
-    // Guard against deeply nested JSON that could cause stack overflow or CPU exhaustion
-    assertMaxDepth(rawParsed, MAX_JSON_DEPTH);
-    // Isolate from Object.prototype to prevent prototype pollution via __proto__/constructor keys
-    const body = Object.assign(Object.create(null), rawParsed) as BodyType;
-
-    // 6. Validate body schema (pipeline step 6)
-    validateBody(msg.type, body);
-    validateThreadReferences(
-      msg.type,
-      body,
-      opts.stateMachine,
-      msg.conversationId,
-      normalizeThreadId(msg.threadId),
-    );
-
-    // 7. State machine validation (pipeline step 7 — after all security checks)
-    opts.stateMachine.transition(
-      msg.conversationId,
-      msg.threadId ?? '',
-      msg.type,
-      msg.messageId,
-      msg.timestamp,
-    );
-
-    return {
-      messageId: msg.messageId,
-      from: msg.from,
-      to: msg.to,
-      conversationId: msg.conversationId,
-      type: msg.type,
-      threadId: msg.threadId,
-      timestamp: msg.timestamp,
-      body,
-    };
-  } catch (err) {
-    if (!authenticated) opts.replayDetector?.release(msg.messageId);
-    throw err;
+    valid = verifySignature(signData, sigBytes, msg.signature.scheme, senderSigningPubKey);
+  } catch {
+    // Malformed signature/key bytes → treat as failed verification.
   }
+  if (!valid) {
+    throw new Error('Signature verification failed');
+  }
+  // Commit now: an authentic message is one-shot, even if a later step fails.
+  if (!opts.replayDetector.commit(msg.messageId, msg.timestamp, opts.oldestTimestamp)) {
+    throw replayError();
+  }
+
+  // 5. Decrypt body via identity's decrypt method (pipeline step 5) —
+  // kemCiphertext was length-checked and signature-verified above.
+  const decrypted = await receiver.decrypt(
+    kemCiphertext,
+    payloadBytes,
+    msg.conversationId,
+  );
+
+  const rawParsed: unknown = JSON.parse(_decoder.decode(decrypted));
+  if (typeof rawParsed !== 'object' || rawParsed === null || Array.isArray(rawParsed)) {
+    throw new Error('Decrypted body must be a JSON object');
+  }
+  // Guard against deeply nested JSON that could cause stack overflow or CPU exhaustion
+  assertMaxDepth(rawParsed, MAX_JSON_DEPTH);
+  // Isolate from Object.prototype to prevent prototype pollution via __proto__/constructor keys
+  const body = Object.assign(Object.create(null), rawParsed) as BodyType;
+
+  // 6. Validate body schema (pipeline step 6)
+  validateBody(msg.type, body);
+  validateThreadReferences(
+    msg.type,
+    body,
+    opts.stateMachine,
+    msg.conversationId,
+    normalizeThreadId(msg.threadId),
+  );
+
+  // 7. State machine validation (pipeline step 7 — after all security checks)
+  opts.stateMachine.transition(
+    msg.conversationId,
+    msg.threadId ?? '',
+    msg.type,
+    msg.messageId,
+    msg.timestamp,
+  );
+
+  return {
+    messageId: msg.messageId,
+    from: msg.from,
+    to: msg.to,
+    conversationId: msg.conversationId,
+    type: msg.type,
+    threadId: msg.threadId,
+    timestamp: msg.timestamp,
+    body,
+  };
 }
 
 export async function parseMessageFromRegistration(

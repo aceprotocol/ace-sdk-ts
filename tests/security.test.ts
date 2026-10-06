@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { ReplayDetector, checkTimestampFreshness, validateMessageId } from '../src/security.js';
 
 describe('Security', () => {
@@ -36,66 +36,86 @@ describe('Security', () => {
   });
 
   describe('ReplayDetector', () => {
-    let detector: ReplayDetector;
+    const T = 1_800_000_000;
+    const id = (n: number) => `550e8400-e29b-41d4-a716-4466554400${String(n).padStart(2, '0')}`;
+    beforeEach(() => { vi.useFakeTimers({ now: T * 1000 }); });
+    afterEach(() => { vi.useRealTimers(); });
 
-    beforeEach(() => {
-      detector = new ReplayDetector(100);
+    it('starts with horizon = now - 5 min', () => {
+      expect(new ReplayDetector().horizon).toBe(T - 300);
     });
 
-    it('accepts new message IDs', () => {
-      expect(detector.checkAndReserve('msg-001')).toBe(true);
-      expect(detector.checkAndReserve('msg-002')).toBe(true);
+    it('rejects duplicates and timestamps at or below the horizon', () => {
+      const d = new ReplayDetector();
+      expect(d.commit(id(1), T)).toBe(true);
+      expect(d.accepts(id(1), T)).toBe(false);
+      expect(d.commit(id(1), T)).toBe(false);
+      expect(d.accepts(id(2), T - 300)).toBe(false);
+      expect(d.accepts(id(2), T - 299)).toBe(true);
     });
 
-    it('rejects duplicate message IDs', () => {
-      expect(detector.checkAndReserve('msg-001')).toBe(true);
-      expect(detector.checkAndReserve('msg-001')).toBe(false);
+    it('keeps an entry until it falls below the floor, then raises the horizon to it', () => {
+      const d = new ReplayDetector();
+      d.commit(id(1), T + 300); // max future drift: acceptable until T + 600
+      vi.advanceTimersByTime(450_000);
+      d.commit(id(2), T + 450);
+      expect(d.accepts(id(1), T + 300)).toBe(false);
+      vi.advanceTimersByTime(200_000);
+      d.commit(id(3), T + 650); // floor T + 350 > T + 300: id(1) removed
+      expect(d.horizon).toBe(T + 300);
+      expect(d.accepts(id(1), T + 300)).toBe(false);
     });
 
-    it('evicts oldest entries when capacity reached', () => {
-      const detector = new ReplayDetector(3);
-      detector.checkAndReserve('a');
-      detector.checkAndReserve('b');
-      detector.checkAndReserve('c');
-      detector.checkAndReserve('d');
-      expect(detector.checkAndReserve('a')).toBe(true);
-      expect(detector.checkAndReserve('b')).toBe(true);
+    it('a fixed earlier floor keeps entries; only capacity removes them', () => {
+      // A store that has been running since before the receiver went offline.
+      const d = ReplayDetector.fromExport({ horizon: T - 7200, entries: [] }, 2);
+      d.commit(id(1), T - 3000, T - 7200);
+      d.commit(id(2), T - 1000, T - 7200);
+      expect(d.horizon).toBe(T - 7200); // nothing removed
+      d.commit(id(3), T - 2000, T - 7200);
+      expect(d.horizon).toBe(T - 3000);
     });
 
-    it('exports and imports seen set', () => {
-      const id1 = '550e8400-e29b-41d4-a716-446655440001';
-      const id2 = '550e8400-e29b-41d4-a716-446655440002';
-      const id3 = '550e8400-e29b-41d4-a716-446655440003';
-      detector.checkAndReserve(id1);
-      detector.checkAndReserve(id2);
-
-      const exported = detector.export();
-      expect(exported).toContain(id1);
-      expect(exported).toContain(id2);
-
-      const restored = ReplayDetector.fromExport(exported, 100);
-      expect(restored.checkAndReserve(id1)).toBe(false);
-      expect(restored.checkAndReserve(id3)).toBe(true);
+    it('at capacity removes the smallest timestamp, not the oldest insertion', () => {
+      const d = new ReplayDetector(2);
+      d.commit(id(1), T - 10);
+      d.commit(id(2), T - 50);
+      d.commit(id(3), T - 20);
+      expect(d.horizon).toBe(T - 50);
+      for (const [n, ts] of [[1, T - 10], [2, T - 50], [3, T - 20]]) {
+        expect(d.accepts(id(n), ts)).toBe(false);
+      }
+      expect(d.accepts(id(4), T - 50)).toBe(false);
+      expect(d.accepts(id(4), T - 49)).toBe(true);
     });
 
-    it('fromExport truncates to capacity (keeps most recent)', () => {
-      const ids = Array.from({ length: 10 }, (_, i) =>
-        `550e8400-e29b-41d4-a716-44665544000${i}`,
-      );
-      const restored = ReplayDetector.fromExport(ids, 3);
-      // Only the last 3 entries should be kept
-      expect(restored.checkAndReserve(ids[7])).toBe(false);
-      expect(restored.checkAndReserve(ids[8])).toBe(false);
-      expect(restored.checkAndReserve(ids[9])).toBe(false);
-      // Earlier entries should have been truncated
-      expect(restored.checkAndReserve(ids[0])).toBe(true);
-      expect(restored.checkAndReserve(ids[6])).toBe(true);
+    it('round-trips through export/fromExport', () => {
+      const d = new ReplayDetector();
+      d.commit(id(1), T - 10);
+      d.commit(id(2), T - 20);
+      const restored = ReplayDetector.fromExport(d.export());
+      expect(restored.horizon).toBe(d.horizon);
+      expect(restored.accepts(id(1), T - 10)).toBe(false);
+      expect(restored.accepts(id(2), T - 20)).toBe(false);
+      expect(restored.accepts(id(3), T - 20)).toBe(true);
     });
 
-    it('release removes a failed reservation', () => {
-      detector.checkAndReserve('msg-001');
-      detector.release('msg-001');
-      expect(detector.checkAndReserve('msg-001')).toBe(true);
+    it('fromExport over capacity removes the smallest timestamps and raises the horizon', () => {
+      const entries: [string, number][] = [[id(1), T - 30], [id(2), T - 10], [id(3), T - 20]];
+      const restored = ReplayDetector.fromExport({ horizon: T - 300, entries }, 2);
+      expect(restored.horizon).toBe(T - 30);
+      expect(restored.export().entries).toHaveLength(2);
+    });
+
+    it('fromExport rejects malformed state', () => {
+      expect(() => ReplayDetector.fromExport({ horizon: -1, entries: [] })).toThrow(/invalid replay state/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [['msg-1', T + 1]] })).toThrow(/invalid messageId/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), T]] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), T + 1], [id(1), T + 2]] })).toThrow(/invalid entry/);
+    });
+
+    it('rejects a non-positive capacity', () => {
+      expect(() => new ReplayDetector(0)).toThrow(/capacity/);
     });
   });
 

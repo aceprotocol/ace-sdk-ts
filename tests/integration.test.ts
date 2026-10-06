@@ -205,7 +205,7 @@ describe('Integration: Full ACE Protocol Flow', () => {
     });
 
     await expect(
-      parseMessage(msg, receiver, impersonator.getSigningPublicKey(), { stateMachine: makeSM() }),
+      parseMessage(msg, receiver, impersonator.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
     ).rejects.toThrow(/does not match sender signing public key/);
   });
 
@@ -254,7 +254,7 @@ describe('Integration: Full ACE Protocol Flow', () => {
       msg1,
       agentSec,
       agentEd.getSigningPublicKey(),
-      { stateMachine: makeSM() },
+      { replayDetector: new ReplayDetector(), stateMachine: makeSM() },
     );
     expect(parsed1.body).toEqual({ message: 'Ed25519 → secp256k1' });
 
@@ -271,7 +271,7 @@ describe('Integration: Full ACE Protocol Flow', () => {
       msg2,
       agentEd,
       agentSec.getSigningPublicKey(),
-      { stateMachine: makeSM() },
+      { replayDetector: new ReplayDetector(), stateMachine: makeSM() },
     );
     expect(parsed2.body).toEqual({ message: 'secp256k1 → Ed25519' });
   });

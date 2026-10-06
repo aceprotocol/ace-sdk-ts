@@ -1,14 +1,14 @@
 /**
- * Replay reservation rule.
+ * Replay commit rule.
  *
- * A failure BEFORE the signature verifies releases the reservation: an
- * unsigned envelope that reuses a victim's messageId with a malformed
+ * Nothing enters the seen store before the signature verifies: an unsigned
+ * envelope that reuses a victim's messageId with a malformed
  * kemCiphertext/payload/signature must not be able to make the genuine
  * message look like a replay later.
  *
- * Once the signature has verified, the reservation is kept on ANY later
- * failure (decrypt, body schema, state machine): an authentic message is
- * one-shot regardless of outcome.
+ * Once the signature has verified, the entry is kept on ANY later failure
+ * (decrypt, body schema, state machine): an authentic message is one-shot
+ * regardless of outcome.
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -25,7 +25,7 @@ async function pair() {
   return { alice, bob, msg };
 }
 
-describe('replay reservation is released on pre-signature failures', () => {
+describe('pre-signature failures leave the seen store untouched', () => {
   for (const field of ['kemCiphertext', 'payload'] as const) {
     it(`invalid Base64 in encryption.${field}`, async () => {
       const { alice, bob, msg } = await pair();
@@ -51,7 +51,7 @@ describe('replay reservation is released on pre-signature failures', () => {
   });
 });
 
-describe('replay reservation is kept once the signature has verified', () => {
+describe('the seen-store entry is kept once the signature has verified', () => {
   it('decryption failure after a valid signature consumes the messageId', async () => {
     const alice = await SoftwareIdentity.generate('ed25519');
     const bob = await SoftwareIdentity.generate('ed25519');
@@ -69,8 +69,8 @@ describe('replay reservation is kept once the signature has verified', () => {
     expect(err).toBeInstanceOf(Error);
     // It got past the signature check and failed at decryption.
     expect((err as Error).message).not.toMatch(/Signature verification failed/);
-    // The authentic message is one-shot: its messageId stays reserved.
-    expect(detector.checkAndReserve(msg.messageId)).toBe(false);
+    // The authentic message is one-shot: its messageId stays committed.
+    expect(detector.accepts(msg.messageId, msg.timestamp)).toBe(false);
     // A second delivery of the same authentic envelope is rejected as a replay.
     await expect(
       parseMessage(msg, bob, alice.getSigningPublicKey(), { stateMachine: new ThreadStateMachine(), replayDetector: detector }),

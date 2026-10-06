@@ -1,4 +1,4 @@
-export const MAX_DRIFT_SECONDS = 300; // 5 minutes
+const MAX_DRIFT_SECONDS = 300; // 5 minutes
 const MESSAGE_ID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 import { sanitizeForError } from './utils.js';
@@ -29,111 +29,122 @@ export function checkTimestampFreshness(timestamp: number, oldestTimestamp?: num
   }
 }
 
+export interface ReplayDetectorExport {
+  /** Messages with `timestamp <= horizon` are rejected. */
+  horizon: number;
+  /** `[messageId, signed envelope timestamp]` pairs. */
+  entries: [string, number][];
+}
+
 /**
- * In-memory replay detector with TTL-based eviction.
+ * Seen store with a replay horizon (06-security § Replay Protection).
  *
- * Messages are evicted after `ttlSeconds` (default: matches the freshness
- * window of 300 s). A hard `capacity` cap prevents unbounded memory growth
- * under burst traffic — when reached, the oldest entry is evicted regardless
- * of TTL.
+ * Holds `(messageId, timestamp)` for every message whose signature verified.
+ * Rejects any message with `timestamp <= horizon`, so an entry can be removed
+ * once the horizon covers it: only the smallest-timestamp entry is removed,
+ * and the horizon moves up to its timestamp. Removal happens when the entry
+ * falls below the acceptance floor or the store exceeds `capacity`.
  *
  * SAFETY: This class is NOT thread-safe. Do not share instances across
- * Worker Threads or concurrent event loops. In single-threaded Node.js/browser
- * environments, synchronous operations between awaits are safe.
+ * Worker Threads or concurrent event loops.
  *
- * Callers SHOULD persist state via export()/fromExport() across restarts
- * to avoid a replay window during the freshness period after restart.
+ * Callers MUST persist state via export()/fromExport() across restarts.
  */
 export class ReplayDetector {
-  // Map preserves insertion order — O(1) FIFO eviction.
-  // Stores messageId -> insertion timestamp (Date.now() ms).
-  private seen: Map<string, number>;
-  private readonly capacity: number;
-  readonly ttlSeconds: number;
+  private readonly ids = new Set<string>();
+  // Min-heap of [timestamp, messageId].
+  private readonly heap: [number, string][] = [];
+  private _horizon = Math.floor(Date.now() / 1000) - MAX_DRIFT_SECONDS;
 
-  constructor(capacity: number = 100_000, ttlSeconds: number = MAX_DRIFT_SECONDS) {
-    this.capacity = capacity;
-    this.ttlSeconds = ttlSeconds;
-    this.seen = new Map();
+  constructor(private readonly capacity: number = 100_000) {
+    if (!Number.isSafeInteger(capacity) || capacity < 1) {
+      throw new Error('ReplayDetector capacity must be a positive integer');
+    }
   }
 
-  /** Remove entries older than TTL. */
-  private evictExpired(): void {
-    const cutoff = Date.now() - this.ttlSeconds * 1000;
-    for (const [id, ts] of this.seen) {
-      if (ts <= cutoff) {
-        this.seen.delete(id);
-      } else {
-        break; // Map is insertion-ordered, so all remaining are newer
-      }
-    }
+  get horizon(): number {
+    return this._horizon;
+  }
+
+  /** Pipeline steps 2–3: true if `timestamp` is above the horizon and `messageId` is unseen. */
+  accepts(messageId: string, timestamp: number): boolean {
+    return timestamp > this._horizon && !this.ids.has(messageId);
   }
 
   /**
-   * Atomically check if a messageId has been seen and reserve it.
-   * Returns true if the message is new (accepted), false if duplicate (rejected).
-   * With `evictWhenFull: false`, throws instead of evicting an unexpired entry
-   * when at capacity (evicting would reopen a replay window).
+   * Pipeline step 4: record a message whose signature has verified.
+   * Returns false if it is a duplicate or at/below the horizon.
+   * `floor` is the acceptance floor (default `now - 5 min`).
    */
-  checkAndReserve(messageId: string, evictWhenFull: boolean = true): boolean {
-    this.evictExpired();
-
-    if (this.seen.has(messageId)) {
-      return false;
-    }
-
-    // Hard capacity cap — evict oldest regardless of TTL
-    if (this.seen.size >= this.capacity) {
-      if (!evictWhenFull) {
-        throw new Error('ReplayDetector at capacity');
-      }
-      const oldest = this.seen.keys().next().value!;
-      this.seen.delete(oldest);
-    }
-
-    this.seen.set(messageId, Date.now());
+  commit(messageId: string, timestamp: number, floor: number = Math.floor(Date.now() / 1000) - MAX_DRIFT_SECONDS): boolean {
+    if (!this.accepts(messageId, timestamp)) return false;
+    this.ids.add(messageId);
+    this.push([timestamp, messageId]);
+    this.evict(floor);
     return true;
   }
 
-  /**
-   * Check if a messageId has been seen (without reserving).
-   */
-  hasSeen(messageId: string): boolean {
-    this.evictExpired();
-    return this.seen.has(messageId);
+  export(): ReplayDetectorExport {
+    return { horizon: this._horizon, entries: this.heap.map(([ts, id]) => [id, ts]) };
   }
 
-  /**
-   * Release a previously reserved message ID after processing failure.
-   */
-  release(messageId: string): void {
-    this.seen.delete(messageId);
-  }
-
-  /**
-   * Export seen message IDs for persistence.
-   */
-  export(): string[] {
-    this.evictExpired();
-    return Array.from(this.seen.keys());
-  }
-
-  /**
-   * Import previously persisted seen message IDs.
-   */
-  static fromExport(messageIds: string[], capacity: number = 100_000, ttlSeconds: number = MAX_DRIFT_SECONDS): ReplayDetector {
-    const detector = new ReplayDetector(capacity, ttlSeconds);
-    // Truncate to capacity — keep the most recent entries
-    const trimmed = messageIds.length > capacity
-      ? messageIds.slice(-capacity)
-      : messageIds;
-    const now = Date.now();
-    for (const id of trimmed) {
+  static fromExport(data: ReplayDetectorExport, capacity: number = 100_000): ReplayDetector {
+    const detector = new ReplayDetector(capacity);
+    if (!Number.isSafeInteger(data?.horizon) || data.horizon < 0 || !Array.isArray(data.entries)) {
+      throw new Error('fromExport: invalid replay state');
+    }
+    detector._horizon = data.horizon;
+    for (const entry of data.entries) {
+      const [id, ts]: unknown[] = Array.isArray(entry) ? entry : [];
       if (typeof id !== 'string' || !MESSAGE_ID_V4_PATTERN.test(id)) {
         throw new Error(`fromExport: invalid messageId '${sanitizeForError(String(id), 50)}'`);
       }
-      detector.seen.set(id, now);
+      if (typeof ts !== 'number' || !Number.isSafeInteger(ts) || ts <= data.horizon || detector.ids.has(id)) {
+        throw new Error('fromExport: invalid entry');
+      }
+      detector.ids.add(id);
+      detector.push([ts, id]);
     }
+    detector.evict(0);
     return detector;
+  }
+
+  /** Remove smallest-timestamp entries while below `floor` or over capacity. */
+  private evict(floor: number): void {
+    while (this.heap.length > 0 && (this.heap[0][0] < floor || this.heap.length > this.capacity)) {
+      const [ts, id] = this.pop();
+      this.ids.delete(id);
+      this._horizon = ts;
+    }
+  }
+
+  private push(item: [number, string]): void {
+    const h = this.heap;
+    h.push(item);
+    for (let i = h.length - 1; i > 0;) {
+      const parent = (i - 1) >> 1;
+      if (h[parent][0] <= h[i][0]) break;
+      [h[parent], h[i]] = [h[i], h[parent]];
+      i = parent;
+    }
+  }
+
+  private pop(): [number, string] {
+    const h = this.heap;
+    const top = h[0];
+    const last = h.pop()!;
+    if (h.length > 0) {
+      h[0] = last;
+      for (let i = 0; ;) {
+        const l = 2 * i + 1, r = l + 1;
+        let min = i;
+        if (l < h.length && h[l][0] < h[min][0]) min = l;
+        if (r < h.length && h[r][0] < h[min][0]) min = r;
+        if (min === i) break;
+        [h[min], h[i]] = [h[i], h[min]];
+        i = min;
+      }
+    }
+    return top;
   }
 }

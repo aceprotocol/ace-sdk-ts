@@ -236,7 +236,7 @@ describe('Messages', () => {
         msg,
         receiver,
         sender.getSigningPublicKey(),
-        { stateMachine: makeSM() },
+        { replayDetector: new ReplayDetector(), stateMachine: makeSM() },
       );
 
       expect(parsed.type).toBe('text');
@@ -259,7 +259,7 @@ describe('Messages', () => {
       });
 
       await expect(
-        parseMessage(msg, eavesdropper, sender.getSigningPublicKey(), { stateMachine: makeSM() }),
+        parseMessage(msg, eavesdropper, sender.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
       ).rejects.toThrow(/not addressed/);
     });
 
@@ -278,7 +278,7 @@ describe('Messages', () => {
       });
 
       await expect(
-        parseMessage(msg, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM() }),
+        parseMessage(msg, receiver, sender.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
       ).rejects.toThrow(/fresh/i);
     });
 
@@ -297,7 +297,7 @@ describe('Messages', () => {
 
       const broken = { ...msg, encryption: undefined } as any;
       await expect(
-        parseMessage(broken, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM() }),
+        parseMessage(broken, receiver, sender.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
       ).rejects.toThrow(/encryption/i);
     });
 
@@ -316,7 +316,7 @@ describe('Messages', () => {
 
       const broken = { ...msg, signature: undefined } as any;
       await expect(
-        parseMessage(broken, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM() }),
+        parseMessage(broken, receiver, sender.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
       ).rejects.toThrow(/signature/i);
     });
 
@@ -335,6 +335,7 @@ describe('Messages', () => {
 
       await expect(
         parseMessage(msg, receiver, sender.getSigningPublicKey(), {
+          replayDetector: new ReplayDetector(),
           stateMachine: makeSM(),
           expectedScheme: 'secp256k1',
         }),
@@ -356,7 +357,7 @@ describe('Messages', () => {
       });
 
       await expect(
-        parseMessage(msg, receiver, other.getSigningPublicKey(), { stateMachine: makeSM() }),
+        parseMessage(msg, receiver, other.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
       ).rejects.toThrow(/does not match/);
     });
 
@@ -413,7 +414,7 @@ describe('Messages', () => {
             scheme: 'ed25519',
             value: 'AQ==',
           },
-        }, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM() }),
+        }, receiver, sender.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
       ).rejects.toThrow(/Payload too large/);
     });
 
@@ -433,8 +434,8 @@ describe('Messages', () => {
       await expect(
         parseMessage(msg, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM(), replayDetector: detector }),
       ).rejects.toThrow(new RegExp(`X-Wing KEM ciphertext must be exactly 1120 bytes, got ${len}`));
-      // The replay reservation must be released on schema failure.
-      expect(detector.checkAndReserve(msg.messageId)).toBe(true);
+      // Nothing enters the seen store before the signature verifies.
+      expect(detector.accepts(msg.messageId, msg.timestamp)).toBe(true);
     });
 
     it('rejects missing kemCiphertext', async () => {
@@ -450,7 +451,7 @@ describe('Messages', () => {
       });
       delete (msg.encryption as Partial<typeof msg.encryption>).kemCiphertext;
       await expect(
-        parseMessage(msg, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM() }),
+        parseMessage(msg, receiver, sender.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
       ).rejects.toThrow(/Missing required encryption fields/);
     });
 
@@ -490,6 +491,7 @@ describe('Messages', () => {
 
       await expect(
         parseMessage(msg, receiver, sender.getSigningPublicKey(), {
+          replayDetector: new ReplayDetector(),
           stateMachine: makeSM(),
           senderEncryptionPubKey: sender.getEncryptionPublicKey(),
         }),
@@ -514,6 +516,7 @@ describe('Messages', () => {
       });
 
       const parsed = await parseMessageFromRegistration(msg, receiver, reg, {
+        replayDetector: new ReplayDetector(),
         stateMachine: makeSM(),
       });
       expect(parsed.body).toEqual({ message: 'strict registration path' });
@@ -693,7 +696,7 @@ describe('Messages', () => {
       });
 
       await expect(
-        parseMessage(msg, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM() }),
+        parseMessage(msg, receiver, sender.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() }),
       ).rejects.toThrow(/maximum nesting depth/);
     });
   });

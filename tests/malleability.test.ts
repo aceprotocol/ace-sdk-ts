@@ -116,6 +116,7 @@ describe('kemCiphertext is signed (relay swap defense)', () => {
 
     await expect(
       parseMessage(msg, receiver, sender.getSigningPublicKey(), {
+        replayDetector: new ReplayDetector(),
         stateMachine: new ThreadStateMachine(),
       }),
     ).rejects.toThrow(/Signature verification failed/);

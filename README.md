@@ -119,7 +119,7 @@ console.log(parsed.body); // { need: 'Translate 500 words EN→FR', ... }
 
 - `checkTimestampFreshness(timestamp)` — Check if a timestamp is within acceptable bounds
 - `validateMessageId(id)` — Validate message ID format
-- `ReplayDetector` — Sliding-window replay detection
+- `ReplayDetector` — Seen store with a replay horizon (required by `parseMessage`); persist it with `export()` / `ReplayDetector.fromExport()`
 
 ### State Machine
 
