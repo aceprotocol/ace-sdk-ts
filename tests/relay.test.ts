@@ -1,7 +1,7 @@
 // RelayClient against a local fake relay (08-relay); PeerStore; Inbox.pull / follow end to end.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  ACEError, MemoryStore, PeerStore, RelayClient, SoftwareIdentity, verifyPeerRecord, type ReceiveOutcome,
+  ACEError, Inbox, MemoryStore, PeerStore, RelayClient, SoftwareIdentity, verifyPeerRecord, type ReceiveOutcome,
 } from '../src/index.js';
 import { parseSSE } from '../src/relay.js';
 import { toBase64 } from '../src/encoding.js';
@@ -318,6 +318,38 @@ describe('PeerStore', () => {
 });
 
 describe('end to end over the relay', () => {
+  it('pull: maxPages sets hasMore, invalid arguments are blocked, abort stops before the next entry', async () => {
+    const alice = await registered('alice');
+    const bob = await registered('bob', 'secp256k1');
+    const bobPeer = await alice.peers.resolve(bob.id);
+    for (let i = 0; i < 6; i++) {
+      const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: `m${i}` } });
+      await alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
+    }
+    const ctrl = new AbortController();
+    let handed = 0;
+    const inbox = await Inbox.open({
+      identity: bob.identity, store: bob.store, peers: new PeerStore({ store: bob.store, relay: bob.relay, clock: clock.fn }),
+      clock: clock.fn,
+      onMessage: () => {
+        if (++handed === 4) ctrl.abort();
+      },
+    });
+    for (const bad of [{ maxPages: 0 }, { maxPages: 1.5 }, { limit: 0 }, { limit: 101 }]) {
+      const r = await inbox.pull(bob.relay!, bad);
+      expect([r.blocked?.code, r.outcomes, r.hasMore]).toEqual(['invalid_argument', [], false]);
+    }
+    const first = await inbox.pull(bob.relay!, { limit: 3, maxPages: 1 });
+    expect([first.delivered, first.blocked, first.hasMore]).toEqual([3, null, true]);
+    expect(first.messages.map((m) => m.body)).toEqual([{ message: 'm0' }, { message: 'm1' }, { message: 'm2' }]);
+    const aborted = await inbox.pull(bob.relay!, { signal: ctrl.signal });
+    expect([aborted.delivered, aborted.blocked, aborted.hasMore]).toEqual([1, null, true]);
+    expect(inbox.cursor(bob.relay!)).toBe('1004-0');
+    const rest = await inbox.pull(bob.relay!, { limit: 3 });
+    expect([rest.delivered, rest.duplicates, rest.blocked, rest.hasMore]).toEqual([2, 0, null, false]);
+    await inbox.close();
+  });
+
   it('stage/deliver → Inbox.pull, then follow live; cursor persists', async () => {
     const alice = await registered('alice');
     const bob = await registered('bob', 'secp256k1');

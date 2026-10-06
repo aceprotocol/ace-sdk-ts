@@ -27,16 +27,20 @@ export type ReceiveOutcome =
   | { kind: 'retryable'; error: ACEError };
 
 /**
- * The result of `Inbox.pull`: every non-retryable outcome in relay order, and the error that
- * stopped the drain (a retryable outcome or a fetch error), or null when the inbox is drained.
+ * The result of `Inbox.pull`: every non-retryable outcome in relay order, the error that
+ * stopped the drain (a retryable outcome, a fetch error or an invalid argument), or null, and
+ * `hasMore` when `maxPages` or an abort stopped it before the inbox was drained.
  */
 export class PullResult {
   readonly outcomes: ReceiveOutcome[];
   readonly blocked: ACEError | null;
+  /** `maxPages` or `signal` stopped the pull early; more entries may be waiting. */
+  readonly hasMore: boolean;
 
-  constructor(outcomes: ReceiveOutcome[], blocked: ACEError | null) {
+  constructor(outcomes: ReceiveOutcome[], blocked: ACEError | null, hasMore = false) {
     this.outcomes = outcomes;
     this.blocked = blocked;
+    this.hasMore = hasMore;
   }
 
   /** The delivered messages, in order. */
@@ -132,6 +136,8 @@ export class Inbox {
   #heldThreads: (() => Promise<void>) | null = null;
   #closed = false;
   #sinceSweep = 0;
+  /** `quarantine/` record count: listed once, then maintained (this instance holds `receive`). */
+  #quarantineCount: number | null = null;
 
   private constructor(o: InboxOptions, release: () => Promise<void>, replay: ReplayDetector, cursors: Record<string, string>) {
     this.#identity = o.identity;
@@ -233,52 +239,71 @@ export class Inbox {
   }
 
   /**
-   * Drain the relay inbox from the persisted cursor. Stops at the first retryable outcome (or
-   * fetch error) and returns its error as `blocked`; `outcomes` holds every other outcome.
+   * Drain the relay inbox from the persisted cursor, page by page. Stops at the first retryable
+   * outcome (or fetch error) and returns its error as `blocked`; `outcomes` holds every other
+   * outcome. `maxPages` bounds the pages fetched and `signal` stops before the next entry; both
+   * set `hasMore`. Never throws: an invalid `limit` (1–100) or `maxPages` (>= 1) is `blocked`
+   * with `invalid_argument`. `outcomes` grows with the backlog; use `maxPages` or `follow` to
+   * bound memory.
    */
-  async pull(relay: RelayClient, o: { limit?: number } = {}): Promise<PullResult> {
+  async pull(relay: RelayClient, o: { limit?: number; maxPages?: number; signal?: AbortSignal } = {}): Promise<PullResult> {
+    const limit = o.limit ?? MAX_INBOX_PAGE;
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_INBOX_PAGE) {
+      return new PullResult([], new ACEError('invalid_argument', `limit must be an integer in 1..${MAX_INBOX_PAGE}`));
+    }
+    if (o.maxPages !== undefined && (!Number.isInteger(o.maxPages) || o.maxPages < 1)) {
+      return new PullResult([], new ACEError('invalid_argument', 'maxPages must be an integer >= 1'));
+    }
     const outcomes: ReceiveOutcome[] = [];
-    const drain = this.#drain(relay, o.limit ?? MAX_INBOX_PAGE);
+    const drain = this.#drain(relay, limit, o.maxPages, o.signal);
     for (;;) {
       const next = await drain.next();
-      if (next.done) return new PullResult(outcomes, next.value);
+      if (next.done) return new PullResult(outcomes, next.value.blocked, next.value.hasMore);
       if (next.value.kind !== 'retryable') outcomes.push(next.value);
     }
   }
 
-  /** Yield each outcome of a drain (a retryable one last); return the blocking error or null. */
-  async *#drain(relay: RelayClient, limit: number): AsyncGenerator<ReceiveOutcome, ACEError | null, undefined> {
+  /** Yield each outcome of a drain (a retryable one last); return the blocking error and `hasMore`. */
+  async *#drain(
+    relay: RelayClient, limit: number, maxPages?: number, signal?: AbortSignal,
+  ): AsyncGenerator<ReceiveOutcome, { blocked: ACEError | null; hasMore: boolean }, undefined> {
     let since = this.cursor(relay) ?? '-';
-    for (;;) {
+    for (let pages = 0; ; pages++) {
+      if ((maxPages !== undefined && pages >= maxPages) || signal?.aborted) return { blocked: null, hasMore: true };
       let page;
       try {
         page = await relay.fetchInbox(this.#identity, { since, limit });
       } catch (e) {
-        return e instanceof ACEError ? e : new ACEError('relay_unavailable', 'inbox fetch failed', { cause: e });
+        const blocked = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'inbox fetch failed', { cause: e });
+        return { blocked, hasMore: false };
       }
       for (const entry of page.entries) {
+        // an aborted caller stops before the next entry; the cursor marks the spot
+        if (signal?.aborted) return { blocked: null, hasMore: true };
         const out = await this.receive(entry.message, { kind: 'relay', relayUrl: relay.baseUrl, streamId: entry.streamId });
         yield out;
-        if (out.kind === 'retryable') return out.error;
+        if (out.kind === 'retryable') return { blocked: out.error, hasMore: false };
         since = entry.streamId;
       }
-      if (page.entries.length < limit) return null;
+      if (page.entries.length < limit) return { blocked: null, hasMore: false };
     }
   }
 
   /**
    * Yield the outcomes of an initial `pull`, then of live events. `onLive` runs once the initial
    * pull is done and the event stream is connected, and again after each reconnect. A retryable
-   * outcome is yielded, then its error thrown; a failed inbox fetch is thrown.
+   * outcome is yielded, then its error thrown; a failed inbox fetch is thrown. Outcomes are
+   * streamed, not retained: the consumer's pace is the backpressure (nothing is read ahead).
    */
   async *follow(
     relay: RelayClient, o: { signal?: AbortSignal; onLive?: () => void } = {},
   ): AsyncGenerator<ReceiveOutcome, void, undefined> {
-    const drain = this.#drain(relay, MAX_INBOX_PAGE);
+    const drain = this.#drain(relay, MAX_INBOX_PAGE, undefined, o.signal);
     for (;;) {
       const next = await drain.next();
       if (next.done) {
-        if (next.value !== null) throw next.value;
+        if (next.value.blocked !== null) throw next.value.blocked;
+        if (next.value.hasMore) return; // aborted
         break;
       }
       yield next.value;
@@ -529,12 +554,19 @@ export class Inbox {
     const fingerprint = envelopeFingerprint(env);
     let reason = error.message;
     if (codePointLength(reason) > 1000) reason = [...reason].slice(0, 1000).join('');
-    await this.#store.write(`quarantine/${fingerprint}.json`, canonicalStateBytes({
+    const key = `quarantine/${fingerprint}.json`;
+    const existed = (await this.#store.read(key)) !== null;
+    await this.#store.write(key, canonicalStateBytes({
       code: error.code, envelope: envelopeKnownFields(env), fingerprint, quarantinedAt: this.#now(), reason,
       source: 'relay', version: 1,
     }));
-    const keys = await this.#store.list('quarantine/');
-    if (keys.length > QUARANTINE_CAP) {
+    if (existed) return fingerprint;
+    // O(1) per insert; the records are listed and read only when the cap is crossed, which
+    // then trims to QUARANTINE_FLOOR (so at most once per 100 inserts).
+    const count = this.#quarantineCount === null ? (await this.#store.list('quarantine/')).length : this.#quarantineCount + 1;
+    this.#quarantineCount = count;
+    if (count > QUARANTINE_CAP) {
+      const keys = await this.#store.list('quarantine/');
       const entries: Array<[number, string]> = [];
       for (const k of keys) {
         const raw = await this.#store.read(k);
@@ -549,6 +581,7 @@ export class Inbox {
       }
       entries.sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
       for (const [, k] of entries.slice(0, Math.max(0, entries.length - QUARANTINE_FLOOR))) await this.#store.delete(k);
+      this.#quarantineCount = Math.min(entries.length, QUARANTINE_FLOOR);
     }
     return fingerprint;
   }
