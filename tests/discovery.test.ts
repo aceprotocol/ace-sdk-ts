@@ -55,6 +55,12 @@ describe('Discovery', () => {
       expect(() => validateRegistrationFile(bad)).toThrow(/Unsupported signing.scheme/);
     });
 
+    it('rejects control characters in name but imposes no length limit', () => {
+      expect(() => validateRegistrationFile({ ...validReg, name: 'Agent\u001b[2J' }))
+        .toThrow(/name must not contain control characters/);
+      expect(() => validateRegistrationFile({ ...validReg, name: 'a'.repeat(1000) })).not.toThrow();
+    });
+
     it('rejects ed25519 address that does not decode to 32 bytes', () => {
       const bad: RegistrationFile = {
         ...validReg,
@@ -84,9 +90,7 @@ describe('Discovery', () => {
       expect(() => validateRegistrationFile(bad)).toThrow(/endpoint/);
     });
 
-    it('requires only a non-empty name (no length or control-character rule)', () => {
-      expect(() => validateRegistrationFile({ ...validReg, name: 'A'.repeat(200) })).not.toThrow();
-      expect(() => validateRegistrationFile({ ...validReg, name: 'line1\nline2' })).not.toThrow();
+    it('requires a non-empty name', () => {
       expect(() => validateRegistrationFile({ ...validReg, name: '' })).toThrow(/name/);
     });
 

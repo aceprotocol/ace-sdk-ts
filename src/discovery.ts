@@ -50,6 +50,9 @@ export function validateRegistrationFile(reg: RegistrationFile): RegistrationKey
   if (!reg.name || typeof reg.name !== 'string') {
     throw new Error('Missing required field: name');
   }
+  if (CONTROL_CHAR_PATTERN.test(reg.name)) {
+    throw new Error('Registration name must not contain control characters');
+  }
   if (!reg.endpoint || typeof reg.endpoint !== 'string') {
     throw new Error('Missing required field: endpoint');
   }
