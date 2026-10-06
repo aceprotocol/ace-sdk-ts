@@ -59,7 +59,7 @@ export class Agent {
     a.id = a.identity.getACEId();
     a.relay = relay;
     a.peers = new PeerStore({ store, relay, clock: clock.fn });
-    a.outbox = new Outbox({ identity: a.identity, store, clock: clock.fn });
+    a.outbox = await Outbox.open({ identity: a.identity, store, clock: clock.fn });
     return a;
   }
 

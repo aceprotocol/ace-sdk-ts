@@ -8,6 +8,7 @@ import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { computeConversationId } from './encryption.js';
 import { messageSignData } from './envelope.js';
 import { buildMessage } from './messages.js';
+import { repairThreadsFromDeliveries } from './inbox.js';
 import { ThreadStateMachine } from './state-machine.js';
 import type { ACEStore } from './store.js';
 import {
@@ -38,7 +39,7 @@ export class Outbox {
   readonly #threads: ThreadStore;
   readonly #clock?: () => number;
 
-  constructor(o: { identity: ACEIdentity; store: ACEStore; clock?: () => number }) {
+  private constructor(o: { identity: ACEIdentity; store: ACEStore; clock?: () => number }) {
     if (typeof o !== 'object' || o === null || typeof o.store !== 'object' || o.store === null || typeof o.identity !== 'object') {
       throw new ACEError('invalid_argument', 'identity and store are required');
     }
@@ -48,6 +49,18 @@ export class Outbox {
     const local = o.identity.getACEId();
     if (!isACEId(local)) throw new ACEError('invalid_argument', 'identity has an invalid ACE ID');
     this.#threads = new ThreadStore({ store: o.store, localAceId: local, clock: o.clock });
+  }
+
+  /**
+   * Open an outbox. Under lock `threads`, thread records are first repaired from `deliveries/`
+   * records whose thread snapshot strictly extends the stored history (an Inbox that crashed
+   * between its delivery and thread writes), so staging never diverges from received history.
+   * Messages are not handed over and replay state is not touched.
+   */
+  static async open(o: { identity: ACEIdentity; store: ACEStore; clock?: () => number }): Promise<Outbox> {
+    const outbox = new Outbox(o);
+    await repairThreadsFromDeliveries(o.store, outbox.#threads);
+    return outbox;
   }
 
   #now(): number {

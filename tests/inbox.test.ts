@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  ACEError, Inbox, MemoryStore, PeerStore, ReplayDetector, ThreadStateMachine, ThreadStore, createMessage,
+  ACEError, Inbox, MemoryStore, Outbox, PeerStore, ReplayDetector, ThreadStateMachine, ThreadStore, createMessage,
   envelopeFingerprint, type ACEMessage, type ReceiveSource,
 } from '../src/index.js';
 import { FileStore } from '../src/node.js';
@@ -361,4 +361,38 @@ describe('crash injection', () => {
       await third.close();
     });
   }
+});
+
+describe('crash between delivery and thread writes, then Outbox', () => {
+  it('Outbox.open repairs the thread, a staged reply extends it, and Inbox.open recovers without divergence', async () => {
+    const clock = new Clock();
+    const alice = await Agent.create('alice', 'ed25519', clock);
+    const bob = await Agent.create('bob', 'secp256k1', clock);
+    await alice.pin(bob);
+    await bob.pin(alice);
+    const env = await rfq(alice, bob, 'd');
+    await (await bob.open()).close();
+    const failing = new CountingStore(bob.store, 2); // 1 = delivery record, 2 = thread record
+    const inbox = await bob.open({ store: failing });
+    expect((await inbox.receive(env, relaySrc(1))).kind).toBe('retryable');
+    // while failed, the instance keeps holding `threads`
+    await expectCode(bob.store.lock('threads', { timeoutMs: 50 }), 'storage_failed');
+    await inbox.close(); // the process "dies"; `threads` is released
+    const threads = new ThreadStore({ store: bob.store, localAceId: bob.id });
+    expect(await threads.get(env.conversationId, 'd')).toBeNull(); // thread write was lost
+
+    const outbox = await Outbox.open({ identity: bob.identity, store: bob.store, clock: clock.fn });
+    expect((await threads.get(env.conversationId, 'd'))!.state).toBe('rfq'); // repaired from deliveries/
+    expect(bob.host.calls).toEqual([]); // Outbox.open never hands over
+    const offer = await outbox.stage({ recipient: await bob.peer(alice), type: 'offer', body: { price: '2', currency: 'USDC' }, threadId: 'd' });
+    expect((await threads.get(env.conversationId, 'd'))!.history.map((h) => h.type)).toEqual(['rfq', 'offer']);
+
+    const recovered = await bob.open(); // no divergence: the stored history extends the delivery snapshot
+    expect(bob.host.calls).toEqual([[alice.id, env.messageId]]);
+    expect((await recovered.receive(env, relaySrc(1))).kind).toBe('duplicate');
+    const snap = (await threads.get(env.conversationId, 'd'))!;
+    expect(snap.state).toBe('offered');
+    expect(snap.history.map((h) => h.messageId)).toEqual([env.messageId, offer.message.messageId]);
+    await recovered.close();
+  });
 });

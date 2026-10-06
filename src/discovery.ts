@@ -478,19 +478,31 @@ export function isBlockedAddress(ip: string): boolean {
   return V6_BLOCKED.some(([net, p]) => inV6(v6, net, p));
 }
 
-type LookupFn = (host: string, opts: { all: true; verbatim: true }) => Promise<Array<{ address: string }>>;
-let lookupFn: LookupFn | null | undefined;
+type LookupFn = (host: string, opts: { all: true; verbatim: true }) => Promise<Array<{ address: string; family: number }>>;
 
-async function getLookup(): Promise<LookupFn | null> {
-  if (lookupFn === undefined) {
-    try {
-      const dns = await import('node:dns');
-      lookupFn = dns.promises.lookup as unknown as LookupFn;
-    } catch {
-      lookupFn = null;
-    }
+/** Internal: injectable network dependencies (tests). */
+export interface FetchDeps {
+  /** DNS resolution (default `node:dns` lookup; `null` = non-Node runtime, no DNS check). */
+  lookup?: LookupFn | null;
+  /** TCP port (default 443). */
+  port?: number;
+}
+
+async function nodeHttps(): Promise<typeof import('node:https') | null> {
+  try {
+    return await import('node:https');
+  } catch {
+    return null;
   }
-  return lookupFn;
+}
+
+async function defaultLookup(): Promise<LookupFn | null> {
+  try {
+    const dns = await import('node:dns');
+    return dns.promises.lookup as unknown as LookupFn;
+  } catch {
+    return null;
+  }
 }
 
 export interface FetchRegistrationFileOptions {
@@ -502,15 +514,24 @@ export interface FetchRegistrationFileOptions {
 /**
  * GET `https://<domain>/.well-known/ace.json` with SSRF protection, then verify it.
  *
- * Resolves DNS and rejects (`blocked_address`) if any address is private / reserved;
- * never follows redirects; requires `application/json`; reads at most `maxBytes + 1` bytes.
- * Network errors, timeouts, 5xx and 429 are `fetch_failed`; everything else `invalid_registration`.
+ * Under Node the name is resolved once; if ANY address is private / reserved the fetch fails
+ * with `blocked_address`, otherwise the request connects only to the validated address
+ * (`node:https` with a pinned lookup; SNI and certificate validation use the domain), which
+ * closes the DNS-rebinding window. Redirects are never followed; `application/json` is
+ * required; at most `maxBytes + 1` bytes are read. Network errors, timeouts, 5xx and 429 are
+ * `fetch_failed`; everything else `invalid_registration`.
  *
- * Runtime note: the DNS check needs `node:dns`. In a non-Node runtime (browser, edge) it is
- * skipped and only the domain grammar applies. Under Node, `fetch` re-resolves the name, so a
- * DNS-rebinding race remains possible; use an egress proxy where that matters.
+ * Non-Node runtimes (browser, edge) have no DNS access: the request goes through `fetch` and
+ * only the domain grammar applies. Use an egress proxy there if SSRF matters.
  */
 export async function fetchRegistrationFile(domain: string, opts: FetchRegistrationFileOptions = {}): Promise<RegistrationFile> {
+  return fetchRegistrationFileWith(domain, opts, {});
+}
+
+/** Internal: `fetchRegistrationFile` with injectable dependencies. */
+export async function fetchRegistrationFileWith(
+  domain: string, opts: FetchRegistrationFileOptions, deps: FetchDeps,
+): Promise<RegistrationFile> {
   if (typeof domain !== 'string' || !DOMAIN_RE.test(domain)) throw new ACEError('invalid_argument', 'invalid domain');
   const timeoutMs = opts.timeoutMs ?? 10_000;
   const maxBytes = opts.maxBytes ?? MAX_REGISTRATION_FILE_BYTES;
@@ -518,49 +539,32 @@ export async function fetchRegistrationFile(domain: string, opts: FetchRegistrat
     throw new ACEError('invalid_argument', 'timeoutMs must be positive');
   }
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new ACEError('invalid_argument', 'maxBytes must be a positive integer');
-  if (opts.allowPrivateAddresses !== true) {
-    const lookup = await getLookup();
-    if (lookup !== null) {
-      let addrs: Array<{ address: string }>;
-      try {
-        addrs = await lookup(domain, { all: true, verbatim: true });
-      } catch (e) {
-        throw new ACEError('fetch_failed', `DNS resolution failed: ${e instanceof Error ? e.message : ''}`);
-      }
-      if (addrs.length === 0) throw new ACEError('fetch_failed', 'no addresses resolved');
-      if (addrs.some((a) => isBlockedAddress(a.address))) {
-        throw new ACEError('blocked_address', `${domain.slice(0, 100)} resolves to a blocked address`);
-      }
-    }
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let body: Uint8Array;
-  try {
-    let res: Response;
+  const lookup = deps.lookup === undefined ? await defaultLookup() : deps.lookup;
+  const https = lookup === null ? null : await nodeHttps();
+  let res: { status: number; contentType: string; body: () => Promise<Uint8Array> };
+  if (lookup !== null && https !== null) {
+    let addrs: Array<{ address: string; family: number }>;
     try {
-      res = await fetch(`https://${domain}/.well-known/ace.json`, {
-        headers: { Accept: 'application/json' }, signal: controller.signal, redirect: 'manual',
-      });
+      addrs = await lookup(domain, { all: true, verbatim: true });
     } catch (e) {
-      throw new ACEError('fetch_failed', `fetch failed: ${e instanceof Error ? e.message : ''}`);
+      throw new ACEError('fetch_failed', `DNS resolution failed: ${e instanceof Error ? e.message : ''}`);
     }
-    if (res.status >= 500 || res.status === 429) {
-      throw new ACEError('fetch_failed', `HTTP ${res.status}`, { status: res.status });
+    if (addrs.length === 0) throw new ACEError('fetch_failed', 'no addresses resolved');
+    if (opts.allowPrivateAddresses !== true && addrs.some((a) => isBlockedAddress(a.address))) {
+      throw new ACEError('blocked_address', `${domain.slice(0, 100)} resolves to a blocked address`);
     }
-    if (res.status !== 200) {
-      throw new ACEError('invalid_registration', `HTTP ${res.status} (redirects are not followed)`, { status: res.status });
-    }
-    const media = (res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
-    if (media !== 'application/json') throw new ACEError('invalid_registration', 'content-type must be application/json');
-    try {
-      body = await readLimited(res, maxBytes + 1);
-    } catch (e) {
-      throw new ACEError('fetch_failed', `read failed: ${e instanceof Error ? e.message : ''}`);
-    }
-  } finally {
-    clearTimeout(timer);
+    res = await httpsGet(https, domain, addrs[0], deps.port ?? 443, timeoutMs, maxBytes + 1);
+  } else {
+    res = await fetchGet(domain, timeoutMs, maxBytes + 1);
   }
+  if (res.status >= 500 || res.status === 429) throw new ACEError('fetch_failed', `HTTP ${res.status}`, { status: res.status });
+  if (res.status !== 200) {
+    throw new ACEError('invalid_registration', `HTTP ${res.status} (redirects are not followed)`, { status: res.status });
+  }
+  if (res.contentType.split(';')[0].trim().toLowerCase() !== 'application/json') {
+    throw new ACEError('invalid_registration', 'content-type must be application/json');
+  }
+  const body = await res.body();
   if (body.length > maxBytes) throw new ACEError('invalid_registration', `registration file exceeds ${maxBytes} bytes`);
   let data: unknown;
   try {
@@ -571,6 +575,95 @@ export async function fetchRegistrationFile(domain: string, opts: FetchRegistrat
   const reg = parseRegistrationFile(data);
   verifyRegistrationFile(reg);
   return reg;
+}
+
+/** Node: one GET pinned to the validated address. */
+function httpsGet(
+  https: typeof import('node:https'), domain: string, addr: { address: string; family: number }, port: number,
+  timeoutMs: number, limit: number,
+): Promise<{ status: number; contentType: string; body: () => Promise<Uint8Array> }> {
+  return new Promise((resolve, reject) => {
+    const fail = (e: unknown) => reject(e instanceof ACEError ? e : new ACEError('fetch_failed', `fetch failed: ${e instanceof Error ? e.message : String(e)}`));
+    const pinned = (_host: string, o: unknown, cb: (...args: unknown[]) => void) => {
+      const all = typeof o === 'object' && o !== null && (o as { all?: boolean }).all === true;
+      if (all) cb(null, [{ address: addr.address, family: addr.family }]);
+      else cb(null, addr.address, addr.family);
+    };
+    const timer = setTimeout(() => {
+      req.destroy(new ACEError('fetch_failed', `timed out after ${timeoutMs} ms`));
+    }, timeoutMs);
+    (timer as { unref?: () => void }).unref?.();
+    const req = https.request({
+      host: domain, servername: domain, port, path: '/.well-known/ace.json', method: 'GET',
+      headers: { Accept: 'application/json' }, lookup: pinned as never, agent: false,
+    }, (msg) => {
+      const status = msg.statusCode ?? 0;
+      const contentType = String(msg.headers['content-type'] ?? '');
+      const body = () => new Promise<Uint8Array>((res2, rej2) => {
+        const chunks: Buffer[] = [];
+        let total = 0;
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          res2(new Uint8Array(Buffer.concat(chunks).subarray(0, limit)));
+        };
+        msg.on('data', (c: Buffer) => {
+          chunks.push(c);
+          total += c.length;
+          if (total >= limit) {
+            finish();
+            msg.destroy();
+          }
+        });
+        msg.on('end', finish);
+        msg.on('error', (e) => {
+          if (done) return;
+          clearTimeout(timer);
+          rej2(new ACEError('fetch_failed', `read failed: ${e.message}`));
+        });
+      });
+      if (status !== 200) {
+        clearTimeout(timer);
+        msg.resume();
+      }
+      resolve({ status, contentType, body });
+    });
+    req.on('error', (e) => {
+      clearTimeout(timer);
+      fail(e);
+    });
+    req.end();
+  });
+}
+
+/** Non-Node runtimes: plain fetch (no DNS check possible). */
+async function fetchGet(domain: string, timeoutMs: number, limit: number): Promise<{ status: number; contentType: string; body: () => Promise<Uint8Array> }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let r: Response;
+  try {
+    r = await fetch(`https://${domain}/.well-known/ace.json`, {
+      headers: { Accept: 'application/json' }, signal: controller.signal, redirect: 'manual',
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    throw new ACEError('fetch_failed', `fetch failed: ${e instanceof Error ? e.message : ''}`);
+  }
+  return {
+    status: r.status,
+    contentType: r.headers.get('content-type') ?? '',
+    body: async () => {
+      try {
+        return await readLimited(r, limit);
+      } catch (e) {
+        throw new ACEError('fetch_failed', `read failed: ${e instanceof Error ? e.message : ''}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
 }
 
 /** Internal: read at most `limit` bytes of a response body, cancelling the rest. */

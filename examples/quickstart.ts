@@ -35,7 +35,7 @@ export async function overRelay(relayUrl: string): Promise<ParsedMessage[]> {
   // Alice resolves Bob through the relay (binding verified, pinned under the rollback barrier).
   const aliceStore = new MemoryStore();
   const alicePeers = new PeerStore({ store: aliceStore, relay });
-  const outbox = new Outbox({ identity: alice, store: aliceStore });
+  const outbox = await Outbox.open({ identity: alice, store: aliceStore });
   const pending = await outbox.stage({
     recipient: await alicePeers.resolve(bob.getACEId()), type: 'rfq', threadId: 'translation-1',
     body: { need: 'Translate 500 words EN→FR', maxPrice: '10', currency: 'USDC' },

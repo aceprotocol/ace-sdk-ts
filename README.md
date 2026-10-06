@@ -73,7 +73,7 @@ export async function overRelay(relayUrl: string): Promise<ParsedMessage[]> {
   // Alice resolves Bob through the relay (binding verified, pinned under the rollback barrier).
   const aliceStore = new MemoryStore();
   const alicePeers = new PeerStore({ store: aliceStore, relay });
-  const outbox = new Outbox({ identity: alice, store: aliceStore });
+  const outbox = await Outbox.open({ identity: alice, store: aliceStore });
   const pending = await outbox.stage({
     recipient: await alicePeers.resolve(bob.getACEId()), type: 'rfq', threadId: 'translation-1',
     body: { need: 'Translate 500 words EN→FR', maxPrice: '10', currency: 'USDC' },
@@ -144,7 +144,7 @@ Economic messages require a `threadId` and follow the transition table of the sp
 
 - `ACEStore` — `read` / `write` (atomic) / `delete` / `list` / `lock`; `MemoryStore`, `FileStore(root)`
 - `PeerStore({ store, relay?, ttlSeconds?, clock? })` — `get`, `resolve`, `adopt`, `pinRegistrationFile`, `remove`. A registration file never rotates a pinned encryption key; rotation needs a newer signed relay binding.
-- `Outbox({ identity, store })` — `stage`, `deliver(requestId, transport)`, `resign` (after `envelope_expired`), `abandon`, `pending`
+- `Outbox.open({ identity, store })` — repairs threads from crashed receives, then `stage`, `deliver(requestId, transport)`, `resign` (after `envelope_expired`), `abandon`, `pending`
 - `Inbox.open({ identity, store, peers, onMessage })` — `receive(envelope, source)`, `pull(relay)`, `follow(relay)`, `cursor(relayUrl)`, `close`. `onMessage` must persist its effect idempotently keyed by `(from, messageId)`.
 - `ThreadStore({ store, localAceId })` — read access to persisted threads
 - `RelayClient(baseUrl)` — `register`, `unregister`, `lookupPeer`, `discover`, `send`, `fetchInbox`, `listen`, `postIntent`, `listIntents`

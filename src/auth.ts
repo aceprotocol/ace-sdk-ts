@@ -96,6 +96,10 @@ export function parseAuthHeaders(headers: Record<string, string | string[] | und
 }
 
 /**
+ * Stateless: this only checks freshness and the signature. The caller (a relay) MUST also
+ * enforce once-only acceptance of each `(action, aceId, signature)` while its timestamp is inside
+ * the window, rejecting repeats with 409 `replay` (08-relay § Authentication).
+ *
  * Check order: `auth.aceId !== signer.aceId` → `invalid_argument`; `|now - ts| > window` →
  * `stale_timestamp`; bad encoding or signature → `invalid_signature`.
  */

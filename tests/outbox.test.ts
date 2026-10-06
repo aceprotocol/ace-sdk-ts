@@ -1,6 +1,6 @@
 // Outbox: stage / deliver / resign / abandon / pending; ThreadStore pruning.
 import { describe, expect, it } from 'vitest';
-import { ACEError, ThreadStore, type ACEMessage } from '../src/index.js';
+import { ACEError, Outbox, ThreadStore, type ACEMessage } from '../src/index.js';
 import { sha256Hex } from '../src/encoding.js';
 import { threadKey } from '../src/thread-store.js';
 import { expectCode } from './helpers.js';
@@ -154,7 +154,7 @@ describe('Outbox', () => {
     expect((await store.get(rej.message.conversationId, 'old'))!.state).toBe('rejected');
     expect(await store.allowedTypes(rej.message.conversationId, 'old', alice.id)).toEqual([]);
     clock.t += 30 * 86400 + 10;
-    const fresh = new (await import('../src/index.js')).Outbox({ identity: bob.identity, store: bob.store, clock: clock.fn });
+    const fresh = await Outbox.open({ identity: bob.identity, store: bob.store, clock: clock.fn });
     const keep = await fresh.stage({ recipient: await bob.peer(alice), type: 'rfq', body: { need: 'new' }, threadId: 'new', requestId: 'n' });
     expect((await store.list()).map((s) => s.threadId)).toEqual(['new']);
     expect(await store.remove(keep.message.conversationId, 'new')).toBe(true);

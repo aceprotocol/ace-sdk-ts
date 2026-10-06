@@ -101,6 +101,7 @@ export class Inbox {
   #replay: ReplayDetector;
   #cursors: Record<string, string>;
   #failed: ACEError | null = null;
+  #heldThreads: (() => Promise<void>) | null = null;
   #closed = false;
   #sinceSweep = 0;
 
@@ -251,7 +252,13 @@ export class Inbox {
     if (this.#closed) return;
     this.#closed = true;
     await this.#queue.run(async () => undefined);
-    await this.#releaseReceive();
+    const held = this.#heldThreads;
+    this.#heldThreads = null;
+    try {
+      if (held !== null) await held();
+    } finally {
+      await this.#releaseReceive();
+    }
   }
 
   // --- receive ---
@@ -411,10 +418,19 @@ export class Inbox {
     if (!economic) {
       committed = await run();
     } else {
+      let release: () => Promise<void>;
       try {
-        committed = await this.#threads.withLock(run);
+        release = await this.#store.lock('threads');
       } catch (e) {
         return { kind: 'retryable', error: asError(e, 'storage_failed', 'threads lock failed') };
+      }
+      try {
+        committed = await run();
+      } finally {
+        // A failure after the commit point keeps `threads` held until close(), so no concurrent
+        // Outbox.stage can extend the thread before recovery repairs it.
+        if (this.#failed !== null) this.#heldThreads = release;
+        else await release();
       }
     }
     if ('kind' in committed) return committed;
@@ -449,42 +465,8 @@ export class Inbox {
     }));
   }
 
-  async #readDelivery(key: string): Promise<DeliveryRecord | null> {
-    const raw = await this.#store.read(key);
-    if (raw === null) return null;
-    const bad = (why: string) => new ACEError('storage_failed', `${key}: ${why}`);
-    const doc = parseStateBytes(raw, key) as Record<string, unknown>;
-    if (typeof doc !== 'object' || doc === null || doc.version !== 1) throw bad('unknown version');
-    const m = doc.message as Record<string, unknown>;
-    const receivedAt = wireInt(doc.receivedAt);
-    if (
-      typeof doc.fingerprint !== 'string' || receivedAt === null || (doc.source !== 'relay' && doc.source !== 'direct')
-      || (doc.status !== 'pending' && doc.status !== 'acked') || typeof m !== 'object' || m === null
-      || !isMessageId(m.messageId) || !isACEId(m.from) || !isACEId(m.to) || !isConversationId(m.conversationId)
-      || !isMessageType(m.type) || (m.threadId !== null && !isThreadId(m.threadId)) || wireInt(m.timestamp) === null
-      || typeof m.body !== 'object' || m.body === null || Array.isArray(m.body)
-    ) {
-      throw bad('invalid delivery record');
-    }
-    if (deliveryKey(m.from as string, m.messageId as string) !== key) throw bad('record does not match its key');
-    let thread: ThreadSnapshot | null = null;
-    if (doc.thread !== null) {
-      const t = doc.thread as ThreadSnapshot;
-      try {
-        ThreadStateMachine.fromState([t], { localAceId: this.#identity.getACEId() });
-      } catch {
-        throw bad('invalid thread snapshot');
-      }
-      thread = t;
-    }
-    return {
-      fingerprint: doc.fingerprint,
-      message: {
-        messageId: m.messageId as string, from: m.from as string, to: m.to as string, conversationId: m.conversationId as string,
-        type: m.type, threadId: (m.threadId as string | null), timestamp: m.timestamp as number, body: m.body as JSONObject,
-      },
-      receivedAt, source: doc.source, status: doc.status, thread,
-    };
+  #readDelivery(key: string): Promise<DeliveryRecord | null> {
+    return readDelivery(this.#store, key, this.#identity.getACEId());
   }
 
   #covered(from: string, ts: number): boolean {
@@ -534,17 +516,12 @@ export class Inbox {
   // --- recovery ---
 
   async #recover(): Promise<void> {
-    const records: Array<[string, DeliveryRecord]> = [];
-    for (const key of await this.#store.list('deliveries/')) {
-      const d = await this.#readDelivery(key);
-      if (d !== null) records.push([key, d]);
-    }
-    records.sort((a, b) => a[1].message.timestamp - b[1].message.timestamp || (a[0] < b[0] ? -1 : 1));
+    const records = await readDeliveries(this.#store, this.#identity.getACEId());
+    await this.#threads.withLock(() => repairThreads(this.#threads, records));
     let replayChanged = false;
     const floor = this.#floor();
-    for (const [key, d] of records) {
+    for (const [, d] of records) {
       const m = d.message;
-      if (d.thread !== null) await this.#repairThread(d.thread);
       if (this.#replay.accepts(m.messageId, m.from, m.timestamp)) {
         this.#replay.commit(m.messageId, m.from, m.timestamp, floor);
         replayChanged = true;
@@ -565,15 +542,75 @@ export class Inbox {
       }
     }
   }
+}
 
-  async #repairThread(snap: ThreadSnapshot): Promise<void> {
-    await this.#threads.withLock(async () => {
-      const rec = await this.#threads.loadRecord(snap.conversationId, snap.threadId);
-      const cmp = rec === null ? -1 : compareHistories(rec.snapshot.history, snap.history);
-      if (cmp === null) throw new ACEError('storage_failed', 'delivery record diverges from the stored thread');
-      if (cmp === -1) await this.#threads.saveRecord({ snapshot: snap, pending: clearedPending(rec, snap) });
-    });
+async function readDelivery(store: ACEStore, key: string, localAceId: string): Promise<DeliveryRecord | null> {
+  const raw = await store.read(key);
+  if (raw === null) return null;
+  const bad = (why: string) => new ACEError('storage_failed', `${key}: ${why}`);
+  const doc = parseStateBytes(raw, key) as Record<string, unknown>;
+  if (typeof doc !== 'object' || doc === null || doc.version !== 1) throw bad('unknown version');
+  const m = doc.message as Record<string, unknown>;
+  const receivedAt = wireInt(doc.receivedAt);
+  if (
+    typeof doc.fingerprint !== 'string' || receivedAt === null || (doc.source !== 'relay' && doc.source !== 'direct')
+    || (doc.status !== 'pending' && doc.status !== 'acked') || typeof m !== 'object' || m === null
+    || !isMessageId(m.messageId) || !isACEId(m.from) || !isACEId(m.to) || !isConversationId(m.conversationId)
+    || !isMessageType(m.type) || (m.threadId !== null && !isThreadId(m.threadId)) || wireInt(m.timestamp) === null
+    || typeof m.body !== 'object' || m.body === null || Array.isArray(m.body)
+  ) {
+    throw bad('invalid delivery record');
   }
+  if (deliveryKey(m.from as string, m.messageId as string) !== key) throw bad('record does not match its key');
+  let thread: ThreadSnapshot | null = null;
+  if (doc.thread !== null) {
+    const t = doc.thread as ThreadSnapshot;
+    try {
+      ThreadStateMachine.fromState([t], { localAceId: localAceId });
+    } catch {
+      throw bad('invalid thread snapshot');
+    }
+    thread = t;
+  }
+  return {
+    fingerprint: doc.fingerprint,
+    message: {
+      messageId: m.messageId as string, from: m.from as string, to: m.to as string, conversationId: m.conversationId as string,
+      type: m.type, threadId: (m.threadId as string | null), timestamp: m.timestamp as number, body: m.body as JSONObject,
+    },
+    receivedAt, source: doc.source, status: doc.status, thread,
+  };
+}
+
+
+/** Internal: every delivery record, ordered by (timestamp, key). */
+async function readDeliveries(store: ACEStore, localAceId: string): Promise<Array<[string, DeliveryRecord]>> {
+  const records: Array<[string, DeliveryRecord]> = [];
+  for (const key of await store.list('deliveries/')) {
+    const d = await readDelivery(store, key, localAceId);
+    if (d !== null) records.push([key, d]);
+  }
+  return records.sort((x, y) => x[1].message.timestamp - y[1].message.timestamp || (x[0] < y[0] ? -1 : 1));
+}
+
+/** Write every delivery snapshot that strictly extends its stored thread (caller holds `threads`). */
+async function repairThreads(threads: ThreadStore, records: Array<[string, DeliveryRecord]>): Promise<void> {
+  for (const [, d] of records) {
+    const snap = d.thread;
+    if (snap === null) continue;
+    const rec = await threads.loadRecord(snap.conversationId, snap.threadId);
+    const cmp = rec === null ? -1 : compareHistories(rec.snapshot.history, snap.history);
+    if (cmp === null) throw new ACEError('storage_failed', 'delivery record diverges from the stored thread');
+    if (cmp === -1) await threads.saveRecord({ snapshot: snap, pending: clearedPending(rec, snap) });
+  }
+}
+
+/**
+ * Internal (Outbox.open): under lock `threads`, repair thread records from `deliveries/`.
+ * Never hands messages over and never touches replay state.
+ */
+export async function repairThreadsFromDeliveries(store: ACEStore, threads: ThreadStore): Promise<void> {
+  await threads.withLock(async () => repairThreads(threads, await readDeliveries(store, threads.localAceId)));
 }
 
 /** Keep the stored pending send unless an inbound entry now follows it (delivery proven). */

@@ -187,3 +187,38 @@ describe('peers and registration', () => {
     await expectCode(fetchRegistrationFile('example.com', { timeoutMs: 0 }), 'invalid_argument');
   });
 });
+
+describe('fetchRegistrationFile DNS pinning', () => {
+  it('rejects if ANY resolved address is blocked, resolves once and connects only to the validated address', async () => {
+    const { fetchRegistrationFileWith } = await import('../src/discovery.js');
+    const net = await import('node:net');
+    const calls: string[] = [];
+    const lookupOf = (addrs: string[]) => async (host: string) => {
+      calls.push(host);
+      return addrs.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+    };
+    await expectCode(fetchRegistrationFileWith('agent.example.com', {}, { lookup: lookupOf(['93.184.216.34', '10.0.0.1']) }), 'blocked_address');
+    await expectCode(fetchRegistrationFileWith('agent.example.com', {}, { lookup: lookupOf(['::ffff:127.0.0.1']) }), 'blocked_address');
+    await expectCode(fetchRegistrationFileWith('agent.example.com', {}, { lookup: async () => { throw new Error('NXDOMAIN'); } }), 'fetch_failed');
+    // a local TCP endpoint stands in for the validated address: the TLS handshake reaches it
+    const seen: string[] = [];
+    const server = net.createServer((sock) => {
+      seen.push(sock.remoteAddress ?? '');
+      sock.once('data', (d) => {
+        seen.push(d.includes(Buffer.from('agent.example.com')) ? 'sni' : 'no-sni');
+        sock.destroy();
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as import('node:net').AddressInfo).port;
+    calls.length = 0;
+    try {
+      await expectCode(fetchRegistrationFileWith('agent.example.com', { allowPrivateAddresses: true, timeoutMs: 2000 },
+        { lookup: lookupOf(['127.0.0.1']), port }), 'fetch_failed');
+    } finally {
+      server.close();
+    }
+    expect(calls).toEqual(['agent.example.com']); // resolved exactly once
+    expect(seen).toEqual(['127.0.0.1', 'sni']); // connected to the pinned address with SNI = domain
+  });
+});
