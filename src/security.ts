@@ -1,4 +1,4 @@
-const MAX_DRIFT_SECONDS = 300; // 5 minutes
+export const MAX_DRIFT_SECONDS = 300; // 5 minutes
 const MESSAGE_ID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 import { sanitizeForError } from './utils.js';
@@ -50,9 +50,11 @@ export class ReplayDetector {
   private seen: Map<string, number>;
   private readonly capacity: number;
   private readonly ttlMs: number;
+  readonly ttlSeconds: number;
 
   constructor(capacity: number = 100_000, ttlSeconds: number = MAX_DRIFT_SECONDS) {
     this.capacity = capacity;
+    this.ttlSeconds = ttlSeconds;
     this.ttlMs = ttlSeconds * 1000;
     this.seen = new Map();
   }
@@ -72,8 +74,10 @@ export class ReplayDetector {
   /**
    * Atomically check if a messageId has been seen and reserve it.
    * Returns true if the message is new (accepted), false if duplicate (rejected).
+   * With `evictWhenFull: false`, throws instead of evicting an unexpired entry
+   * when at capacity (evicting would reopen a replay window).
    */
-  checkAndReserve(messageId: string): boolean {
+  checkAndReserve(messageId: string, evictWhenFull: boolean = true): boolean {
     this.evictExpired();
 
     if (this.seen.has(messageId)) {
@@ -82,6 +86,9 @@ export class ReplayDetector {
 
     // Hard capacity cap — evict oldest regardless of TTL
     if (this.seen.size >= this.capacity) {
+      if (!evictWhenFull) {
+        throw new Error('ReplayDetector at capacity');
+      }
       const oldest = this.seen.keys().next().value!;
       this.seen.delete(oldest);
     }

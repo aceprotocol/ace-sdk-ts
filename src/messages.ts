@@ -5,7 +5,7 @@ import { isEconomicType } from './types.js';
 import { toBase64, fromBase64, computeACEId } from './identity.js';
 import { computeConversationId, encrypt, decodeKemCiphertext, MAX_PAYLOAD_SIZE } from './encryption.js';
 import { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
-import { checkTimestampFreshness, validateMessageId, ReplayDetector } from './security.js';
+import { checkTimestampFreshness, validateMessageId, ReplayDetector, MAX_DRIFT_SECONDS } from './security.js';
 import {
   validateRegistrationFile,
   verifyRegistrationId,
@@ -443,8 +443,17 @@ export async function parseMessage(
 
   // 2. Timestamp freshness (pipeline step 2 — BEFORE expensive ops)
   checkTimestampFreshness(msg.timestamp, opts.oldestTimestamp);
-  if (opts.oldestTimestamp !== undefined && !opts.replayDetector) {
-    throw new Error('Offline delivery requires a ReplayDetector');
+  const offline = opts.oldestTimestamp !== undefined;
+  if (offline) {
+    if (!opts.replayDetector) {
+      throw new Error('Offline delivery requires a ReplayDetector');
+    }
+    // Entries must outlive the acceptance window, or an evicted messageId
+    // could be replayed while its timestamp is still >= oldestTimestamp.
+    const windowSeconds = Math.floor(Date.now() / 1000) - opts.oldestTimestamp! + MAX_DRIFT_SECONDS;
+    if (opts.replayDetector.ttlSeconds < windowSeconds) {
+      throw new Error(`Offline delivery requires ReplayDetector ttlSeconds >= ${windowSeconds}`);
+    }
   }
 
   // 3. Replay detection (pipeline step 3 — BEFORE signature verification)
@@ -454,7 +463,7 @@ export async function parseMessage(
     throw new Error(`Economic message type '${msg.type}' requires a ReplayDetector for security`);
   }
   if (opts.replayDetector) {
-    if (!opts.replayDetector.checkAndReserve(msg.messageId)) {
+    if (!opts.replayDetector.checkAndReserve(msg.messageId, !offline)) {
       throw new Error(`Replay detected: messageId '${msg.messageId}' already processed`);
     }
   }
