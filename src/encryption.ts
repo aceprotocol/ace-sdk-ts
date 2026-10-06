@@ -1,256 +1,134 @@
+/**
+ * ACE E2E encryption: X-Wing hybrid KEM + HKDF-SHA256 + AES-256-GCM.
+ *
+ *   (ss, kemCiphertext) = XWing.Encapsulate(recipientPublicKey)
+ *   aesKey  = HKDF-SHA256(ikm = ss, salt = SHA-256("ace.protocol.kem.v1"), info = conversationId, L = 32)
+ *   payload = nonce[12] || AES-256-GCM(aesKey, nonce, plaintext, aad = conversationId)
+ *
+ * `@noble/post-quantum`'s `ml_kem768_x25519` is X-Wing (draft-connolly-cfrg-xwing-kem-11).
+ * This module is the single owner of the X-Wing byte-length checks.
+ */
+
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { fromBase64 } from './utils.js';
+import { ACEError } from './errors.js';
+import { compareBytes, isConversationId, utf8 } from './encoding.js';
+import {
+  KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_SEED_SIZE, MAX_PAYLOAD_BYTES, MAX_PLAINTEXT_BYTES,
+} from './limits.js';
 
-// ACE message encryption: X-Wing hybrid KEM → HKDF-SHA256 → AES-256-GCM.
-//
-// X-Wing (draft-connolly-cfrg-xwing-kem-11) combines ML-KEM-768 with X25519 as
-// its classical component. `@noble/post-quantum`'s `ml_kem768_x25519` IS X-Wing:
-// label `\.//^\`, SHA3-256 combiner, SHAKE256 seed expansion. The combiner binds
-// the recipient public key and the KEM ciphertext, so no small-order-point or
-// all-zero shared-secret checks are needed (or performed) here.
+export const ACE_KEM_SALT = sha256(utf8('ace.protocol.kem.v1'));
+const NONCE_LEN = 12;
+export const MIN_PAYLOAD_BYTES = 28;
 
-const _encoder = new TextEncoder();
-
-/** X-Wing private key = 32-byte seed (expanded with SHAKE256 at use time). */
-export const KEM_SEED_SIZE = 32;
-/** X-Wing public key: pk_M[1184] || pk_X[32]. */
-export const KEM_PUBLIC_KEY_SIZE = 1216;
-/** X-Wing ciphertext: ct_M[1088] || ct_X[32]. */
-export const KEM_CIPHERTEXT_SIZE = 1120;
-
-// Pre-computed: SHA-256("ace.protocol.kem.v1") — internal, never exposed directly
-const _ACE_KEM_SALT = sha256(_encoder.encode('ace.protocol.kem.v1'));
-
-/** Returns a copy of the ACE KEM salt (SHA-256 of "ace.protocol.kem.v1"). */
-export function getACEKemSalt(): Uint8Array {
-  return _ACE_KEM_SALT.slice();
+function isBytes(v: unknown, n: number): v is Uint8Array {
+  return v instanceof Uint8Array && v.length === n;
 }
 
-// === Byte-length validation (single owner for the X-Wing sizes) ===
+export function isKemPublicKey(v: unknown): v is Uint8Array {
+  return isBytes(v, KEM_PUBLIC_KEY_SIZE);
+}
 
-function assertExactLength(bytes: Uint8Array, expected: number, what: string): void {
-  if (bytes.length !== expected) {
-    throw new Error(`${what} must be exactly ${expected} bytes, got ${bytes.length}`);
+export function isKemCiphertext(v: unknown): v is Uint8Array {
+  return isBytes(v, KEM_CIPHERTEXT_SIZE);
+}
+
+/** hex(SHA-256(min(pubA, pubB) || max(pubA, pubB))) over two 1216-byte X-Wing public keys. */
+export function computeConversationId(pubA: Uint8Array, pubB: Uint8Array): string {
+  if (!isKemPublicKey(pubA) || !isKemPublicKey(pubB)) {
+    throw new ACEError('invalid_key', `X-Wing public keys must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
   }
+  const [a, b] = compareBytes(pubA, pubB) <= 0 ? [pubA, pubB] : [pubB, pubA];
+  const buf = new Uint8Array(a.length + b.length);
+  buf.set(a, 0);
+  buf.set(b, a.length);
+  return bytesToHex(sha256(buf));
 }
 
-/** Assert that `pk` is a 1216-byte X-Wing public key. */
-export function validatePublicKey(pk: Uint8Array): void {
-  assertExactLength(pk, KEM_PUBLIC_KEY_SIZE, 'X-Wing public key');
-}
-
-/** Assert that `ct` is a 1120-byte X-Wing KEM ciphertext. */
-export function validateKemCiphertext(ct: Uint8Array): void {
-  assertExactLength(ct, KEM_CIPHERTEXT_SIZE, 'X-Wing KEM ciphertext');
-}
-
-/** Assert that `seed` is a 32-byte X-Wing seed (the private key). */
-export function validateSeed(seed: Uint8Array): void {
-  assertExactLength(seed, KEM_SEED_SIZE, 'X-Wing seed');
-}
-
-// === Base64 wire decoding ===
-
-/** Decode a Base64 X-Wing public key, enforcing the exact 1216-byte length. */
-export function decodeKemPublicKey(b64: string): Uint8Array {
-  const bytes = fromBase64(b64, KEM_PUBLIC_KEY_SIZE, 'X-Wing public key');
-  validatePublicKey(bytes);
-  return bytes;
-}
-
-/** Decode a Base64 X-Wing KEM ciphertext, enforcing the exact 1120-byte length. */
-export function decodeKemCiphertext(b64: string): Uint8Array {
-  const bytes = fromBase64(b64, KEM_CIPHERTEXT_SIZE, 'X-Wing KEM ciphertext');
-  validateKemCiphertext(bytes);
-  return bytes;
-}
-
-/**
- * Lexicographic byte comparison. Returns negative if a < b, positive if a > b, 0 if equal.
- *
- * SAFETY: This is variable-time, which is acceptable here because it operates
- * exclusively on public keys (not secret material). Do NOT reuse for secrets.
- */
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
-  for (let i = 0; i < Math.min(a.length, b.length); i++) {
-    if (a[i] !== b[i]) return a[i] - b[i];
-  }
-  return a.length - b.length;
-}
-
-/**
- * Compute deterministic conversation ID from two X-Wing encryption public keys.
- * conversationId = hex(SHA-256(sort_bytes(pubA, pubB)))
- */
-export function computeConversationId(
-  pubA: Uint8Array,
-  pubB: Uint8Array,
-): string {
-  validatePublicKey(pubA);
-  validatePublicKey(pubB);
-  const [first, second] = compareBytes(pubA, pubB) <= 0 ? [pubA, pubB] : [pubB, pubA];
-  const combined = new Uint8Array(first.length + second.length);
-  combined.set(first, 0);
-  combined.set(second, first.length);
-  return bytesToHex(sha256(combined));
-}
-
-// Minimum payload size: nonce[12] + GCM tag[16] = 28 bytes (0-byte plaintext)
-const MIN_PAYLOAD_LENGTH = 28;
-export const MAX_PAYLOAD_SIZE = 10 * 1024 * 1024;
-export const MAX_PLAINTEXT_SIZE = MAX_PAYLOAD_SIZE - MIN_PAYLOAD_LENGTH;
-
-// === X-Wing KEM primitives ===
-
-/**
- * Derive the X-Wing public key (1216 bytes) from a 32-byte seed.
- */
-export function kemPublicKeyFromSeed(seed: Uint8Array): Uint8Array {
-  validateSeed(seed);
-  return ml_kem768_x25519.getPublicKey(seed);
-}
-
-/**
- * Generate a fresh random X-Wing seed (the private key).
- */
+/** A fresh 32-byte X-Wing private seed. */
 export function generateKemSeed(): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(KEM_SEED_SIZE));
 }
 
-/**
- * X-Wing encapsulation against a recipient public key.
- * Returns the 1120-byte KEM ciphertext and the 32-byte shared secret.
- */
-export function kemEncapsulate(
-  recipientPubKey: Uint8Array,
-): { kemCiphertext: Uint8Array; sharedSecret: Uint8Array } {
-  validatePublicKey(recipientPubKey);
-  const { cipherText, sharedSecret } = ml_kem768_x25519.encapsulate(recipientPubKey);
-  return { kemCiphertext: cipherText, sharedSecret };
+/** The 1216-byte X-Wing public key of a 32-byte seed. */
+export function kemPublicKeyFromSeed(seed: Uint8Array): Uint8Array {
+  if (!isBytes(seed, KEM_SEED_SIZE)) throw new ACEError('invalid_key', `X-Wing seed must be ${KEM_SEED_SIZE} bytes`);
+  return ml_kem768_x25519.getPublicKey(seed);
 }
 
-/**
- * X-Wing decapsulation with a 32-byte seed. Implicit rejection: an invalid
- * ciphertext yields a pseudorandom secret rather than an error; the AEAD tag
- * check downstream is what actually fails.
- */
-export function kemDecapsulate(kemCiphertext: Uint8Array, seed: Uint8Array): Uint8Array {
-  validateSeed(seed);
-  validateKemCiphertext(kemCiphertext);
-  return ml_kem768_x25519.decapsulate(kemCiphertext, seed);
+/** Internal: raw X-Wing decapsulation (used by the KAT tests). */
+export function xwingDecapsulate(ciphertext: Uint8Array, seed: Uint8Array): Uint8Array {
+  if (!isKemCiphertext(ciphertext)) throw new ACEError('decryption_failed', `X-Wing ciphertext must be ${KEM_CIPHERTEXT_SIZE} bytes`);
+  try {
+    return ml_kem768_x25519.decapsulate(ciphertext, seed);
+  } catch {
+    throw new ACEError('decryption_failed', 'X-Wing decapsulation failed');
+  }
 }
 
-// === ACE message encryption ===
+async function aesKey(sharedSecret: Uint8Array, conversationId: string, usage: 'encrypt' | 'decrypt'): Promise<CryptoKey> {
+  const raw = hkdf(sha256, sharedSecret, ACE_KEM_SALT, utf8(conversationId), 32);
+  const copy = Uint8Array.from(raw);
+  try {
+    return await crypto.subtle.importKey('raw', copy, 'AES-GCM', false, [usage]);
+  } finally {
+    raw.fill(0);
+    copy.fill(0);
+  }
+}
 
-/**
- * Encrypt plaintext for a recipient.
- * Returns the X-Wing KEM ciphertext + encrypted payload (nonce || ciphertext || tag).
- * The recipient public key is validated by {@link kemEncapsulate}.
- */
+/** Internal: returns `{kemCiphertext, payload}`. */
 export async function encrypt(
-  plaintext: Uint8Array,
-  recipientPubKey: Uint8Array,
-  conversationId: string,
+  plaintext: Uint8Array, recipientPublicKey: Uint8Array, conversationId: string,
 ): Promise<{ kemCiphertext: Uint8Array; payload: Uint8Array }> {
-  // 0. Validate plaintext size
-  if (plaintext.length > MAX_PLAINTEXT_SIZE) {
-    throw new Error(
-      `Plaintext too large: maximum is ${MAX_PLAINTEXT_SIZE} bytes, got ${plaintext.length}`,
-    );
-  }
-
-  // 1. X-Wing encapsulation → (ct, ss)
-  const { kemCiphertext, sharedSecret } = kemEncapsulate(recipientPubKey);
-
-  // 2. HKDF key derivation
-  const convIdBytes = _encoder.encode(conversationId);
-  const aesKey = hkdf(sha256, sharedSecret, _ACE_KEM_SALT, convIdBytes, 32);
-
+  if (plaintext.length > MAX_PLAINTEXT_BYTES) throw new ACEError('limit_exceeded', `plaintext exceeds ${MAX_PLAINTEXT_BYTES} bytes`);
+  if (!isKemPublicKey(recipientPublicKey)) throw new ACEError('invalid_key', 'recipient X-Wing public key must be 1216 bytes');
+  const { cipherText, sharedSecret } = ml_kem768_x25519.encapsulate(recipientPublicKey);
   try {
-    // 3. AES-256-GCM encryption via Web Crypto
-    const nonce = crypto.getRandomValues(new Uint8Array(12));
-
-    const cryptoKey = await crypto.subtle.importKey(
-      'raw', Uint8Array.from(aesKey), 'AES-GCM', false, ['encrypt'],
-    );
-    const encrypted = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: nonce, additionalData: convIdBytes },
-      cryptoKey,
-      Uint8Array.from(plaintext),
-    );
-    // Web Crypto returns ciphertext || tag (tag is last 16 bytes)
-    const encryptedBytes = new Uint8Array(encrypted);
-
-    // 4. Payload = nonce[12] || ciphertext || tag[16]
-    const payload = new Uint8Array(12 + encryptedBytes.length);
+    const key = await aesKey(sharedSecret, conversationId, 'encrypt');
+    const nonce = crypto.getRandomValues(new Uint8Array(NONCE_LEN));
+    const ct = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: nonce, additionalData: Uint8Array.from(utf8(conversationId)) }, key, Uint8Array.from(plaintext),
+    ));
+    const payload = new Uint8Array(NONCE_LEN + ct.length);
     payload.set(nonce, 0);
-    payload.set(encryptedBytes, 12);
-    if (payload.length > MAX_PAYLOAD_SIZE) {
-      throw new Error(
-        `Encrypted payload too large: maximum is ${MAX_PAYLOAD_SIZE} bytes, got ${payload.length}`,
-      );
-    }
-
-    return { kemCiphertext, payload };
+    payload.set(ct, NONCE_LEN);
+    return { kemCiphertext: cipherText, payload };
   } finally {
-    // Zero all key material
     sharedSecret.fill(0);
-    aesKey.fill(0);
   }
 }
 
 /**
- * Decrypt a message using own X-Wing seed (private key).
- * The seed and KEM ciphertext are validated by {@link kemDecapsulate}.
+ * Decrypt with a borrowed 32-byte X-Wing seed (for custom identities, e.g. a Secure Enclave
+ * wrapper that keeps the seed in a keychain).
+ *
+ * Crypto failures (decapsulation, AEAD, wrong ciphertext / payload length) are
+ * `ACEError(decryption_failed)`; a malformed seed is `invalid_key`; a malformed
+ * conversationId is `invalid_argument`.
  */
-export async function decrypt(
-  kemCiphertext: Uint8Array,
-  payload: Uint8Array,
-  recipientSeed: Uint8Array,
-  conversationId: string,
+export async function decryptWithSeed(
+  kemCiphertext: Uint8Array, payload: Uint8Array, seed: Uint8Array, conversationId: string,
 ): Promise<Uint8Array> {
-  // 0. Validate payload length (before any decapsulation)
-  if (payload.length < MIN_PAYLOAD_LENGTH) {
-    throw new Error(
-      `Payload too short: expected at least ${MIN_PAYLOAD_LENGTH} bytes, got ${payload.length}`,
-    );
+  if (!isBytes(seed, KEM_SEED_SIZE)) throw new ACEError('invalid_key', `X-Wing seed must be ${KEM_SEED_SIZE} bytes`);
+  if (!isConversationId(conversationId)) throw new ACEError('invalid_argument', 'conversationId must be 64 lowercase hex characters');
+  if (!(payload instanceof Uint8Array) || payload.length < MIN_PAYLOAD_BYTES || payload.length > MAX_PAYLOAD_BYTES) {
+    throw new ACEError('decryption_failed', 'payload length out of range');
   }
-  if (payload.length > MAX_PAYLOAD_SIZE) {
-    throw new Error(
-      `Payload too large: maximum is ${MAX_PAYLOAD_SIZE} bytes, got ${payload.length}`,
-    );
-  }
-
-  // 1. X-Wing decapsulation → ss
-  const sharedSecret = kemDecapsulate(kemCiphertext, recipientSeed);
-
-  // 2. HKDF key derivation
-  const convIdBytes = _encoder.encode(conversationId);
-  const aesKey = hkdf(sha256, sharedSecret, _ACE_KEM_SALT, convIdBytes, 32);
-
+  const sharedSecret = xwingDecapsulate(kemCiphertext, seed);
   try {
-    // 3. Parse payload: nonce[12] || ciphertext+tag
-    const nonce = payload.slice(0, 12);
-    const ciphertextAndTag = payload.slice(12);
-
-    // 4. AES-256-GCM decryption
-    const cryptoKey = await crypto.subtle.importKey(
-      'raw', Uint8Array.from(aesKey), 'AES-GCM', false, ['decrypt'],
-    );
-
-    const decrypted = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: nonce, additionalData: convIdBytes },
-      cryptoKey,
-      ciphertextAndTag,
-    );
-
-    return new Uint8Array(decrypted);
+    const key = await aesKey(sharedSecret, conversationId, 'decrypt');
+    try {
+      return new Uint8Array(await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: Uint8Array.from(payload.subarray(0, NONCE_LEN)), additionalData: Uint8Array.from(utf8(conversationId)) },
+        key, Uint8Array.from(payload.subarray(NONCE_LEN)),
+      ));
+    } catch {
+      throw new ACEError('decryption_failed', 'AEAD authentication failed');
+    }
   } finally {
-    // Zero all key material
     sharedSecret.fill(0);
-    aesKey.fill(0);
   }
 }

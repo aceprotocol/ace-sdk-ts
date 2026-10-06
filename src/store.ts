@@ -1,0 +1,140 @@
+/** Key-value persistence for the pipeline (design §2.9). */
+
+import { ACEError } from './errors.js';
+
+/**
+ * A durable key-value store. Keys match `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$` (≤ 200 chars).
+ * All I/O errors are `ACEError('storage_failed')`. Lock timeout is `receiver_busy` for the
+ * `receive` lock and `storage_failed` otherwise.
+ */
+export interface ACEStore {
+  read(key: string): Promise<Uint8Array | null>;
+  /** Atomic replace, durable when the promise resolves. */
+  write(key: string, value: Uint8Array): Promise<void>;
+  /** A missing key is not an error. */
+  delete(key: string): Promise<void>;
+  /** Keys starting with `prefix`, sorted ascending. */
+  list(prefix: string): Promise<string[]>;
+  /** Exclusive, non-reentrant lock. Resolves to a release function. */
+  lock(name: string, opts?: { timeoutMs?: number }): Promise<() => Promise<void>>;
+}
+
+const KEY_RE = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)*$/;
+const LOCK_RE = /^[a-z0-9][a-z0-9._-]*$/;
+export const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
+
+export function checkKey(key: unknown): string {
+  if (typeof key !== 'string' || key.length > 200 || !KEY_RE.test(key)) {
+    throw new ACEError('invalid_argument', `invalid store key ${JSON.stringify(String(key).slice(0, 60))}`);
+  }
+  return key;
+}
+
+export function checkLockName(name: unknown): string {
+  if (typeof name !== 'string' || name.length > 64 || !LOCK_RE.test(name)) {
+    throw new ACEError('invalid_argument', 'invalid lock name');
+  }
+  return name;
+}
+
+export function lockTimeoutError(name: string): ACEError {
+  return new ACEError(name === 'receive' ? 'receiver_busy' : 'storage_failed', `lock '${name}' is held`);
+}
+
+export function checkTimeout(timeoutMs: unknown): number {
+  const t = timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS;
+  if (typeof t !== 'number' || !Number.isFinite(t) || t < 0) throw new ACEError('invalid_argument', 'timeoutMs must be >= 0');
+  return t;
+}
+
+/** An async mutex with a timeout. Internal. */
+export class Mutex {
+  #held = false;
+  #waiters: Array<() => void> = [];
+
+  get held(): boolean {
+    return this.#held;
+  }
+
+  /** Resolves true when acquired, false on timeout. */
+  acquire(timeoutMs: number): Promise<boolean> {
+    if (!this.#held) {
+      this.#held = true;
+      return Promise.resolve(true);
+    }
+    if (timeoutMs <= 0) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const waiter = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        const i = this.#waiters.indexOf(waiter);
+        if (i >= 0) this.#waiters.splice(i, 1);
+        resolve(false);
+      }, timeoutMs);
+      this.#waiters.push(waiter);
+    });
+  }
+
+  release(): void {
+    const next = this.#waiters.shift();
+    if (next) next(); // ownership passes directly to the next waiter
+    else this.#held = false;
+  }
+}
+
+/** Serializes async calls in order. Internal. */
+export class SerialQueue {
+  #tail: Promise<unknown> = Promise.resolve();
+
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.#tail.then(fn, fn);
+    this.#tail = result.catch(() => undefined);
+    return result;
+  }
+}
+
+/** In-memory store: a map plus an in-process mutex per lock name. */
+export class MemoryStore implements ACEStore {
+  readonly #data = new Map<string, Uint8Array>();
+  readonly #locks = new Map<string, Mutex>();
+
+  async read(key: string): Promise<Uint8Array | null> {
+    const v = this.#data.get(checkKey(key));
+    return v === undefined ? null : v.slice();
+  }
+
+  async write(key: string, value: Uint8Array): Promise<void> {
+    checkKey(key);
+    if (!(value instanceof Uint8Array)) throw new ACEError('invalid_argument', 'value must be bytes');
+    this.#data.set(key, value.slice());
+  }
+
+  async delete(key: string): Promise<void> {
+    this.#data.delete(checkKey(key));
+  }
+
+  async list(prefix: string): Promise<string[]> {
+    if (typeof prefix !== 'string') throw new ACEError('invalid_argument', 'prefix must be a string');
+    return [...this.#data.keys()].filter((k) => k.startsWith(prefix)).sort();
+  }
+
+  async lock(name: string, opts: { timeoutMs?: number } = {}): Promise<() => Promise<void>> {
+    checkLockName(name);
+    const timeout = checkTimeout(opts.timeoutMs);
+    let m = this.#locks.get(name);
+    if (m === undefined) {
+      m = new Mutex();
+      this.#locks.set(name, m);
+    }
+    if (!(await m.acquire(timeout))) throw lockTimeoutError(name);
+    let released = false;
+    const mutex = m;
+    return async () => {
+      if (released) return;
+      released = true;
+      mutex.release();
+    };
+  }
+}

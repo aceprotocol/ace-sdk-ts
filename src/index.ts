@@ -1,56 +1,42 @@
-export {
-  // Types
-  type ACEIdentity,
-  type SigningScheme,
-  type IdentityTier,
-  type HardwareBacking,
-  type RegistrationFile,
-  type SigningConfig,
-  type Capability,
-  type PricingInfo,
-  type ChainInfo,
-  type AgentProfile,
-  type ProfilePricing,
-  type DiscoverQuery,
-  type DiscoverAgent,
-  type DiscoverResult,
-  type ACEMessage,
-  type MessageType,
-  type EncryptionEnvelope,
-  type SignatureEnvelope,
-  type RfqBody,
-  type OfferBody,
-  type AcceptBody,
-  type RejectBody,
-  type InvoiceBody,
-  type ReceiptBody,
-  type DeliverBody,
-  type ConfirmBody,
-  type InfoBody,
-  type TextBody,
-  // Type guards
-  isMessageType,
-  isEconomicType,
-  isSystemType,
-  isSocialType,
-  MESSAGE_TYPES,
-  ECONOMIC_TYPES,
-  SYSTEM_TYPES,
-  SOCIAL_TYPES,
-} from './types.js';
+// ACE Protocol SDK — public API (design §2.15). Everything not exported here is internal.
 
-export { SoftwareIdentity, type SoftwareIdentityExport, type SoftwareIdentityBinaryExport, computeACEId, toBase64, fromBase64, secp256k1Address } from './identity.js';
+export type {
+  ACEIdentity, SigningScheme, IdentityTier, HardwareBacking, RegistrationFile, SigningConfig, Capability,
+  PricingInfo, ChainInfo, AgentProfile, ProfilePricing, DiscoverQuery, PeerRecord, ACEMessage, MessageType,
+  EncryptionEnvelope, SignatureEnvelope, RfqBody, OfferBody, AcceptBody, RejectBody, InvoiceBody, ReceiptBody,
+  DeliverBody, ConfirmBody, InfoBody, TextBody, JSONValue, JSONObject, ParsedMessage, ReplayState,
+  RegistrationRequest, Intent,
+} from './types.js';
+export type { ThreadState, ThreadSnapshot, ThreadHistoryEntry, ThreadEvent } from './state-machine.js';
+export type { RelayAuthRequest } from './auth.js';
+export type { ReceiveSource, ReceiveOutcome } from './inbox.js';
+export type { PendingSend } from './outbox.js';
+export type { ACEStore } from './store.js';
+export type { ACEErrorCode, ACEErrorCategory } from './errors.js';
+export type { SoftwareIdentityExport } from './identity.js';
+
+export { ACEError } from './errors.js';
+export { MESSAGE_TYPES, ECONOMIC_TYPES, isMessageType, isEconomicType } from './types.js';
 export {
-  computeConversationId, encrypt, decrypt, getACEKemSalt,
-  kemEncapsulate, kemDecapsulate, kemPublicKeyFromSeed, generateKemSeed,
-  validatePublicKey, validateKemCiphertext, validateSeed,
-  decodeKemPublicKey, decodeKemCiphertext,
-  KEM_SEED_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_CIPHERTEXT_SIZE,
-  MAX_PAYLOAD_SIZE, MAX_PLAINTEXT_SIZE,
-} from './encryption.js';
-export { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
-export { createMessage, parseMessage, parseMessageFromRegistration, parseMessageFromPeer, validateBody, type CreateMessageOptions, type ParsedMessage, type ParseMessageOptions, type ParseMessageFromRegistrationOptions } from './messages.js';
-export { validateRegistrationFile, validateACEId, verifyRegistrationId, fetchRegistrationFile, getRegistrationSigningPublicKey, getRegistrationEncryptionPublicKey, validateProfile, verifyEncryptionKeyBinding, verifyPeerResponse, type RegistrationKeys, type FetchRegistrationFileOptions, type RelayPeerResponse, type VerifiedPeer } from './discovery.js';
-export { checkTimestampFreshness, validateMessageId, ReplayDetector, type ReplayDetectorExport } from './security.js';
-export { ThreadStateMachine, InvalidTransitionError, validateThreadId, type ThreadState, type ThreadSnapshot, type ThreadStateMachineOptions } from './state-machine.js';
-export { createRegistrationRequest, buildRegistrationPayload, type RegistrationRequest } from './registration.js';
+  MAX_PLAINTEXT_BYTES, MAX_PAYLOAD_BYTES, MAX_ENVELOPE_BYTES, MAX_JSON_DEPTH, MAX_THREAD_ID_LENGTH,
+  TIMESTAMP_WINDOW_SECONDS, OFFLINE_WINDOW_SECONDS, MAX_REGISTRATION_FILE_BYTES, MAX_INBOX_PAGE,
+  KEM_SEED_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_CIPHERTEXT_SIZE, DEFAULT_REPLAY_CAPACITY,
+} from './limits.js';
+export { SoftwareIdentity, computeACEId } from './identity.js';
+export { toBase64, fromBase64, isACEId, isMessageId, isThreadId, isConversationId } from './encoding.js';
+export { computeConversationId, decryptWithSeed, kemPublicKeyFromSeed, generateKemSeed } from './encryption.js';
+export { decodeEnvelope, verifyEnvelopeSignature, envelopeFingerprint } from './envelope.js';
+export { createMessage, parseMessage, validateBody } from './messages.js';
+export {
+  VerifiedPeer, verifyPeerRecord, verifyRegistrationFile, fetchRegistrationFile, validateProfile,
+} from './discovery.js';
+export { createRegistrationRequest, verifyRegistrationRequest } from './registration.js';
+export { createAuthHeaders, parseAuthHeaders, verifyAuthHeaders } from './auth.js';
+export { ReplayDetector } from './replay.js';
+export { ThreadStateMachine } from './state-machine.js';
+export { ThreadStore } from './thread-store.js';
+export { PeerStore } from './peer-store.js';
+export { Inbox } from './inbox.js';
+export { Outbox } from './outbox.js';
+export { RelayClient } from './relay.js';
+export { MemoryStore } from './store.js';

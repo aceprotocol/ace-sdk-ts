@@ -1,550 +1,606 @@
+/** Peers: relay peer records, registration files, well-known fetch, profiles, rollback barrier. */
+
 import bs58 from 'bs58';
-import type { AgentProfile, RegistrationFile, SigningScheme } from './types.js';
-import { computeACEId, fromBase64, secp256k1Address } from './identity.js';
-import { buildSignData, encodePayload, verifySignature, decodeSignature } from './signing.js';
-import { constantTimeEqual, codePointLength, CONTROL_CHAR_PATTERN } from './utils.js';
-import { decodeKemPublicKey } from './encryption.js';
+import { ACEError, type ACEErrorCode } from './errors.js';
+import {
+  bytesEqual, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, wireInt,
+} from './encoding.js';
+import { KEM_PUBLIC_KEY_SIZE, MAX_REGISTRATION_FILE_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import {
+  buildSignData, computeACEId, encodePayload, isValidSigningPublicKey, signingAddress, verifySignature,
+} from './signing.js';
+import type {
+  AgentProfile, Capability, ChainInfo, PeerRecord, ProfilePricing, RegistrationFile, SigningScheme,
+} from './types.js';
+import { isSigningScheme } from './types.js';
 
-const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
-const DEFAULT_MAX_REGISTRATION_BYTES = 1_048_576;
+// --- VerifiedPeer ------------------------------------------------------------------------
 
-function decodeEd25519Address(address: string): Uint8Array {
-  const pubKey = bs58.decode(address);
-  if (pubKey.length !== 32) {
-    throw new Error(`ed25519 signing.address must decode to 32 bytes, got ${pubKey.length}`);
+const MINT = Symbol('VerifiedPeer.mint');
+
+interface PeerFields {
+  aceId: string;
+  scheme: SigningScheme;
+  signingPublicKey: Uint8Array;
+  encryptionPublicKey: Uint8Array;
+  registeredAt: number;
+  registrationSignature: string | null;
+  source: 'relay' | 'registration';
+  profile: AgentProfile | null;
+}
+
+let isPeerImpl: (x: unknown) => boolean;
+
+/**
+ * A peer whose keys were verified. Obtain only from `verifyPeerRecord`,
+ * `verifyRegistrationFile`, `verifyRegistrationRequest`, `PeerStore` or `RelayClient`.
+ * Instances are immutable; key getters return copies.
+ */
+export class VerifiedPeer {
+  readonly #brand = true;
+  readonly aceId: string;
+  readonly scheme: SigningScheme;
+  readonly #signingPublicKey: Uint8Array;
+  readonly #encryptionPublicKey: Uint8Array;
+  readonly registeredAt: number;
+  /** The relay binding signature (`register` action); `null` for a registration-file source. */
+  readonly registrationSignature: string | null;
+  readonly source: 'relay' | 'registration';
+  /**
+   * Unverified relay metadata: self-asserted by the peer and NOT covered by the binding
+   * signature, so a relay can alter it. Never base trust decisions on it.
+   */
+  readonly profile: AgentProfile | null;
+
+  private constructor(token: symbol, f: PeerFields) {
+    if (token !== MINT) throw new ACEError('invalid_argument', 'VerifiedPeer is created only by the verify functions');
+    this.aceId = f.aceId;
+    this.scheme = f.scheme;
+    this.#signingPublicKey = Uint8Array.from(f.signingPublicKey);
+    this.#encryptionPublicKey = Uint8Array.from(f.encryptionPublicKey);
+    this.registeredAt = f.registeredAt;
+    this.registrationSignature = f.registrationSignature;
+    this.source = f.source;
+    this.profile = f.profile === null ? null : deepFreeze(structuredClone(f.profile));
+    Object.freeze(this);
   }
-  return pubKey;
+
+  static {
+    isPeerImpl = (x: unknown) => typeof x === 'object' && x !== null && #brand in x;
+  }
+
+  get signingPublicKey(): Uint8Array {
+    return this.#signingPublicKey.slice();
+  }
+
+  get encryptionPublicKey(): Uint8Array {
+    return this.#encryptionPublicKey.slice();
+  }
+
+  /** ed25519: Base58 of the signing key; secp256k1: EIP-55 address. */
+  get address(): string {
+    return signingAddress(this.scheme, this.#signingPublicKey);
+  }
+
+  toJSON(): Record<string, unknown> {
+    return {
+      aceId: this.aceId, scheme: this.scheme, registeredAt: this.registeredAt, source: this.source,
+      registrationSignature: this.registrationSignature, profile: this.profile,
+    };
+  }
+}
+
+function deepFreeze<T>(v: T): T {
+  if (typeof v === 'object' && v !== null) {
+    for (const k of Object.keys(v)) deepFreeze((v as Record<string, unknown>)[k]);
+    Object.freeze(v);
+  }
+  return v;
+}
+
+/** Internal: construct a VerifiedPeer from already-verified fields. */
+export function mintPeer(f: PeerFields): VerifiedPeer {
+  return new (VerifiedPeer as unknown as new (t: symbol, f: PeerFields) => VerifiedPeer)(MINT, f);
+}
+
+/** Internal: true for genuine VerifiedPeer instances (not structural look-alikes). */
+export function isVerifiedPeer(x: unknown): x is VerifiedPeer {
+  return isPeerImpl(x);
+}
+
+// --- strict readers ---------------------------------------------------------------------
+
+type Kind = 'string' | 'object' | 'array';
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function opt(d: Record<string, unknown>, key: string, kind: Kind, code: ACEErrorCode, what: string): any {
+  const v = d[key];
+  if (v === null || v === undefined) return undefined;
+  const ok = kind === 'string' ? typeof v === 'string' : kind === 'array' ? Array.isArray(v) : isObj(v);
+  if (!ok) throw new ACEError(code, `${what}.${key} must be a${kind === 'array' ? 'n array' : ` ${kind}`}`);
+  return v;
+}
+
+function req(d: Record<string, unknown>, key: string, kind: Kind, code: ACEErrorCode, what: string): any {
+  const v = opt(d, key, kind, code, what);
+  if (v === undefined) throw new ACEError(code, `${what}.${key} is required`);
+  return v;
+}
+
+function optStrList(d: Record<string, unknown>, key: string, code: ACEErrorCode, what: string): string[] | undefined {
+  const v = opt(d, key, 'array', code, what) as unknown[] | undefined;
+  if (v !== undefined && !v.every((x) => typeof x === 'string')) throw new ACEError(code, `${what}.${key} must be an array of strings`);
+  return v === undefined ? undefined : [...(v as string[])];
+}
+
+// --- profile ----------------------------------------------------------------------------
+
+const TAG_RE = /^[a-z0-9][a-z0-9-]*$/;
+const CAIP2_RE = /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/;
+const AMOUNT_RE = /^[0-9]+(\.[0-9]+)?$/;
+
+/** Parse the profile wire shape; unknown top-level fields are dropped; pricing is strict. */
+function parseProfile(d: unknown): AgentProfile {
+  const code: ACEErrorCode = 'invalid_profile';
+  if (!isObj(d)) throw new ACEError(code, 'profile must be a JSON object');
+  const out: AgentProfile = {};
+  for (const k of ['name', 'description', 'image', 'endpoint'] as const) {
+    const v = opt(d, k, 'string', code, 'profile');
+    if (v !== undefined) out[k] = v;
+  }
+  for (const k of ['tags', 'capabilities', 'chains'] as const) {
+    const v = optStrList(d, k, code, 'profile');
+    if (v !== undefined) out[k] = v;
+  }
+  const p = opt(d, 'pricing', 'object', code, 'profile') as Record<string, unknown> | undefined;
+  if (p !== undefined) {
+    const extra = Object.keys(p).filter((k) => k !== 'currency' && k !== 'maxAmount');
+    if (extra.length > 0) throw new ACEError(code, `profile.pricing has unknown fields: ${extra.slice(0, 3).join(',')}`);
+    const pricing: ProfilePricing = { currency: req(p, 'currency', 'string', code, 'profile.pricing') };
+    const max = opt(p, 'maxAmount', 'string', code, 'profile.pricing');
+    if (max !== undefined) pricing.maxAmount = max;
+    out.pricing = pricing;
+  }
+  return out;
+}
+
+function tagList(items: string[], name: string, max: number): void {
+  if (items.length > max) throw new ACEError('invalid_profile', `profile.${name} has more than ${max} items`);
+  for (const item of items) {
+    if (item.length > 32 || !TAG_RE.test(item)) throw new ACEError('invalid_profile', `profile.${name} items must be 1-32 of [a-z0-9-]`);
+  }
+}
+
+/** Validate a discovery profile (`invalid_profile`); returns the normalized profile. */
+export function validateProfile(profile: AgentProfile): AgentProfile {
+  const p = parseProfile(profile);
+  const text = (v: string | undefined, name: string, lo: number, hi: number) => {
+    if (v === undefined) return;
+    const n = codePointLength(v);
+    if (n < lo || n > hi || CONTROL_CHAR_RE.test(v)) {
+      throw new ACEError('invalid_profile', `profile.${name} must be ${lo}-${hi} characters without control characters`);
+    }
+  };
+  text(p.name, 'name', 1, 64);
+  text(p.description, 'description', 0, 256);
+  if (p.image !== undefined && (codePointLength(p.image) > 512 || !isHttpsUrl(p.image))) {
+    throw new ACEError('invalid_profile', 'profile.image must be an HTTPS URL of at most 512 characters');
+  }
+  if (p.tags !== undefined) tagList(p.tags, 'tags', 10);
+  if (p.capabilities !== undefined) tagList(p.capabilities, 'capabilities', 20);
+  if (p.chains !== undefined && (p.chains.length > 10 || !p.chains.every((c) => CAIP2_RE.test(c)))) {
+    throw new ACEError('invalid_profile', 'profile.chains must be at most 10 CAIP-2 identifiers');
+  }
+  if (p.endpoint !== undefined && !isHttpsUrl(p.endpoint)) throw new ACEError('invalid_profile', 'profile.endpoint must be an HTTPS URL');
+  if (p.pricing !== undefined) {
+    text(p.pricing.currency, 'pricing.currency', 1, 16);
+    const m = p.pricing.maxAmount;
+    if (m !== undefined && (m.length > 32 || !AMOUNT_RE.test(m))) {
+      throw new ACEError('invalid_profile', 'profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)');
+    }
+  }
+  return p;
+}
+
+// --- keys / binding ----------------------------------------------------------------------
+
+export function decodeSigningKey(scheme: unknown, text: unknown, code: ACEErrorCode): Uint8Array {
+  const raw = decodeB64(text, code, 'signingPublicKey', 64);
+  if (!isSigningScheme(scheme) || !isValidSigningPublicKey(scheme, raw)) {
+    throw new ACEError(code, 'signingPublicKey is not a valid key for the scheme');
+  }
+  return raw;
+}
+
+export function decodeEncryptionKey(text: unknown, code: ACEErrorCode): Uint8Array {
+  const raw = decodeB64(text, code, 'encryptionPublicKey', KEM_PUBLIC_KEY_SIZE + 3);
+  if (raw.length !== KEM_PUBLIC_KEY_SIZE) throw new ACEError(code, `encryptionPublicKey must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
+  return raw;
+}
+
+export function bindingSignData(aceId: string, timestamp: number, encB64: string, sigB64: string): Uint8Array {
+  return buildSignData('register', aceId, timestamp, encodePayload(encB64, sigB64));
+}
+
+/** Verify a relay `PeerRecord`; every failure is `invalid_peer`. */
+export function verifyPeerRecord(record: unknown): VerifiedPeer {
+  const code: ACEErrorCode = 'invalid_peer';
+  if (!isObj(record)) throw new ACEError(code, 'peer record must be an object');
+  const { aceId, scheme, encryptionPublicKey: encB64, signingPublicKey: sigB64 } = record;
+  if (!isACEId(aceId)) throw new ACEError(code, 'aceId is not an ACE ID');
+  if (!isSigningScheme(scheme)) throw new ACEError(code, 'unsupported scheme');
+  const signingKey = decodeSigningKey(scheme, sigB64, code);
+  if (computeACEId(signingKey) !== aceId) throw new ACEError(code, 'aceId does not match the signing key');
+  const encKey = decodeEncryptionKey(encB64, code);
+  const registeredAt = wireInt(record.registeredAt);
+  if (registeredAt === null) throw new ACEError(code, 'registeredAt must be an integer');
+  const signature = record.registrationSignature;
+  const sig = decodeSignature(signature, scheme, code);
+  if (!verifySignature(bindingSignData(aceId, registeredAt, encB64 as string, sigB64 as string), sig, scheme, signingKey)) {
+    throw new ACEError(code, 'registrationSignature does not verify');
+  }
+  let profile: AgentProfile | null = null;
+  if (record.profile !== null && record.profile !== undefined) {
+    try {
+      profile = validateProfile(record.profile as AgentProfile);
+    } catch (e) {
+      throw new ACEError(code, e instanceof ACEError ? e.message : 'invalid profile');
+    }
+  }
+  return mintPeer({
+    aceId, scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey, registeredAt,
+    registrationSignature: signature as string, source: 'relay', profile,
+  });
+}
+
+// --- registration files ---------------------------------------------------------------------
+
+/** Parse the registration-file wire shape (`invalid_registration`). Unknown fields dropped; null optional = absent. */
+export function parseRegistrationFile(d: unknown): RegistrationFile {
+  const code: ACEErrorCode = 'invalid_registration';
+  if (!isObj(d)) throw new ACEError(code, 'registration file must be a JSON object');
+  const signing = req(d, 'signing', 'object', code, 'registration') as Record<string, unknown>;
+  const tier = d.tier;
+  if (tier !== 0 && tier !== 1) throw new ACEError(code, 'registration.tier must be 0 or 1');
+  const reg: RegistrationFile = {
+    ace: req(d, 'ace', 'string', code, 'registration'),
+    id: req(d, 'id', 'string', code, 'registration'),
+    name: req(d, 'name', 'string', code, 'registration'),
+    endpoint: req(d, 'endpoint', 'string', code, 'registration'),
+    tier,
+    signing: {
+      scheme: req(signing, 'scheme', 'string', code, 'signing'),
+      address: req(signing, 'address', 'string', code, 'signing'),
+      encryptionPublicKey: req(signing, 'encryptionPublicKey', 'string', code, 'signing'),
+    },
+  };
+  const spk = opt(signing, 'signingPublicKey', 'string', code, 'signing');
+  if (spk !== undefined) reg.signing.signingPublicKey = spk;
+  const hb = opt(d, 'hardwareBacking', 'string', code, 'registration');
+  if (hb !== undefined) reg.hardwareBacking = hb;
+  const desc = opt(d, 'description', 'string', code, 'registration');
+  if (desc !== undefined) reg.description = desc;
+  const caps = opt(d, 'capabilities', 'array', code, 'registration') as unknown[] | undefined;
+  if (caps !== undefined) {
+    reg.capabilities = caps.map((c): Capability => {
+      if (!isObj(c)) throw new ACEError(code, 'registration.capabilities entries must be objects');
+      const cap: Capability = {
+        id: req(c, 'id', 'string', code, 'capability'),
+        description: req(c, 'description', 'string', code, 'capability'),
+      };
+      const input = opt(c, 'input', 'string', code, 'capability');
+      if (input !== undefined) cap.input = input;
+      const output = opt(c, 'output', 'string', code, 'capability');
+      if (output !== undefined) cap.output = output;
+      const p = opt(c, 'pricing', 'object', code, 'capability') as Record<string, unknown> | undefined;
+      if (p !== undefined) {
+        cap.pricing = {
+          model: req(p, 'model', 'string', code, 'capability.pricing'),
+          amount: req(p, 'amount', 'string', code, 'capability.pricing'),
+          currency: req(p, 'currency', 'string', code, 'capability.pricing'),
+        };
+      }
+      return cap;
+    });
+  }
+  const settlement = optStrList(d, 'settlement', code, 'registration');
+  if (settlement !== undefined) reg.settlement = settlement;
+  const chains = opt(d, 'chains', 'array', code, 'registration') as unknown[] | undefined;
+  if (chains !== undefined) {
+    reg.chains = chains.map((c): ChainInfo => {
+      if (!isObj(c)) throw new ACEError(code, 'registration.chains entries must be objects');
+      return { network: req(c, 'network', 'string', code, 'chain'), address: req(c, 'address', 'string', code, 'chain') };
+    });
+  }
+  return reg;
+}
+
+/**
+ * Run all 01 rules (including the ID hash); failures are `invalid_registration`.
+ * The peer's `registeredAt` is `pinnedAt` or now (a file has no signed timestamp).
+ */
+export function verifyRegistrationFile(
+  reg: RegistrationFile, opts: { pinnedAt?: number; clock?: () => number } = {},
+): VerifiedPeer {
+  const code: ACEErrorCode = 'invalid_registration';
+  if (opts.pinnedAt !== undefined && wireInt(opts.pinnedAt) === null) {
+    throw new ACEError('invalid_argument', 'pinnedAt must be an integer in [0, 2^53-1]');
+  }
+  const r = parseRegistrationFile(reg);
+  if (r.ace !== '1.0') throw new ACEError(code, "ace must be '1.0'");
+  if (!isACEId(r.id)) throw new ACEError(code, 'id is not an ACE ID');
+  if (r.name.length === 0 || CONTROL_CHAR_RE.test(r.name)) throw new ACEError(code, 'name must be non-empty without control characters');
+  if (!isHttpsUrl(r.endpoint)) throw new ACEError(code, 'endpoint must match the ACE HTTPS URL grammar');
+  const s = r.signing;
+  if (!isSigningScheme(s.scheme)) throw new ACEError(code, 'unsupported signing.scheme');
+  let signingKey: Uint8Array;
+  if (s.scheme === 'ed25519') {
+    try {
+      signingKey = bs58.decode(s.address);
+    } catch {
+      throw new ACEError(code, 'signing.address is not Base58');
+    }
+    if (signingKey.length !== 32 || bs58.encode(signingKey) !== s.address) {
+      throw new ACEError(code, 'signing.address must be the Base58 of a 32-byte key');
+    }
+    if (s.signingPublicKey !== undefined && !bytesEqual(decodeB64(s.signingPublicKey, code, 'signing.signingPublicKey'), signingKey)) {
+      throw new ACEError(code, 'signing.signingPublicKey must equal Base58Decode(signing.address)');
+    }
+  } else {
+    if (s.signingPublicKey === undefined) throw new ACEError(code, 'secp256k1 requires signing.signingPublicKey');
+    signingKey = decodeSigningKey('secp256k1', s.signingPublicKey, code);
+    if (s.address.toLowerCase() !== signingAddress('secp256k1', signingKey).toLowerCase()) {
+      throw new ACEError(code, 'signing.address does not match signing.signingPublicKey');
+    }
+  }
+  if (computeACEId(signingKey) !== r.id) throw new ACEError(code, 'id does not match the signing key');
+  const encKey = decodeEncryptionKey(s.encryptionPublicKey, code);
+  const now = Math.floor(opts.clock ? opts.clock() : Date.now() / 1000);
+  return mintPeer({
+    aceId: r.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
+    registeredAt: opts.pinnedAt ?? now, registrationSignature: null, source: 'registration', profile: null,
+  });
+}
+
+// --- rollback barrier (02) ---------------------------------------------------------------------
+
+export type AdoptOutcome = 'adopted' | 'unchanged' | 'rotated';
+
+/**
+ * Internal pure rule used by `PeerStore.adopt`: the binding to store and the outcome.
+ *
+ * Rotation to a different encryption key requires a signed (relay) binding with a strictly
+ * newer `registeredAt`; an unsigned registration-file candidate is adopted only without a
+ * pin, or as `unchanged` when its key equals the pin (the pin is then kept exactly).
+ */
+export function adoptDecision(pin: VerifiedPeer | null, candidate: VerifiedPeer, now: number): { peer: VerifiedPeer; outcome: AdoptOutcome } {
+  if (candidate.registeredAt > now + TIMESTAMP_WINDOW_SECONDS) throw new ACEError('invalid_peer', 'registeredAt is in the future');
+  if (pin === null) return { peer: candidate, outcome: 'adopted' };
+  if (pin.aceId !== candidate.aceId || !bytesEqual(pin.signingPublicKey, candidate.signingPublicKey) || pin.scheme !== candidate.scheme) {
+    throw new ACEError('invalid_peer', 'signing key or scheme differs from the pinned binding');
+  }
+  const unsigned = candidate.registrationSignature === null;
+  if (bytesEqual(pin.encryptionPublicKey, candidate.encryptionPublicKey)) {
+    if (unsigned) return { peer: pin, outcome: 'unchanged' };
+    const newer = candidate.registeredAt > pin.registeredAt ? candidate : pin;
+    return {
+      peer: mintPeer({
+        aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
+        encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
+        registrationSignature: newer.registrationSignature, source: newer.source,
+        profile: candidate.source === 'relay' ? candidate.profile : pin.profile,
+      }),
+      outcome: 'unchanged',
+    };
+  }
+  if (unsigned) throw new ACEError('stale_peer_binding', 'an unsigned source cannot rotate a pinned encryption key');
+  if (candidate.registeredAt > pin.registeredAt) return { peer: candidate, outcome: 'rotated' };
+  throw new ACEError('stale_peer_binding', 'a different encryption key requires a newer registeredAt');
+}
+
+// --- well-known fetch ------------------------------------------------------------------------
+
+const DOMAIN_RE = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
+
+const V4_BLOCKED: Array<[number, number]> = ([
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
+  ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
+  ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
+] as Array<[string, number]>).map(([a, p]) => [parseV4(a)!, p]);
+
+const V6_BLOCKED: Array<[Uint8Array, number]> = ([
+  ['::', 128], ['::1', 128], ['100::', 64], ['2001:db8::', 32], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
+] as Array<[string, number]>).map(([a, p]) => [parseV6(a)!, p]);
+
+function parseV4(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    if (!/^[0-9]{1,3}$/.test(p) || Number(p) > 255) return null;
+    n = n * 256 + Number(p);
+  }
+  return n;
+}
+
+function parseV6(ip: string): Uint8Array | null {
+  let s = ip.split('%')[0].toLowerCase();
+  let tail: number[] = [];
+  if (s.includes('.')) {
+    const i = s.lastIndexOf(':');
+    const v4 = parseV4(s.slice(i + 1));
+    if (i < 0 || v4 === null) return null;
+    tail = [(v4 >>> 16) & 0xffff, v4 & 0xffff];
+    s = s.slice(0, i + 1);
+    if (!s.endsWith('::')) s = s.slice(0, -1);
+  }
+  const halves = s.split('::');
+  if (halves.length > 2) return null;
+  const parse = (h: string) => (h === '' ? [] : h.split(':').map((x) => (/^[0-9a-f]{1,4}$/.test(x) ? parseInt(x, 16) : NaN)));
+  const head = parse(halves[0]);
+  const back = halves.length === 2 ? parse(halves[1]) : [];
+  const groups = halves.length === 2
+    ? [...head, ...new Array(8 - head.length - back.length - tail.length).fill(0), ...back, ...tail]
+    : [...head, ...tail];
+  if (groups.length !== 8 || groups.some((g) => Number.isNaN(g) || g < 0 || g > 0xffff)) return null;
+  const out = new Uint8Array(16);
+  groups.forEach((g, i) => { out[2 * i] = g >> 8; out[2 * i + 1] = g & 0xff; });
+  return out;
+}
+
+function inV6(addr: Uint8Array, net: Uint8Array, prefix: number): boolean {
+  for (let bit = 0; bit < prefix; bit++) {
+    const byte = bit >> 3;
+    const mask = 0x80 >> (bit & 7);
+    if ((addr[byte] & mask) !== (net[byte] & mask)) return false;
+  }
+  return true;
+}
+
+function v4Blocked(n: number): boolean {
+  return V4_BLOCKED.some(([net, p]) => Math.floor(n / 2 ** (32 - p)) === Math.floor(net / 2 ** (32 - p)));
+}
+
+/** Internal: SSRF blocklist (design §2.8). IPv4-mapped and 64:ff9b::/96 are judged by the embedded IPv4. */
+export function isBlockedAddress(ip: string): boolean {
+  const v4 = parseV4(ip);
+  if (v4 !== null) return v4Blocked(v4);
+  const v6 = parseV6(ip);
+  if (v6 === null) return true;
+  const mapped = parseV6('::ffff:0:0')!;
+  const nat64 = parseV6('64:ff9b::')!;
+  if (inV6(v6, mapped, 96) || inV6(v6, nat64, 96)) {
+    return v4Blocked(((v6[12] << 24) >>> 0) + (v6[13] << 16) + (v6[14] << 8) + v6[15]);
+  }
+  return V6_BLOCKED.some(([net, p]) => inV6(v6, net, p));
+}
+
+type LookupFn = (host: string, opts: { all: true; verbatim: true }) => Promise<Array<{ address: string }>>;
+let lookupFn: LookupFn | null | undefined;
+
+async function getLookup(): Promise<LookupFn | null> {
+  if (lookupFn === undefined) {
+    try {
+      const dns = await import('node:dns');
+      lookupFn = dns.promises.lookup as unknown as LookupFn;
+    } catch {
+      lookupFn = null;
+    }
+  }
+  return lookupFn;
 }
 
 export interface FetchRegistrationFileOptions {
   timeoutMs?: number;
   maxBytes?: number;
-  /** Set to true to skip SSRF protection (e.g. when behind a secure proxy). */
-  allowPrivateIPs?: boolean;
+  allowPrivateAddresses?: boolean;
 }
 
 /**
- * Validate ACE ID format: ace:sha256:<64 hex chars>
+ * GET `https://<domain>/.well-known/ace.json` with SSRF protection, then verify it.
+ *
+ * Resolves DNS and rejects (`blocked_address`) if any address is private / reserved;
+ * never follows redirects; requires `application/json`; reads at most `maxBytes + 1` bytes.
+ * Network errors, timeouts, 5xx and 429 are `fetch_failed`; everything else `invalid_registration`.
+ *
+ * Runtime note: the DNS check needs `node:dns`. In a non-Node runtime (browser, edge) it is
+ * skipped and only the domain grammar applies. Under Node, `fetch` re-resolves the name, so a
+ * DNS-rebinding race remains possible; use an egress proxy where that matters.
  */
-export function validateACEId(id: string): boolean {
-  return /^ace:sha256:[a-f0-9]{64}$/.test(id);
-}
-
-/** Decoded public keys of a validated registration file. */
-export interface RegistrationKeys {
-  signingPublicKey: Uint8Array;
-  encryptionPublicKey: Uint8Array;
-}
-
-/**
- * Validate a registration file has all required fields and correct format.
- * Returns the decoded keys so callers need not decode them a second time.
- */
-export function validateRegistrationFile(reg: RegistrationFile): RegistrationKeys {
-  if (reg.ace !== '1.0') {
-    throw new Error(`Invalid ace version: expected '1.0', got '${reg.ace}'`);
+export async function fetchRegistrationFile(domain: string, opts: FetchRegistrationFileOptions = {}): Promise<RegistrationFile> {
+  if (typeof domain !== 'string' || !DOMAIN_RE.test(domain)) throw new ACEError('invalid_argument', 'invalid domain');
+  const timeoutMs = opts.timeoutMs ?? 10_000;
+  const maxBytes = opts.maxBytes ?? MAX_REGISTRATION_FILE_BYTES;
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new ACEError('invalid_argument', 'timeoutMs must be positive');
   }
-  if (!reg.id || !validateACEId(reg.id)) {
-    throw new Error(`Invalid or missing ACE id: '${reg.id}'`);
-  }
-  if (!reg.name || typeof reg.name !== 'string') {
-    throw new Error('Missing required field: name');
-  }
-  if (CONTROL_CHAR_PATTERN.test(reg.name)) {
-    throw new Error('Registration name must not contain control characters');
-  }
-  if (!reg.endpoint || typeof reg.endpoint !== 'string') {
-    throw new Error('Missing required field: endpoint');
-  }
-  if (!isHttpsURL(reg.endpoint)) {
-    throw new Error(`Registration endpoint must be an absolute HTTPS URL: '${reg.endpoint.slice(0, 100)}'`);
-  }
-  if (reg.tier === undefined || ![0, 1].includes(reg.tier)) {
-    throw new Error(`Invalid tier: ${reg.tier}`);
-  }
-  if (!reg.signing) {
-    throw new Error('Missing required field: signing');
-  }
-  if (!reg.signing.scheme) {
-    throw new Error('Missing required field: signing.scheme');
-  }
-  if (!isSigningScheme(reg.signing.scheme)) {
-    throw new Error(`Unsupported signing.scheme: '${String(reg.signing.scheme).slice(0, 32)}'`);
-  }
-  if (!reg.signing.address) {
-    throw new Error('Missing required field: signing.address');
-  }
-  if (!reg.signing.encryptionPublicKey) {
-    throw new Error('Missing required field: signing.encryptionPublicKey');
-  }
-  const encryptionPublicKey = getRegistrationEncryptionPublicKey(reg);
-  const signingPublicKey = getRegistrationSigningPublicKey(reg);
-  if (reg.signing.scheme === 'secp256k1' && reg.signing.address !== secp256k1Address(signingPublicKey)) {
-    throw new Error('signing.address does not match signing.signingPublicKey');
-  }
-  return { signingPublicKey, encryptionPublicKey };
-}
-
-/** Parsed absolute URL with scheme `https` (case-insensitive) and a non-empty host. */
-function isHttpsURL(value: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    return false;
-  }
-  return url.protocol === 'https:' && url.hostname !== '';
-}
-
-function isSigningScheme(scheme: unknown): scheme is SigningScheme {
-  return scheme === 'ed25519' || scheme === 'secp256k1';
-}
-
-/**
- * Verify that a registration file's ACE ID matches its signing key.
- */
-export function verifyRegistrationId(reg: RegistrationFile): boolean {
-  const signingPubKeyBytes = getRegistrationSigningPublicKey(reg);
-
-  const expectedId = computeACEId(signingPubKeyBytes);
-  if (reg.id !== expectedId) {
-    return false;
-  }
-  if (reg.signing.scheme === 'secp256k1') {
-    return reg.signing.address === secp256k1Address(signingPubKeyBytes);
-  }
-  return true;
-}
-
-/**
- * Extract the signing public key from a validated registration file.
- */
-export function getRegistrationSigningPublicKey(reg: RegistrationFile): Uint8Array {
-  if (reg.signing.scheme === 'ed25519') {
-    const addressPubKey = decodeEd25519Address(reg.signing.address);
-    if (reg.signing.signingPublicKey) {
-      const signingPubKeyBytes = fromBase64(reg.signing.signingPublicKey);
-      if (!constantTimeEqual(addressPubKey, signingPubKeyBytes)) {
-        throw new Error('ed25519 signing.signingPublicKey does not match signing.address');
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new ACEError('invalid_argument', 'maxBytes must be a positive integer');
+  if (opts.allowPrivateAddresses !== true) {
+    const lookup = await getLookup();
+    if (lookup !== null) {
+      let addrs: Array<{ address: string }>;
+      try {
+        addrs = await lookup(domain, { all: true, verbatim: true });
+      } catch (e) {
+        throw new ACEError('fetch_failed', `DNS resolution failed: ${e instanceof Error ? e.message : ''}`);
       }
-    }
-    return addressPubKey;
-  }
-  if (reg.signing.signingPublicKey) {
-    return fromBase64(reg.signing.signingPublicKey);
-  }
-  throw new Error(`${reg.signing.scheme} scheme requires signing.signingPublicKey`);
-}
-
-/**
- * Extract the X-Wing encryption public key (1216 bytes) from a validated registration file.
- */
-export function getRegistrationEncryptionPublicKey(reg: RegistrationFile): Uint8Array {
-  return decodeKemPublicKey(reg.signing.encryptionPublicKey);
-}
-
-// === Encryption-key binding (relay-sourced peer keys) ===
-//
-// `aceId` self-certifies only the SIGNING key (aceId === sha256(signingKey)). The
-// X-Wing ENCRYPTION key is separate — on its own it is an unauthenticated claim.
-// A relay routes ciphertext and is untrusted by design, so it could hand a client
-// its own X-Wing key and read messages the client believes are end-to-end
-// encrypted. The binding below is the proof that closes that gap: the exact
-// signature the relay already requires at registration, verifiable with nothing
-// but the identity's own signing key.
-
-/** Shape of a `GET /v1/peer` response or a `/v1/discover` agent entry. */
-export interface RelayPeerResponse {
-  aceId: string;
-  scheme: SigningScheme;
-  encryptionPublicKey: string;
-  signingPublicKey: string;
-  registrationSignature?: string;
-  registeredAt?: number;
-}
-
-/** A peer's public keys AFTER the identity + encryption-key binding are verified. */
-export interface VerifiedPeer {
-  registeredAt: number;
-  aceId: string;
-  scheme: SigningScheme;
-  signingPublicKey: Uint8Array;
-  encryptionPublicKey: Uint8Array;
-}
-
-/**
- * Verify that `encryptionPublicKey` was authorized by `aceId`.
- *
- * The binding is identical to what `POST /v1/register` signs:
- *   buildSignData('register', aceId, timestamp,
- *                 encodePayload(encryptionPublicKey, signingPublicKey))
- * signed by the identity's signing key. This also re-checks
- * `aceId === sha256(signingPublicKey)`, so `true` means: this exact X-Wing key was
- * signed by the key that defines this identity.
- *
- * `encryptionPublicKey` / `signingPublicKey` MUST be the Base64 wire strings (the
- * signature commits to those strings). Returns `false` on any malformed input.
- */
-export function verifyEncryptionKeyBinding(
-  aceId: string,
-  scheme: SigningScheme,
-  encryptionPublicKey: string,
-  signingPublicKey: string,
-  timestamp: number,
-  signature: string,
-): boolean {
-  return verifyBinding(aceId, scheme, encryptionPublicKey, signingPublicKey, timestamp, signature) !== null;
-}
-
-/** {@link verifyEncryptionKeyBinding}, returning the decoded keys on success. */
-function verifyBinding(
-  aceId: string,
-  scheme: SigningScheme,
-  encryptionPublicKey: string,
-  signingPublicKey: string,
-  timestamp: number,
-  signature: string,
-): RegistrationKeys | null {
-  if (!isSigningScheme(scheme)) return null;
-  if (!Number.isInteger(timestamp)) return null;
-  try {
-    // The bound key must be a well-formed X-Wing public key.
-    const encryptionPubBytes = decodeKemPublicKey(encryptionPublicKey);
-    const signingPubBytes = fromBase64(signingPublicKey);
-    // The signing key must be the one that defines this identity.
-    if (computeACEId(signingPubBytes) !== aceId) return null;
-    const payload = encodePayload(encryptionPublicKey, signingPublicKey);
-    const signData = buildSignData('register', aceId, timestamp, payload);
-    const sigBytes = decodeSignature(signature, scheme);
-    if (!verifySignature(signData, sigBytes, scheme, signingPubBytes)) return null;
-    return { signingPublicKey: signingPubBytes, encryptionPublicKey: encryptionPubBytes };
-  } catch {
-    // Malformed key/signature bytes → treat as failed verification.
-    return null;
-  }
-}
-
-/**
- * Build a {@link VerifiedPeer} from a relay `GET /v1/peer` or `/v1/discover` entry.
- *
- * Throws if the binding signature is absent or fails — a relay that substitutes an
- * X-Wing key cannot produce a passing binding, so a VerifiedPeer can only be
- * obtained for a genuine key. Use its keys with {@link parseMessageFromPeer}.
- */
-export function verifyPeerResponse(data: RelayPeerResponse): VerifiedPeer {
-  const { aceId, scheme, encryptionPublicKey, signingPublicKey, registrationSignature, registeredAt } = data;
-
-  if (typeof aceId !== 'string' || !validateACEId(aceId)) {
-    throw new Error(`Invalid peer aceId: '${String(aceId).slice(0, 80)}'`);
-  }
-  if (!isSigningScheme(scheme)) {
-    throw new Error(`Unsupported peer signing scheme: '${String(scheme).slice(0, 32)}'`);
-  }
-  if (registrationSignature === undefined || registeredAt === undefined) {
-    throw new Error(
-      'Peer response is missing the encryption-key binding (registrationSignature/registeredAt); ' +
-      'its encryptionPublicKey cannot be trusted. Without the binding a relay could substitute ' +
-      'its own X-Wing key and read messages meant to be end-to-end encrypted.',
-    );
-  }
-  const keys = verifyBinding(aceId, scheme, encryptionPublicKey, signingPublicKey, registeredAt, registrationSignature);
-  if (!keys) {
-    throw new Error(
-      'Peer encryption-key binding failed verification: the encryptionPublicKey is not signed by ' +
-      "this identity's signing key (possible key substitution / relay MITM).",
-    );
-  }
-  return { aceId, scheme, registeredAt, ...keys };
-}
-
-const TAG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
-const CAIP2_PATTERN = /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/;
-
-function validateTagLikeArray(items: string[], fieldName: string, maxCount: number): void {
-  if (items.length > maxCount) {
-    throw new Error(`profile.${fieldName} must have at most ${maxCount} items, got ${items.length}`);
-  }
-  for (const item of items) {
-    if (codePointLength(item) > 32) {
-      throw new Error(`profile.${fieldName} item must be at most 32 characters: '${item}'`);
-    }
-    if (!TAG_PATTERN.test(item)) {
-      throw new Error(`profile.${fieldName} item must match /^[a-z0-9][a-z0-9-]*$/: '${item}'`);
-    }
-  }
-}
-
-/**
- * Validate an AgentProfile object.
- * Throws an Error describing the first violation found.
- * An empty profile `{}` is valid.
- */
-export function validateProfile(profile: AgentProfile): void {
-  if (profile.name !== undefined) {
-    const nameLength = codePointLength(profile.name);
-    if (nameLength < 1 || nameLength > 64) {
-      throw new Error(`profile.name must be 1-64 characters, got ${nameLength}`);
-    }
-    if (CONTROL_CHAR_PATTERN.test(profile.name)) {
-      throw new Error('profile.name must not contain control characters');
-    }
-  }
-
-  if (profile.description !== undefined) {
-    const descriptionLength = codePointLength(profile.description);
-    if (descriptionLength > 256) {
-      throw new Error(`profile.description must be at most 256 characters, got ${descriptionLength}`);
-    }
-    // Reject control characters (U+0000–U+001F and U+007F)
-    if (CONTROL_CHAR_PATTERN.test(profile.description)) {
-      throw new Error('profile.description must not contain control characters');
-    }
-  }
-
-  if (profile.image !== undefined) {
-    const imageLength = codePointLength(profile.image);
-    if (imageLength > 512) {
-      throw new Error(`profile.image must be at most 512 characters, got ${imageLength}`);
-    }
-    if (!isHttpsURL(profile.image)) {
-      throw new Error(`profile.image must be an absolute HTTPS URL: '${profile.image}'`);
-    }
-  }
-
-  if (profile.tags !== undefined) {
-    validateTagLikeArray(profile.tags, 'tags', 10);
-  }
-
-  if (profile.capabilities !== undefined) {
-    validateTagLikeArray(profile.capabilities, 'capabilities', 20);
-  }
-
-  if (profile.chains !== undefined) {
-    if (profile.chains.length > 10) {
-      throw new Error(`profile.chains must have at most 10 items, got ${profile.chains.length}`);
-    }
-    for (const chain of profile.chains) {
-      if (typeof chain !== 'string' || !CAIP2_PATTERN.test(chain)) {
-        throw new Error('Invalid profile: each chain must be a CAIP-2 identifier (chains)');
+      if (addrs.length === 0) throw new ACEError('fetch_failed', 'no addresses resolved');
+      if (addrs.some((a) => isBlockedAddress(a.address))) {
+        throw new ACEError('blocked_address', `${domain.slice(0, 100)} resolves to a blocked address`);
       }
     }
   }
-
-  if (profile.endpoint !== undefined && !isHttpsURL(profile.endpoint)) {
-    throw new Error(`profile.endpoint must be an absolute HTTPS URL: '${profile.endpoint}'`);
-  }
-
-  if (profile.pricing !== undefined) {
-    if (!profile.pricing.currency || profile.pricing.currency.length === 0) {
-      throw new Error('profile.pricing.currency must be a non-empty string');
-    }
-  }
-}
-
-// Strict domain validation: alphanumeric, hyphens, dots only. No ports, paths, or URL-special chars.
-const VALID_DOMAIN_PATTERN = /^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/;
-
-/**
- * SSRF protection: reject domains that are known private/internal hostnames.
- * This is a defense-in-depth check — it does NOT replace network-level controls.
- * DNS rebinding attacks can bypass this; production deployments should use
- * egress firewalls or HTTP proxies for full protection.
- */
-const PRIVATE_DOMAIN_PATTERNS: RegExp[] = [
-  /^localhost$/i,
-  /\.localhost$/i,
-  /\.local$/i,
-  /\.internal$/i,
-];
-
-/**
- * Check if a resolved IP address is private/internal.
- * Covers: loopback, link-local, RFC 1918, carrier-grade NAT, multicast, broadcast,
- * and cloud metadata endpoints (169.254.169.254).
- */
-function isPrivateIP(ip: string): boolean {
-  // IPv4 patterns
-  if (ip.startsWith('127.')) return true;          // Loopback
-  if (ip.startsWith('10.')) return true;           // RFC 1918 Class A
-  if (ip.startsWith('0.')) return true;            // "This" network
-  if (ip === '255.255.255.255') return true;       // Broadcast
-  if (ip.startsWith('169.254.')) return true;      // Link-local / cloud metadata
-  if (ip.startsWith('192.168.')) return true;      // RFC 1918 Class C
-  if (ip.startsWith('100.')) {                     // Carrier-grade NAT (100.64.0.0/10)
-    const second = parseInt(ip.split('.')[1], 10);
-    if (second >= 64 && second <= 127) return true;
-  }
-  if (ip.startsWith('172.')) {                     // RFC 1918 Class B (172.16.0.0/12)
-    const second = parseInt(ip.split('.')[1], 10);
-    if (second >= 16 && second <= 31) return true;
-  }
-  // IPv6 patterns
-  const lower = ip.toLowerCase();
-  if (lower === '::1') return true;                // Loopback
-  if (lower === '::') return true;                 // Unspecified
-  if (lower.startsWith('fe80:')) return true;      // Link-local
-  if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // Unique local
-  // IPv4-mapped IPv6 (::ffff:127.0.0.1)
-  if (lower.startsWith('::ffff:')) {
-    const v4Part = lower.slice(7);
-    if (isPrivateIP(v4Part)) return true;
-  }
-  return false;
-}
-
-// Lazy-cached DNS module (Node.js only — null in browsers)
-let _dnsModule: { resolve4: (domain: string) => Promise<string[]>; resolve6: (domain: string) => Promise<string[]> } | null | undefined;
-async function _getDnsPromises() {
-  if (_dnsModule === undefined) {
-    try { _dnsModule = (await import('node:dns')).promises; } catch { _dnsModule = null; }
-  }
-  return _dnsModule;
-}
-
-/**
- * Resolve domain and validate that it does not point to private/internal IP addresses.
- * Uses Node.js dns module when available; skips in browser environments.
- */
-async function validateNotPrivateHost(domain: string): Promise<void> {
-  // Check domain name patterns first (no DNS needed)
-  for (const pattern of PRIVATE_DOMAIN_PATTERNS) {
-    if (pattern.test(domain)) {
-      throw new Error(`SSRF protection: domain '${domain.slice(0, 100)}' resolves to a private/internal host`);
-    }
-  }
-
-  // Attempt DNS resolution (Node.js only — gracefully skip in browsers)
-  try {
-    const dns = await _getDnsPromises();
-    if (dns) {
-      const [r4, r6] = await Promise.allSettled([dns.resolve4(domain), dns.resolve6(domain)]);
-      const results = [
-        ...(r4.status === 'fulfilled' ? r4.value : []),
-        ...(r6.status === 'fulfilled' ? r6.value : []),
-      ];
-
-      for (const ip of results) {
-        if (isPrivateIP(ip)) {
-          throw new Error(
-            `SSRF protection: domain '${domain.slice(0, 100)}' resolves to private IP '${ip}'`,
-          );
-        }
-      }
-    }
-  } catch (e) {
-    // Re-throw SSRF errors
-    if (e instanceof Error && e.message.startsWith('SSRF protection:')) throw e;
-    // DNS module not available (browser) — domain name checks above are the only guard
-  }
-}
-
-/**
- * Fetch and validate a registration file from a well-known URL.
- */
-export async function fetchRegistrationFile(
-  domain: string,
-  opts: FetchRegistrationFileOptions = {},
-): Promise<RegistrationFile> {
-  if (!VALID_DOMAIN_PATTERN.test(domain)) {
-    throw new Error(`Invalid domain: '${domain.slice(0, 100)}'`);
-  }
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
-  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_REGISTRATION_BYTES;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    throw new Error(`Invalid timeoutMs: expected positive finite milliseconds, got '${timeoutMs}'`);
-  }
-  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
-    throw new Error(`Invalid maxBytes: expected positive integer, got '${maxBytes}'`);
-  }
-
-  // SSRF protection: validate domain does not resolve to private/internal IPs
-  if (!opts.allowPrivateIPs) {
-    await validateNotPrivateHost(domain);
-  }
-
-  const url = `https://${domain}/.well-known/ace.json`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  let response: Response;
+  let body: Uint8Array;
   try {
-    response = await fetch(url, {
-      headers: { Accept: 'application/json' },
-      signal: controller.signal,
-      // Never follow redirects — a redirect target would bypass the SSRF host
-      // check above (e.g. 302 to http://169.254.169.254). fetch throws on 3xx.
-      redirect: 'error',
-    });
-  } catch (e) {
-    if (e instanceof Error && e.name === 'AbortError') {
-      throw new Error(`Timed out fetching registration file from ${url} after ${timeoutMs}ms`);
+    let res: Response;
+    try {
+      res = await fetch(`https://${domain}/.well-known/ace.json`, {
+        headers: { Accept: 'application/json' }, signal: controller.signal, redirect: 'manual',
+      });
+    } catch (e) {
+      throw new ACEError('fetch_failed', `fetch failed: ${e instanceof Error ? e.message : ''}`);
     }
-    throw e;
+    if (res.status >= 500 || res.status === 429) {
+      throw new ACEError('fetch_failed', `HTTP ${res.status}`, { status: res.status });
+    }
+    if (res.status !== 200) {
+      throw new ACEError('invalid_registration', `HTTP ${res.status} (redirects are not followed)`, { status: res.status });
+    }
+    const media = (res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
+    if (media !== 'application/json') throw new ACEError('invalid_registration', 'content-type must be application/json');
+    try {
+      body = await readLimited(res, maxBytes + 1);
+    } catch (e) {
+      throw new ACEError('fetch_failed', `read failed: ${e instanceof Error ? e.message : ''}`);
+    }
   } finally {
     clearTimeout(timer);
   }
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch registration file: ${response.status} ${response.statusText}`);
-  }
-
-  const contentType = response.headers.get('content-type');
-  if (!contentType || !contentType.includes('application/json')) {
-    throw new Error(`Invalid or missing content-type: expected application/json, got '${contentType}'`);
-  }
-
-  const contentLength = response.headers.get('content-length');
-  if (contentLength) {
-    const declaredLength = Number(contentLength);
-    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-      throw new Error(`Registration file too large: ${declaredLength} bytes exceeds max ${maxBytes}`);
-    }
-  }
-
-  // Stream-read with early abort to prevent memory exhaustion from chunked responses
-  const reader = response.body?.getReader();
-  let bodyBytes: Uint8Array;
-  if (reader) {
-    const chunks: Uint8Array[] = [];
-    let totalRead = 0;
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        totalRead += value.length;
-        if (totalRead > maxBytes) {
-          reader.cancel();
-          throw new Error(`Registration file too large: exceeds max ${maxBytes} bytes`);
-        }
-        chunks.push(value);
-      }
-    } finally {
-      reader.releaseLock();
-    }
-    bodyBytes = new Uint8Array(totalRead);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bodyBytes.set(chunk, offset);
-      offset += chunk.length;
-    }
-  } else {
-    // Fallback for environments without ReadableStream
-    bodyBytes = new Uint8Array(await response.arrayBuffer());
-    if (bodyBytes.length > maxBytes) {
-      throw new Error(`Registration file too large: ${bodyBytes.length} bytes exceeds max ${maxBytes}`);
-    }
-  }
-
-  let reg: RegistrationFile;
+  if (body.length > maxBytes) throw new ACEError('invalid_registration', `registration file exceeds ${maxBytes} bytes`);
+  let data: unknown;
   try {
-    reg = JSON.parse(new TextDecoder().decode(bodyBytes)) as RegistrationFile;
+    data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(body));
   } catch {
-    throw new Error('Failed to parse registration file: invalid JSON response');
+    throw new ACEError('invalid_registration', 'registration file is not JSON');
   }
-  const { signingPublicKey } = validateRegistrationFile(reg);
-  if (computeACEId(signingPublicKey) !== reg.id) {
-    throw new Error('Registration ACE ID does not match signing key');
-  }
-
+  const reg = parseRegistrationFile(data);
+  verifyRegistrationFile(reg);
   return reg;
 }
+
+/** Internal: read at most `limit` bytes of a response body, cancelling the rest. */
+export async function readLimited(res: Response, limit: number): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (res.body === null) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const take = value.subarray(0, Math.max(0, limit - total));
+      chunks.push(take);
+      total += take.length;
+      if (total >= limit) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
+export type { PeerRecord };

@@ -1,0 +1,261 @@
+/** Persistent thread records shared by Inbox and Outbox (design §2.11, Appendix A). */
+
+import { ACEError } from './errors.js';
+import {
+  canonicalStateBytes, codePointLength, CONTROL_CHAR_RE, isACEId, pairKey, parseStateBytes, wireInt,
+} from './encoding.js';
+import { decodeEnvelope, envelopeKnownFields } from './envelope.js';
+import {
+  isTerminalState, ThreadStateMachine, type ThreadHistoryEntry, type ThreadSnapshot, type ThreadState,
+} from './state-machine.js';
+import type { ACEStore } from './store.js';
+import type { ACEMessage, MessageType } from './types.js';
+
+/** A staged outbound message awaiting acknowledgement. */
+export interface PendingSend {
+  requestId: string;
+  status: 'pending' | 'expired';
+  stagedAt: number;
+  message: ACEMessage;
+}
+
+/** Internal: a thread record (`threads/<sha256(c ‖ 0 ‖ t)>.json`). */
+export interface ThreadRecord {
+  snapshot: ThreadSnapshot;
+  pending: PendingSend | null;
+}
+
+export const THREAD_RETENTION_SECONDS = 2592000;
+const PRUNE_INTERVAL_SECONDS = 3600;
+
+export function threadKey(conversationId: string, threadId: string): string {
+  return `threads/${pairKey(conversationId, threadId)}.json`;
+}
+
+export function isRequestId(v: unknown): v is string {
+  if (typeof v !== 'string' || v.length === 0 || v.length > 512) return false;
+  const n = codePointLength(v);
+  return n >= 1 && n <= 256 && !CONTROL_CHAR_RE.test(v);
+}
+
+/** Internal: decode a persisted PendingSend (without `version`); `storage_failed` on any defect. */
+export function decodePendingSend(v: unknown, what: string): PendingSend {
+  const bad = () => new ACEError('storage_failed', `${what}: invalid pending send`);
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) throw bad();
+  const p = v as Record<string, unknown>;
+  const stagedAt = wireInt(p.stagedAt);
+  if (!isRequestId(p.requestId) || (p.status !== 'pending' && p.status !== 'expired') || stagedAt === null) throw bad();
+  let message: ACEMessage;
+  try {
+    message = decodeEnvelope(p.message);
+  } catch {
+    throw bad();
+  }
+  return { requestId: p.requestId, status: p.status, stagedAt, message };
+}
+
+export function encodePendingSend(p: PendingSend): Record<string, unknown> {
+  return { message: envelopeKnownFields(p.message), requestId: p.requestId, stagedAt: p.stagedAt, status: p.status };
+}
+
+/** Internal: derive the state reached by a history (no validation beyond the table). */
+export function restoreMachine(localAceId: string, snapshot: ThreadSnapshot | null): ThreadStateMachine {
+  return snapshot === null
+    ? new ThreadStateMachine({ localAceId })
+    : ThreadStateMachine.fromState([snapshot], { localAceId });
+}
+
+/** Internal: the snapshot whose history is `history` (state derived by replay), or null if empty. */
+export function snapshotWithHistory(base: ThreadSnapshot, history: ThreadHistoryEntry[]): ThreadSnapshot | null {
+  if (history.length === 0) return null;
+  const sm = new ThreadStateMachine({ localAceId: base.localAceId });
+  for (const h of history) {
+    sm.apply(
+      {
+        conversationId: base.conversationId, threadId: base.threadId, type: h.type, messageId: h.messageId,
+        timestamp: h.timestamp, from: h.from, to: h.from === base.localAceId ? base.peerAceId : base.localAceId,
+      },
+      referenceBody(h.type, sm.getSnapshot(base.conversationId, base.threadId)),
+    );
+  }
+  return sm.getSnapshot(base.conversationId, base.threadId);
+}
+
+/** A body carrying exactly the reference the position rules require (history replay). */
+function referenceBody(type: MessageType, snap: ThreadSnapshot | null): Record<string, string> {
+  const h = snap?.history ?? [];
+  const head = h[h.length - 1]?.messageId ?? '';
+  const beforeHead = h[h.length - 2]?.messageId ?? '';
+  switch (type) {
+    case 'accept': return { offerId: head };
+    case 'invoice': return { offerId: beforeHead };
+    case 'receipt': return { referenceId: head };
+    case 'confirm': return { deliverId: head };
+    default: return {};
+  }
+}
+
+function historyEqual(a: ThreadHistoryEntry, b: ThreadHistoryEntry): boolean {
+  return a.type === b.type && a.messageId === b.messageId && a.timestamp === b.timestamp && a.from === b.from;
+}
+
+/** -1: a is a strict prefix of b; 0: equal; 1: b is a strict prefix of a; null: diverged. */
+export function compareHistories(a: ThreadHistoryEntry[], b: ThreadHistoryEntry[]): -1 | 0 | 1 | null {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (!historyEqual(a[i], b[i])) return null;
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
+/**
+ * Persistent economic thread state. Each record is validated on load by replaying its
+ * history (`ThreadStateMachine.fromState`); a record that fails is `storage_failed` and is
+ * never reset. Writes prune terminal threads without a pending send whose last entry is
+ * older than 30 days.
+ */
+export class ThreadStore {
+  readonly localAceId: string;
+  readonly #store: ACEStore;
+  readonly #clock?: () => number;
+  #lastPrune: number | null = null;
+
+  constructor(opts: { store: ACEStore; localAceId: string; clock?: () => number }) {
+    if (typeof opts !== 'object' || opts === null || typeof opts.store !== 'object' || opts.store === null) {
+      throw new ACEError('invalid_argument', 'store is required');
+    }
+    if (!isACEId(opts.localAceId)) throw new ACEError('invalid_argument', 'localAceId must be an ACE ID');
+    this.#store = opts.store;
+    this.localAceId = opts.localAceId;
+    this.#clock = opts.clock;
+  }
+
+  #now(): number {
+    return Math.floor(this.#clock ? this.#clock() : Date.now() / 1000);
+  }
+
+  async get(conversationId: string, threadId: string): Promise<ThreadSnapshot | null> {
+    return (await this.loadRecord(conversationId, threadId))?.snapshot ?? null;
+  }
+
+  async list(): Promise<ThreadSnapshot[]> {
+    return (await this.listRecords()).map((r) => r.snapshot);
+  }
+
+  async remove(conversationId: string, threadId: string): Promise<boolean> {
+    return this.withLock(async () => {
+      const key = threadKey(conversationId, threadId);
+      const exists = (await this.#store.read(key)) !== null;
+      if (exists) await this.#store.delete(key);
+      return exists;
+    });
+  }
+
+  async allowedTypes(conversationId: string, threadId: string, senderAceId: string): Promise<MessageType[]> {
+    const rec = await this.loadRecord(conversationId, threadId);
+    return restoreMachine(this.localAceId, rec?.snapshot ?? null).allowedTypes(conversationId, threadId, senderAceId);
+  }
+
+  // --- internal API (Inbox / Outbox) ---
+
+  /** Run `fn` under the `threads` lock. */
+  async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await this.#store.lock('threads');
+    try {
+      return await fn();
+    } finally {
+      await release();
+    }
+  }
+
+  async loadRecord(conversationId: string, threadId: string): Promise<ThreadRecord | null> {
+    const key = threadKey(conversationId, threadId);
+    const raw = await this.#store.read(key);
+    if (raw === null) return null;
+    const rec = this.#decode(parseStateBytes(raw, key), key);
+    if (rec.snapshot.conversationId !== conversationId || rec.snapshot.threadId !== threadId) {
+      throw new ACEError('storage_failed', `${key}: record does not match its key`);
+    }
+    return rec;
+  }
+
+  async listRecords(): Promise<ThreadRecord[]> {
+    const out: ThreadRecord[] = [];
+    for (const key of await this.#store.list('threads/')) {
+      const raw = await this.#store.read(key);
+      if (raw === null) continue;
+      const rec = this.#decode(parseStateBytes(raw, key), key);
+      if (threadKey(rec.snapshot.conversationId, rec.snapshot.threadId) !== key) {
+        throw new ACEError('storage_failed', `${key}: record does not match its key`);
+      }
+      out.push(rec);
+    }
+    return out;
+  }
+
+  /** Write a record (caller holds the lock), then prune old terminal threads. */
+  async saveRecord(rec: ThreadRecord): Promise<void> {
+    const s = rec.snapshot;
+    const doc = {
+      conversationId: s.conversationId,
+      history: s.history.map((h) => ({ from: h.from, messageId: h.messageId, timestamp: h.timestamp, type: h.type })),
+      localAceId: s.localAceId,
+      peerAceId: s.peerAceId,
+      pending: rec.pending === null ? null : encodePendingSend(rec.pending),
+      state: s.state,
+      threadId: s.threadId,
+      version: 1,
+    };
+    await this.#store.write(threadKey(s.conversationId, s.threadId), canonicalStateBytes(doc));
+    await this.#maybePrune();
+  }
+
+  async deleteRecord(conversationId: string, threadId: string): Promise<void> {
+    await this.#store.delete(threadKey(conversationId, threadId));
+  }
+
+  async #maybePrune(): Promise<void> {
+    const now = this.#now();
+    if (this.#lastPrune !== null && now - this.#lastPrune < PRUNE_INTERVAL_SECONDS) return;
+    this.#lastPrune = now;
+    for (const key of await this.#store.list('threads/')) {
+      const raw = await this.#store.read(key);
+      if (raw === null) continue;
+      let rec: ThreadRecord;
+      try {
+        rec = this.#decode(parseStateBytes(raw, key), key);
+      } catch {
+        continue; // never reset or delete a corrupt record
+      }
+      const h = rec.snapshot.history;
+      if (rec.pending === null && isTerminalState(rec.snapshot.state) && h[h.length - 1].timestamp < now - THREAD_RETENTION_SECONDS) {
+        await this.#store.delete(key);
+      }
+    }
+  }
+
+  #decode(doc: unknown, key: string): ThreadRecord {
+    if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) throw new ACEError('storage_failed', `${key}: not an object`);
+    const d = doc as Record<string, unknown>;
+    if (d.version !== 1) throw new ACEError('storage_failed', `${key}: unknown version`);
+    if (d.localAceId !== this.localAceId) throw new ACEError('storage_failed', `${key}: belongs to another identity`);
+    if (!Array.isArray(d.history)) throw new ACEError('storage_failed', `${key}: invalid history`);
+    const snapshot: ThreadSnapshot = {
+      conversationId: d.conversationId as string,
+      threadId: d.threadId as string,
+      localAceId: d.localAceId as string,
+      peerAceId: d.peerAceId as string,
+      state: d.state as ThreadState,
+      history: d.history.map((h) => {
+        const e = (typeof h === 'object' && h !== null ? h : {}) as Record<string, unknown>;
+        return { type: e.type as MessageType, messageId: e.messageId as string, timestamp: e.timestamp as number, from: e.from as string };
+      }),
+    };
+    try {
+      ThreadStateMachine.fromState([snapshot], { localAceId: this.localAceId });
+    } catch (e) {
+      throw new ACEError('storage_failed', `${key}: history does not replay (${e instanceof ACEError ? e.message : 'invalid'})`);
+    }
+    for (const h of snapshot.history) h.timestamp = wireInt(h.timestamp)!;
+    const pending = d.pending === null || d.pending === undefined ? null : decodePendingSend(d.pending, key);
+    return { snapshot, pending };
+  }
+}

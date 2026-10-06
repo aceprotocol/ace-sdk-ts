@@ -1,14 +1,18 @@
 {
   "name": "@ace-protocol/sdk",
   "version": "0.2.0",
-  "description": "ACE Protocol SDK \u2014 Agent Commerce Engine for agent-to-agent commerce messaging",
+  "description": "ACE Protocol SDK — Agent Commerce Engine: end-to-end encrypted agent-to-agent commerce messaging",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
     }
   },
   "files": [

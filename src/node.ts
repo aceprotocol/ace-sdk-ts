@@ -1,0 +1,283 @@
+/**
+ * Node.js-only exports (`@ace-protocol/sdk/node`).
+ *
+ * `FileStore(root)`: an `ACEStore` over a directory. Directories are 0700, files 0600.
+ * Writes are atomic (temp file + fsync + rename + directory fsync). Locks are lock files
+ * shared with the Python and Swift SDKs' protocol; concurrent mixed-language access to one
+ * root is unsupported, but the files at rest are portable.
+ */
+
+import { constants as fsc, promises as fs } from 'node:fs';
+import { hostname } from 'node:os';
+import { join, dirname } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { ACEError } from './errors.js';
+import { checkKey, checkLockName, checkTimeout, lockTimeoutError, Mutex, type ACEStore } from './store.js';
+
+export type { ACEStore } from './store.js';
+
+const MAX_FILE_BYTES = 64 * 1024 * 1024;
+const LOCK_POLL_MS = 50;
+const STALE_UNPARSEABLE_MS = 60_000;
+const processMutexes = new Map<string, Mutex>();
+
+function fail(what: string, e: unknown): ACEError {
+  if (e instanceof ACEError) return e;
+  const code = (e as NodeJS.ErrnoException)?.code ?? '';
+  return new ACEError('storage_failed', `${what} failed${code ? ` (${code})` : ''}`, { cause: e });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function errno(e: unknown): string | undefined {
+  return (e as NodeJS.ErrnoException)?.code;
+}
+
+export class FileStore implements ACEStore {
+  readonly root: string;
+  #realRoot: Promise<string> | null = null;
+
+  constructor(root: string) {
+    if (typeof root !== 'string' || root.length === 0) throw new ACEError('invalid_argument', 'root must be a directory path');
+    this.root = root;
+  }
+
+  async #base(): Promise<string> {
+    if (this.#realRoot === null) {
+      this.#realRoot = (async () => {
+        try {
+          await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
+          const st = await fs.lstat(this.root);
+          if (!st.isDirectory()) throw new ACEError('storage_failed', 'store root is not a directory');
+          return await fs.realpath(this.root);
+        } catch (e) {
+          this.#realRoot = null;
+          throw fail('opening the store root', e);
+        }
+      })();
+    }
+    return this.#realRoot;
+  }
+
+  /** Refuse symlinks anywhere below the root. Returns the absolute path. */
+  async #path(key: string, create: boolean): Promise<string | null> {
+    checkKey(key);
+    if (key === 'locks' || key.startsWith('locks/')) throw new ACEError('invalid_argument', "the 'locks/' prefix is reserved");
+    const base = await this.#base();
+    const parts = key.split('/');
+    let dir = base;
+    for (const part of parts.slice(0, -1)) {
+      dir = join(dir, part);
+      try {
+        const st = await fs.lstat(dir);
+        if (!st.isDirectory()) throw new ACEError('storage_failed', `${part} is not a directory`);
+      } catch (e) {
+        if (errno(e) !== 'ENOENT') throw fail('checking a directory', e);
+        if (!create) return null;
+        try {
+          await fs.mkdir(dir, { mode: 0o700 });
+        } catch (e2) {
+          if (errno(e2) !== 'EEXIST') throw fail('creating a directory', e2);
+        }
+      }
+    }
+    return join(dir, parts[parts.length - 1]);
+  }
+
+  async read(key: string): Promise<Uint8Array | null> {
+    const path = await this.#path(key, false);
+    if (path === null) return null;
+    try {
+      const st = await fs.lstat(path);
+      if (st.isSymbolicLink() || !st.isFile()) throw new ACEError('storage_failed', 'refusing a non-regular file');
+      if (st.size > MAX_FILE_BYTES) throw new ACEError('storage_failed', 'file exceeds 64 MiB');
+      const fh = await fs.open(path, fsc.O_RDONLY | fsc.O_NOFOLLOW);
+      try {
+        const data = await fh.readFile();
+        if (data.length > MAX_FILE_BYTES) throw new ACEError('storage_failed', 'file exceeds 64 MiB');
+        return new Uint8Array(data.buffer, data.byteOffset, data.length);
+      } finally {
+        await fh.close();
+      }
+    } catch (e) {
+      if (errno(e) === 'ENOENT') return null;
+      throw fail(`reading ${key}`, e);
+    }
+  }
+
+  async write(key: string, value: Uint8Array): Promise<void> {
+    if (!(value instanceof Uint8Array)) throw new ACEError('invalid_argument', 'value must be bytes');
+    const path = (await this.#path(key, true))!;
+    const dir = dirname(path);
+    const tmp = join(dir, `.tmp-${randomBytes(8).toString('hex')}`);
+    try {
+      const fh = await fs.open(tmp, fsc.O_CREAT | fsc.O_EXCL | fsc.O_WRONLY | fsc.O_NOFOLLOW, 0o600);
+      try {
+        await fh.writeFile(value);
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+      await fs.rename(tmp, path);
+      await syncDir(dir);
+    } catch (e) {
+      await fs.unlink(tmp).catch(() => {});
+      throw fail(`writing ${key}`, e);
+    }
+  }
+
+  async delete(key: string): Promise<void> {
+    const path = await this.#path(key, false);
+    if (path === null) return;
+    try {
+      await fs.unlink(path);
+      await syncDir(dirname(path));
+    } catch (e) {
+      if (errno(e) === 'ENOENT') return;
+      throw fail(`deleting ${key}`, e);
+    }
+  }
+
+  async list(prefix: string): Promise<string[]> {
+    if (typeof prefix !== 'string') throw new ACEError('invalid_argument', 'prefix must be a string');
+    const base = await this.#base();
+    const slash = prefix.lastIndexOf('/');
+    const startRel = slash >= 0 ? prefix.slice(0, slash) : '';
+    if (startRel !== '' && !/^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)*$/.test(startRel)) return [];
+    const out: string[] = [];
+    const walk = async (rel: string): Promise<void> => {
+      let entries;
+      try {
+        entries = await fs.readdir(rel ? join(base, rel) : base, { withFileTypes: true });
+      } catch (e) {
+        if (errno(e) === 'ENOENT' || errno(e) === 'ENOTDIR') return;
+        throw fail('listing', e);
+      }
+      for (const ent of entries) {
+        if (ent.name.startsWith('.')) continue;
+        const key = rel ? `${rel}/${ent.name}` : ent.name;
+        if (key === 'locks') continue;
+        if (ent.isDirectory()) {
+          if (key.startsWith(prefix) || prefix.startsWith(`${key}/`)) await walk(key);
+        } else if (ent.isFile() && key.startsWith(prefix)) {
+          out.push(key);
+        }
+      }
+    };
+    await walk(startRel);
+    return out.sort();
+  }
+
+  async lock(name: string, opts: { timeoutMs?: number } = {}): Promise<() => Promise<void>> {
+    checkLockName(name);
+    const timeout = checkTimeout(opts.timeoutMs);
+    const deadline = Date.now() + timeout;
+    const base = await this.#base();
+    const mkey = `${base}\u0000${name}`;
+    let mutex = processMutexes.get(mkey);
+    if (mutex === undefined) {
+      mutex = new Mutex();
+      processMutexes.set(mkey, mutex);
+    }
+    if (!(await mutex.acquire(timeout))) throw lockTimeoutError(name);
+    try {
+      const release = await this.#acquireFile(base, name, deadline);
+      let released = false;
+      const m = mutex;
+      return async () => {
+        if (released) return;
+        released = true;
+        try {
+          await release();
+        } finally {
+          m.release();
+        }
+      };
+    } catch (e) {
+      mutex.release();
+      throw e;
+    }
+  }
+
+  async #acquireFile(base: string, name: string, deadline: number): Promise<() => Promise<void>> {
+    const dir = join(base, 'locks');
+    const path = join(dir, `${name}.lock`);
+    try {
+      await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    } catch (e) {
+      throw fail('creating the locks directory', e);
+    }
+    const host = hostname();
+    const content = Buffer.from(JSON.stringify({ createdAt: Math.floor(Date.now() / 1000), host, pid: process.pid }));
+    for (;;) {
+      try {
+        const fh = await fs.open(path, fsc.O_CREAT | fsc.O_EXCL | fsc.O_WRONLY | fsc.O_NOFOLLOW, 0o600);
+        try {
+          await fh.writeFile(content);
+          await fh.sync();
+        } finally {
+          await fh.close();
+        }
+        return async () => {
+          try {
+            const current = await fs.readFile(path);
+            if (current.equals(content)) await fs.unlink(path);
+          } catch (e) {
+            if (errno(e) !== 'ENOENT') throw fail('releasing a lock', e);
+          }
+        };
+      } catch (e) {
+        if (errno(e) !== 'EEXIST') throw fail('acquiring a lock', e);
+      }
+      if (await this.#isStale(path, host)) {
+        await fs.unlink(path).catch(() => {});
+        continue;
+      }
+      if (Date.now() >= deadline) throw lockTimeoutError(name);
+      await sleep(Math.min(LOCK_POLL_MS, Math.max(1, deadline - Date.now())));
+    }
+  }
+
+  async #isStale(path: string, host: string): Promise<boolean> {
+    let raw: Buffer;
+    let mtimeMs: number;
+    try {
+      raw = await fs.readFile(path);
+      mtimeMs = (await fs.stat(path)).mtimeMs;
+    } catch {
+      return false;
+    }
+    let info: { host?: unknown; pid?: unknown } | null = null;
+    try {
+      const parsed = JSON.parse(raw.toString('utf8'));
+      if (typeof parsed === 'object' && parsed !== null) info = parsed;
+    } catch {
+      info = null;
+    }
+    if (info === null || typeof info.pid !== 'number' || typeof info.host !== 'string') {
+      return Date.now() - mtimeMs > STALE_UNPARSEABLE_MS;
+    }
+    if (info.host !== host) return false;
+    try {
+      process.kill(info.pid, 0);
+      return false;
+    } catch (e) {
+      return errno(e) === 'ESRCH';
+    }
+  }
+}
+
+async function syncDir(dir: string): Promise<void> {
+  let fh;
+  try {
+    fh = await fs.open(dir, fsc.O_RDONLY);
+    await fh.sync();
+  } catch (e) {
+    // Some platforms refuse fsync on directories; the rename itself is still atomic.
+    if (errno(e) !== 'EINVAL' && errno(e) !== 'EISDIR' && errno(e) !== 'EPERM') throw e;
+  } finally {
+    await fh?.close();
+  }
+}

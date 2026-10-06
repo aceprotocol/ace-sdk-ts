@@ -1,5 +1,16 @@
 import { expect, it } from 'vitest';
-it('the documented quickstart encrypts, authenticates and decrypts an RFQ', async () => {
-  const { parsed } = await import('../examples/quickstart.js');
-  expect(parsed.body).toEqual({ need: 'Translate 500 words EN→FR', maxPrice: '10', currency: 'USDC' });
+import { FakeRelay } from './fake-relay.js';
+
+const BODY = { need: 'Translate 500 words EN→FR', maxPrice: '10', currency: 'USDC' };
+
+it('the documented quickstart works locally and over a relay', async () => {
+  const { parsed, overRelay } = await import('../examples/quickstart.js');
+  expect(parsed.body).toEqual(BODY);
+  const relay = await new FakeRelay().start();
+  try {
+    const received = await overRelay(relay.url);
+    expect(received.map((m) => m.body)).toEqual([BODY]);
+  } finally {
+    await relay.close();
+  }
 });

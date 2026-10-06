@@ -1,563 +1,219 @@
-import type {
-  ACEIdentity, ACEMessage, MessageType, SigningScheme, RegistrationFile,
-} from './types.js';
+/** Message construction and the receive pipeline (06-security). */
+
+import { ACEError } from './errors.js';
+import {
+  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isThreadId, loadsBody, toBase64, wireInt,
+} from './encoding.js';
+import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
+import { computeConversationId, encrypt } from './encryption.js';
+import { decodeEnvelope, decodeKemCiphertext, decodePayload, messageSignData } from './envelope.js';
+import { MAX_PLAINTEXT_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import { ReplayDetector } from './replay.js';
+import { verifySignature } from './signing.js';
+import { ThreadStateMachine, type ThreadEvent } from './state-machine.js';
+import type { ACEIdentity, ACEMessage, JSONObject, MessageType, ParsedMessage } from './types.js';
 import { isEconomicType, isMessageType } from './types.js';
-import { toBase64, fromBase64, computeACEId } from './identity.js';
-import { computeConversationId, encrypt, decodeKemCiphertext, MAX_PAYLOAD_SIZE } from './encryption.js';
-import { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
-import { checkTimestampFreshness, validateMessageId, ReplayDetector } from './security.js';
-import { validateRegistrationFile, type VerifiedPeer } from './discovery.js';
-import { ThreadStateMachine, validateThreadId } from './state-machine.js';
-import { sanitizeForError } from './utils.js';
 
-const _encoder = new TextEncoder();
-const _decoder = new TextDecoder();
+// --- body schema --------------------------------------------------------------------
 
-/** Maximum nesting depth for parsed JSON bodies — prevents stack overflow from malicious payloads. */
-const MAX_JSON_DEPTH = 32;
+type FieldKind = 'str' | 'optStr' | 'optObj' | 'obj' | 'optTtl';
 
-/** Iterative depth check — no recursion, immune to stack overflow from the check itself. */
-function assertMaxDepth(value: unknown, maxDepth: number): void {
-  const stack: Array<{ val: unknown; depth: number }> = [{ val: value, depth: 0 }];
-  while (stack.length > 0) {
-    const { val, depth } = stack.pop()!;
-    if (depth > maxDepth) {
-      throw new Error(`Decrypted body exceeds maximum nesting depth of ${maxDepth}`);
-    }
-    if (typeof val === 'object' && val !== null) {
-      for (const v of Object.values(val)) {
-        if (typeof v === 'object' && v !== null) {
-          stack.push({ val: v, depth: depth + 1 });
-        }
-      }
-    }
-  }
-}
+const SCHEMAS: Record<MessageType, Array<[string, FieldKind]>> = {
+  rfq: [['need', 'str'], ['maxPrice', 'optStr'], ['currency', 'optStr'], ['ttl', 'optTtl']],
+  offer: [['price', 'str'], ['currency', 'str'], ['terms', 'optStr'], ['ttl', 'optTtl']],
+  accept: [['offerId', 'str']],
+  reject: [['reason', 'optStr']],
+  invoice: [['offerId', 'str'], ['amount', 'str'], ['currency', 'str'], ['settlementMethod', 'str'], ['settlementDetails', 'optObj']],
+  receipt: [['referenceId', 'str'], ['amount', 'str'], ['currency', 'str'], ['settlementMethod', 'str'], ['proof', 'obj']],
+  deliver: [['type', 'str'], ['content', 'optStr'], ['contentType', 'optStr'], ['uri', 'optStr'], ['metadata', 'optObj']],
+  confirm: [['deliverId', 'str'], ['message', 'optStr']],
+  info: [['message', 'str']],
+  text: [['message', 'str']],
+};
 
-const CONVERSATION_ID_PATTERN = /^[0-9a-f]{64}$/;
-
-function assertMessageType(type: unknown): void {
-  if (!isMessageType(type)) {
-    throw new Error(`Unknown message type: '${sanitizeForError(String(type), 32)}'`);
-  }
-}
-
-/** Shared pre-check: economic messages must carry a threadId. */
-function requireThreadIdForEconomic(type: MessageType, threadId: string | undefined): void {
-  if (isEconomicType(type) && !threadId) {
-    throw new Error(`Economic message type '${type}' requires a threadId`);
-  }
-}
-
-function normalizeThreadId(threadId: string | undefined): string {
-  return threadId ?? '';
-}
-
-function buildSignedMessagePayload(
-  type: MessageType,
-  to: string,
-  conversationId: string,
-  messageId: string,
-  threadId: string | undefined,
-  kemCiphertext: Uint8Array,
-  payload: Uint8Array,
-): Uint8Array {
-  // kemCiphertext is signed too: it is what the recipient decapsulates to derive
-  // the decryption key, so it is part of the sender's commitment. Omitting it
-  // would let a relay swap the KEM ciphertext (garbling the message) without
-  // breaking the signature.
-  return encodePayload(
-    type, to, conversationId, messageId, normalizeThreadId(threadId),
-    kemCiphertext, payload,
-  );
-}
-
-// === Schema Validation ===
-
-type BodyType = Record<string, unknown>;
-
-function requireString(body: BodyType, field: string, typeName: string): string {
-  if (!Object.hasOwn(body, field)) {
-    throw new Error(`${typeName} body requires '${field}' field`);
-  }
-  const value = body[field];
-  if (value === undefined || value === null) {
-    throw new Error(`${typeName} body requires '${field}' field`);
-  }
-  if (typeof value !== 'string') {
-    throw new Error(`${typeName}.${field} must be a string`);
-  }
-  return value;
-}
-
-function requireObject(body: BodyType, field: string, typeName: string): void {
-  if (!Object.hasOwn(body, field)) {
-    throw new Error(`${typeName} body requires '${field}' field`);
-  }
-  const value = body[field];
-  if (value === undefined || value === null) {
-    throw new Error(`${typeName} body requires '${field}' field`);
-  }
-  validateObject(value, field, typeName);
-}
-
-function validateOptionalString(body: BodyType, field: string, typeName: string): void {
-  const value = body[field];
-  if (value === undefined || value === null) return;
-  if (typeof value !== 'string') {
-    throw new Error(`${typeName}.${field} must be a string`);
-  }
-}
-
-function validateOptionalObject(body: BodyType, field: string, typeName: string): void {
-  const value = body[field];
-  if (value === undefined || value === null) return;
-  validateObject(value, field, typeName);
-}
-
-function validateOptionalNumber(body: BodyType, field: string, typeName: string): void {
-  const value = body[field];
-  if (value === undefined || value === null) return;
-  if (!isJSONNumber(value)) {
-    throw new Error(`${typeName}.${field} must be a number`);
-  }
-}
-
-function validateObject(value: unknown, field: string, typeName: string): void {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new Error(`${typeName}.${field} must be an object`);
-  }
-}
-
-function isJSONNumber(value: unknown): boolean {
-  return typeof value === 'number' && Number.isFinite(value);
-}
-
-export function validateBody(type: MessageType, body: BodyType): void {
-  switch (type) {
-    case 'rfq':
-      requireString(body, 'need', 'rfq');
-      validateOptionalString(body, 'maxPrice', 'rfq');
-      validateOptionalString(body, 'currency', 'rfq');
-      validateOptionalNumber(body, 'ttl', 'rfq');
-      break;
-    case 'offer':
-      requireString(body, 'price', 'offer');
-      requireString(body, 'currency', 'offer');
-      validateOptionalString(body, 'terms', 'offer');
-      validateOptionalNumber(body, 'ttl', 'offer');
-      break;
-    case 'accept':
-      requireString(body, 'offerId', 'accept');
-      break;
-    case 'reject':
-      validateOptionalString(body, 'reason', 'reject');
-      break;
-    case 'invoice':
-      requireString(body, 'offerId', 'invoice');
-      requireString(body, 'amount', 'invoice');
-      requireString(body, 'currency', 'invoice');
-      requireString(body, 'settlementMethod', 'invoice');
-      validateOptionalObject(body, 'settlementDetails', 'invoice');
-      break;
-    case 'receipt':
-      requireString(body, 'referenceId', 'receipt');
-      requireString(body, 'amount', 'receipt');
-      requireString(body, 'currency', 'receipt');
-      requireString(body, 'settlementMethod', 'receipt');
-      requireObject(body, 'proof', 'receipt');
-      break;
-    case 'deliver': {
-      const deliverType = requireString(body, 'type', 'deliver');
-      validateOptionalString(body, 'content', 'deliver');
-      validateOptionalString(body, 'contentType', 'deliver');
-      validateOptionalString(body, 'uri', 'deliver');
-      validateOptionalObject(body, 'metadata', 'deliver');
-      if (deliverType === 'inline') {
-        requireString(body, 'content', 'deliver (inline)');
-      } else if (deliverType === 'reference') {
-        requireString(body, 'uri', 'deliver (reference)');
-      } else {
-        const sanitized = deliverType.slice(0, 50);
-        throw new Error(`deliver.type must be 'inline' or 'reference', got '${sanitized}'`);
-      }
-      break;
-    }
-    case 'confirm':
-      requireString(body, 'deliverId', 'confirm');
-      validateOptionalString(body, 'message', 'confirm');
-      break;
-    case 'info':
-      requireString(body, 'message', 'info');
-      break;
-    case 'text':
-      requireString(body, 'message', 'text');
-      break;
-    default:
-      assertMessageType(type);
-      break;
-  }
-}
-
-function threadContainsMessage(
-  stateMachine: ThreadStateMachine,
-  conversationId: string,
-  threadId: string,
-  messageType: MessageType,
-  messageId: string,
-): boolean {
-  return stateMachine.getSnapshot(conversationId, threadId).history
-    .some((entry) => entry.type === messageType && entry.messageId === messageId);
-}
-
-function validateThreadReferences(
-  type: MessageType,
-  body: BodyType,
-  stateMachine: ThreadStateMachine,
-  conversationId: string,
-  threadId: string,
-): void {
-  if (!isEconomicType(type) || threadId.length === 0) {
-    return;
-  }
-
-  switch (type) {
-    case 'accept':
-      if (!threadContainsMessage(stateMachine, conversationId, threadId, 'offer', requireString(body, 'offerId', 'accept'))) {
-        throw new Error('accept.offerId must reference an offer in the same thread');
-      }
-      break;
-    case 'invoice':
-      if (!threadContainsMessage(stateMachine, conversationId, threadId, 'offer', requireString(body, 'offerId', 'invoice'))) {
-        throw new Error('invoice.offerId must reference an offer in the same thread');
-      }
-      break;
-    case 'receipt': {
-      // Pre-paid path (accepted → paid): the receipt references the accept.
-      const referenced = stateMachine.getState(conversationId, threadId) === 'accepted' ? 'accept' : 'invoice';
-      if (!threadContainsMessage(stateMachine, conversationId, threadId, referenced, requireString(body, 'referenceId', 'receipt'))) {
-        throw new Error(
-          'receipt.referenceId must reference the invoice (or, when pre-paid, the accept) in the same thread',
-        );
-      }
-      break;
-    }
-    case 'confirm':
-      if (!threadContainsMessage(stateMachine, conversationId, threadId, 'deliver', requireString(body, 'deliverId', 'confirm'))) {
-        throw new Error('confirm.deliverId must reference a deliver message in the same thread');
-      }
-      break;
-    default:
-      break;
-  }
-}
-
-// === Message Construction ===
-
-export interface CreateMessageOptions {
-  sender: ACEIdentity;
-  recipientPubKey: Uint8Array; // X-Wing encryption public key (1216 bytes)
-  recipientACEId: string;
-  type: MessageType;
-  body: BodyType;
-  stateMachine: ThreadStateMachine;
-  threadId?: string; // Required for economic messages
-  timestamp?: number; // defaults to Date.now() / 1000
-}
-
-export async function createMessage(
-  opts: CreateMessageOptions,
-): Promise<ACEMessage> {
-  assertMessageType(opts.type);
-  if (opts.threadId !== undefined) {
-    validateThreadId(opts.threadId);
-  }
-  requireThreadIdForEconomic(opts.type, opts.threadId);
-
-  // 1. Validate body schema
-  validateBody(opts.type, opts.body);
-
-  const messageId = crypto.randomUUID();
-  const timestamp = opts.timestamp ?? Math.floor(Date.now() / 1000);
-  const fromId = opts.sender.getACEId();
-  const toId = opts.recipientACEId;
-  const conversationId = computeConversationId(
-    opts.sender.getEncryptionPublicKey(),
-    opts.recipientPubKey,
-  );
-
-  // 2. State machine pre-check (optimistic fail-fast before expensive crypto).
-  // NOTE: This is NOT atomic with the final transition() at step 5 — concurrent
-  // createMessage calls sharing the same stateMachine may both pass this check.
-  // The authoritative guard is the transition() call after crypto completes.
-  const threadKey = normalizeThreadId(opts.threadId);
-  if (!opts.stateMachine.canTransition(conversationId, threadKey, opts.type)) {
-    // Call transition() to produce the proper InvalidTransitionError
-    opts.stateMachine.transition(conversationId, threadKey, opts.type, messageId, timestamp);
-  }
-  validateThreadReferences(opts.type, opts.body, opts.stateMachine, conversationId, threadKey);
-
-  // 3. Encrypt body
-  const bodyJson = JSON.stringify(opts.body);
-  const bodyBytes = _encoder.encode(bodyJson);
-  const { kemCiphertext, payload } = await encrypt(
-    bodyBytes,
-    opts.recipientPubKey,
-    conversationId,
-  );
-
-  // 4. Build sign data and sign
-  const messagePayload = buildSignedMessagePayload(
-    opts.type,
-    toId,
-    conversationId,
-    messageId,
-    opts.threadId,
-    kemCiphertext,
-    payload,
-  );
-  const signData = buildSignData('message', fromId, timestamp, messagePayload);
-  const { signature, scheme } = await opts.sender.sign(signData);
-
-  // 5. Commit state transition (only after all crypto succeeded)
-  opts.stateMachine.transition(conversationId, threadKey, opts.type, messageId, timestamp);
-
-  // 6. Assemble envelope
-  const msg: ACEMessage = {
-    ace: '1.0',
-    messageId,
-    from: fromId,
-    to: toId,
-    conversationId,
-    type: opts.type,
-    timestamp,
-    encryption: {
-      kemCiphertext: toBase64(kemCiphertext),
-      payload: toBase64(payload),
-    },
-    signature: {
-      scheme,
-      value: encodeSignature(signature, scheme),
-    },
-  };
-
-  if (opts.threadId) {
-    msg.threadId = opts.threadId;
-  }
-
-  return msg;
-}
-
-// === Message Parsing (Verify + Decrypt) ===
-
-export interface ParsedMessage<T = Record<string, unknown>> {
-  messageId: string;
-  from: string;
-  to: string;
-  conversationId: string;
-  type: MessageType;
-  threadId?: string;
-  timestamp: number;
-  body: T;
-}
-
-export interface ParseMessageOptions {
-  /** Offline acceptance floor; use it for every message, live ones included, until the backlog is done. */
-  oldestTimestamp?: number;
-  stateMachine: ThreadStateMachine;
-  expectedScheme?: SigningScheme;
-  replayDetector: ReplayDetector;
-  senderEncryptionPubKey?: Uint8Array;
-}
-
-export interface ParseMessageFromRegistrationOptions {
-  oldestTimestamp?: number;
-  stateMachine: ThreadStateMachine;
-  replayDetector: ReplayDetector;
-}
-
-export async function parseMessage(
-  msg: ACEMessage,
-  receiver: ACEIdentity,
-  senderSigningPubKey: Uint8Array,
-  opts: ParseMessageOptions,
-): Promise<ParsedMessage> {
-  // 1. Envelope validation (pipeline step 1)
-  if (msg.ace !== '1.0') {
-    throw new Error(`Unsupported ACE version: '${msg.ace}'`);
-  }
-  if (msg.to !== receiver.getACEId()) {
-    throw new Error('Message not addressed to this recipient');
-  }
-  if (!msg.messageId || !msg.from || !msg.conversationId || !msg.type) {
-    throw new Error('Missing required envelope fields');
-  }
-  assertMessageType(msg.type);
-  if (typeof msg.conversationId !== 'string' || !CONVERSATION_ID_PATTERN.test(msg.conversationId)) {
-    throw new Error('Invalid conversationId: expected 64 lowercase hex characters');
-  }
-  validateMessageId(msg.messageId);
-  if (msg.threadId !== undefined) {
-    validateThreadId(msg.threadId);
-  }
-
-  // Validate encryption and signature envelopes exist
-  if (!msg.encryption?.payload || !msg.encryption?.kemCiphertext) {
-    throw new Error('Missing required encryption fields');
-  }
-  if (!msg.signature?.scheme || !msg.signature?.value) {
-    throw new Error('Missing required signature fields');
-  }
-
-  // Validate msg.from matches the sender's signing public key
-  const expectedFromId = computeACEId(senderSigningPubKey);
-  if (msg.from !== expectedFromId) {
-    throw new Error('msg.from does not match sender signing public key');
-  }
-  if (opts.senderEncryptionPubKey) {
-    const expectedConversationId = computeConversationId(
-      opts.senderEncryptionPubKey,
-      receiver.getEncryptionPublicKey(),
-    );
-    if (msg.conversationId !== expectedConversationId) {
-      throw new Error('msg.conversationId does not match sender/recipient encryption keys');
-    }
-  }
-
-  // Validate signature scheme if expected scheme is provided
-  if (opts.expectedScheme && msg.signature.scheme !== opts.expectedScheme) {
-    throw new Error(
-      `Signature scheme mismatch: expected '${opts.expectedScheme}', got '${msg.signature.scheme}'`,
-    );
-  }
-
-  requireThreadIdForEconomic(msg.type, msg.threadId);
-
-  // 2–3. Timestamp freshness, replay horizon and seen check — BEFORE expensive ops
-  checkTimestampFreshness(msg.timestamp, opts.oldestTimestamp);
-  const replayError = () => new Error(`Replay detected: messageId '${msg.messageId}' already processed or below replay horizon`);
-  if (!opts.replayDetector.accepts(msg.messageId, msg.from, msg.timestamp)) {
-    throw replayError();
-  }
-
-  // 4. Verify signature BEFORE decryption (pipeline step 4).
-  const payloadBytes = fromBase64(msg.encryption.payload, MAX_PAYLOAD_SIZE, 'Payload');
-  // Schema check: the X-Wing ciphertext has a fixed size. Rejected before any
-  // signature verification or decapsulation runs.
-  const kemCiphertext = decodeKemCiphertext(msg.encryption.kemCiphertext);
-  const messagePayload = buildSignedMessagePayload(
-    msg.type,
-    msg.to,
-    msg.conversationId,
-    msg.messageId,
-    msg.threadId,
-    kemCiphertext,
-    payloadBytes,
-  );
-  const signData = buildSignData('message', msg.from, msg.timestamp, messagePayload);
-  const sigBytes = decodeSignature(msg.signature.value, msg.signature.scheme);
-  let valid = false;
-  try {
-    valid = verifySignature(signData, sigBytes, msg.signature.scheme, senderSigningPubKey);
-  } catch {
-    // Malformed signature/key bytes → treat as failed verification.
-  }
-  if (!valid) {
-    throw new Error('Signature verification failed');
-  }
-  // Commit now: an authentic message is one-shot, even if a later step fails.
-  if (!opts.replayDetector.commit(msg.messageId, msg.from, msg.timestamp, opts.oldestTimestamp)) {
-    throw replayError();
-  }
-
-  // 5. Decrypt body via identity's decrypt method (pipeline step 5) —
-  // kemCiphertext was length-checked and signature-verified above.
-  const decrypted = await receiver.decrypt(
-    kemCiphertext,
-    payloadBytes,
-    msg.conversationId,
-  );
-
-  const rawParsed: unknown = JSON.parse(_decoder.decode(decrypted));
-  if (typeof rawParsed !== 'object' || rawParsed === null || Array.isArray(rawParsed)) {
-    throw new Error('Decrypted body must be a JSON object');
-  }
-  // Guard against deeply nested JSON that could cause stack overflow or CPU exhaustion
-  assertMaxDepth(rawParsed, MAX_JSON_DEPTH);
-  // Isolate from Object.prototype to prevent prototype pollution via __proto__/constructor keys
-  const body = Object.assign(Object.create(null), rawParsed) as BodyType;
-
-  // 6. Validate body schema (pipeline step 6)
-  validateBody(msg.type, body);
-  validateThreadReferences(
-    msg.type,
-    body,
-    opts.stateMachine,
-    msg.conversationId,
-    normalizeThreadId(msg.threadId),
-  );
-
-  // 7. State machine validation (pipeline step 7 — after all security checks)
-  opts.stateMachine.transition(
-    msg.conversationId,
-    msg.threadId ?? '',
-    msg.type,
-    msg.messageId,
-    msg.timestamp,
-  );
-
-  return {
-    messageId: msg.messageId,
-    from: msg.from,
-    to: msg.to,
-    conversationId: msg.conversationId,
-    type: msg.type,
-    threadId: msg.threadId,
-    timestamp: msg.timestamp,
-    body,
-  };
-}
-
-export async function parseMessageFromRegistration(
-  msg: ACEMessage,
-  receiver: ACEIdentity,
-  senderRegistration: RegistrationFile,
-  opts: ParseMessageFromRegistrationOptions,
-): Promise<ParsedMessage> {
-  // validateRegistrationFile already checks the secp256k1 address against the
-  // signing key, so the only remaining verifyRegistrationId check is the id.
-  const keys = validateRegistrationFile(senderRegistration);
-  if (computeACEId(keys.signingPublicKey) !== senderRegistration.id) {
-    throw new Error('Sender registration file failed cryptographic verification');
-  }
-
-  return parseMessage(msg, receiver, keys.signingPublicKey, {
-    oldestTimestamp: opts.oldestTimestamp,
-    stateMachine: opts.stateMachine,
-    expectedScheme: senderRegistration.signing.scheme,
-    replayDetector: opts.replayDetector,
-    senderEncryptionPubKey: keys.encryptionPublicKey,
-  });
+function isPlainObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 /**
- * Safe path for messages whose sender keys came from a relay.
- *
- * `sender` must be a {@link VerifiedPeer} — obtainable only after its encryption-key
- * binding was verified — so the recipient never trusts a relay-substituted X-Wing
- * key. `conversationId` is recomputed from the verified keys and must match.
+ * Validate a body against its type's schema; failures are `invalid_body`
+ * (an unknown type is `invalid_argument`). Optional fields set to null are absent;
+ * unknown fields are ignored.
  */
-export async function parseMessageFromPeer(
-  msg: ACEMessage,
-  receiver: ACEIdentity,
-  sender: VerifiedPeer,
-  opts: ParseMessageFromRegistrationOptions,
+export function validateBody(type: MessageType, body: JSONObject): void {
+  if (!isMessageType(type)) throw new ACEError('invalid_argument', 'unknown message type');
+  if (!isPlainObj(body)) throw new ACEError('invalid_body', 'body must be a JSON object');
+  for (const [name, kind] of SCHEMAS[type]) {
+    const v = body[name];
+    if (v === null || v === undefined) {
+      if (kind === 'str' || kind === 'obj') throw new ACEError('invalid_body', `${type}.${name} is required`);
+      continue;
+    }
+    const ok = kind === 'str' || kind === 'optStr' ? typeof v === 'string'
+      : kind === 'obj' || kind === 'optObj' ? isPlainObj(v)
+        : wireInt(v) !== null;
+    if (!ok) throw new ACEError('invalid_body', `${type}.${name} has the wrong type`);
+  }
+  if (type === 'deliver') {
+    const kind = body.type;
+    const required = kind === 'inline' ? 'content' : kind === 'reference' ? 'uri' : null;
+    if (required === null) throw new ACEError('invalid_body', "deliver.type must be 'inline' or 'reference'");
+    if (typeof body[required] !== 'string') throw new ACEError('invalid_body', `deliver (${kind}) requires ${required}`);
+  }
+}
+
+/** Internal: decrypted bytes -> validated body (`invalid_body`). */
+export function decodeBody(type: MessageType, raw: Uint8Array): JSONObject {
+  const body = loadsBody(raw);
+  validateBody(type, body);
+  return body;
+}
+
+function nowOf(clock?: () => number): number {
+  return Math.floor(clock ? clock() : Date.now() / 1000);
+}
+
+export function eventOf(env: ACEMessage): ThreadEvent {
+  return {
+    conversationId: env.conversationId, threadId: env.threadId, type: env.type, messageId: env.messageId,
+    timestamp: env.timestamp, from: env.from, to: env.to,
+  };
+}
+
+// --- create -----------------------------------------------------------------------
+
+export interface CreateMessageInput {
+  sender: ACEIdentity;
+  recipient: VerifiedPeer;
+  type: MessageType;
+  body: JSONObject;
+  threads: ThreadStateMachine;
+  threadId?: string;
+  timestamp?: number;
+}
+
+/** Encrypt, sign and record an outbound message (design §2.5 order). */
+export async function createMessage(opts: CreateMessageInput): Promise<ACEMessage> {
+  return buildMessage(opts);
+}
+
+/** Internal: `createMessage`, optionally reusing a messageId (Outbox re-sign). */
+export async function buildMessage(opts: CreateMessageInput, reuseMessageId?: string): Promise<ACEMessage> {
+  if (typeof opts !== 'object' || opts === null) throw new ACEError('invalid_argument', 'options are required');
+  const { sender, recipient, type, body, threads, threadId } = opts;
+  if (!isVerifiedPeer(recipient)) throw new ACEError('invalid_argument', 'recipient must be a VerifiedPeer');
+  if (!(threads instanceof ThreadStateMachine)) throw new ACEError('invalid_argument', 'threads must be a ThreadStateMachine');
+  // 1. type, threadId, local identity
+  if (!isMessageType(type)) throw new ACEError('invalid_argument', 'unknown message type');
+  if (threadId !== undefined && !isThreadId(threadId)) {
+    throw new ACEError('invalid_argument', 'threadId must be 1..256 code points without control characters');
+  }
+  if (threadId === undefined && isEconomicType(type)) throw new ACEError('invalid_argument', 'economic messages require threadId');
+  const from = sender.getACEId();
+  if (threads.localAceId !== from) throw new ACEError('invalid_argument', 'threads.localAceId must be the sender');
+  const ts = opts.timestamp ?? nowOf();
+  if (wireInt(ts) === null) throw new ACEError('invalid_argument', 'timestamp must be an integer in [0, 2^53-1]');
+  // 2. JSON values, then schema
+  if (!isPlainObj(body)) throw new ACEError('invalid_body', 'body must be a JSON object');
+  checkJsonValue(body);
+  validateBody(type, body);
+  // 3. conversation
+  const conversationId = computeConversationId(sender.getEncryptionPublicKey(), recipient.encryptionPublicKey);
+  const messageId = reuseMessageId ?? crypto.randomUUID();
+  const event: ThreadEvent = { conversationId, threadId, type, messageId, timestamp: ts, from, to: recipient.aceId };
+  // 4. state machine pre-check
+  threads.check(event, body);
+  // 5. serialize
+  const plaintext = dumpsBody(body);
+  if (plaintext.length > MAX_PLAINTEXT_BYTES) throw new ACEError('limit_exceeded', `body exceeds ${MAX_PLAINTEXT_BYTES} bytes`);
+  // 6. encrypt
+  const { kemCiphertext, payload } = await encrypt(plaintext, recipient.encryptionPublicKey, conversationId);
+  const scheme = sender.getSigningScheme();
+  const env: ACEMessage = {
+    ace: '1.0', messageId, from, to: recipient.aceId, conversationId, type, timestamp: ts,
+    encryption: { kemCiphertext: toBase64(kemCiphertext), payload: toBase64(payload) },
+    signature: { scheme, value: '' },
+  };
+  if (threadId !== undefined) env.threadId = threadId;
+  // 7. sign
+  env.signature.value = encodeSignature(await sender.sign(messageSignData(env)), scheme);
+  // 8. commit
+  threads.apply(event, body);
+  return env;
+}
+
+// --- parse ------------------------------------------------------------------------
+
+export interface ParseMessageOptions {
+  threads: ThreadStateMachine;
+  replay: ReplayDetector;
+  /** Acceptance floor in [0, now]; default now - 300. */
+  floor?: number;
+  clock?: () => number;
+}
+
+/**
+ * Verify, decrypt and validate an inbound message. The first failure wins:
+ * decode → wrong_recipient → from (invalid_envelope) → scheme_mismatch →
+ * conversationId (invalid_envelope) → floor / timestamp (stale_timestamp) → replay →
+ * invalid_signature → replay commit → decrypt → invalid_body → state machine.
+ */
+export async function parseMessage(
+  envelope: ACEMessage, receiver: ACEIdentity, sender: VerifiedPeer, opts: ParseMessageOptions,
 ): Promise<ParsedMessage> {
-  return parseMessage(msg, receiver, sender.signingPublicKey, {
-    oldestTimestamp: opts.oldestTimestamp,
-    stateMachine: opts.stateMachine,
-    expectedScheme: sender.scheme,
-    replayDetector: opts.replayDetector,
-    senderEncryptionPubKey: sender.encryptionPublicKey,
-  });
+  if (!isVerifiedPeer(sender)) throw new ACEError('invalid_argument', 'sender must be a VerifiedPeer');
+  if (typeof opts !== 'object' || opts === null || !(opts.threads instanceof ThreadStateMachine) || !(opts.replay instanceof ReplayDetector)) {
+    throw new ACEError('invalid_argument', 'threads and replay are required');
+  }
+  const { threads, replay } = opts;
+  const receiverId = receiver.getACEId();
+  if (threads.localAceId !== receiverId) throw new ACEError('invalid_argument', 'threads.localAceId must be the receiver');
+  // 1
+  const env = decodeEnvelope(envelope);
+  // 2-5
+  if (env.to !== receiverId) throw new ACEError('wrong_recipient', 'message is not addressed to this identity');
+  if (env.from !== sender.aceId) throw new ACEError('invalid_envelope', 'from does not match the sender');
+  if (env.signature.scheme !== sender.scheme) throw new ACEError('scheme_mismatch', 'signature scheme differs from the sender\'s scheme');
+  if (env.conversationId !== computeConversationId(sender.encryptionPublicKey, receiver.getEncryptionPublicKey())) {
+    throw new ACEError('invalid_envelope', 'conversationId does not match the verified keys');
+  }
+  // 6
+  const now = nowOf(opts.clock);
+  let floor: number;
+  if (opts.floor === undefined) {
+    floor = Math.max(0, now - TIMESTAMP_WINDOW_SECONDS);
+  } else {
+    if (wireInt(opts.floor) === null || opts.floor > now) throw new ACEError('invalid_argument', 'floor must be an integer in [0, now]');
+    floor = opts.floor;
+  }
+  if (env.timestamp < floor || env.timestamp > now + TIMESTAMP_WINDOW_SECONDS) {
+    throw new ACEError('stale_timestamp', 'timestamp is outside the acceptance window');
+  }
+  // 7
+  if (!replay.accepts(env.messageId, env.from, env.timestamp)) throw new ACEError('replay', 'message already seen or below the replay horizon');
+  // 8
+  const sig = decodeSignature(env.signature.value, env.signature.scheme, 'invalid_envelope');
+  if (!verifySignature(messageSignData(env), sig, sender.scheme, sender.signingPublicKey)) {
+    throw new ACEError('invalid_signature', 'message signature does not verify');
+  }
+  // 9
+  if (!replay.commit(env.messageId, env.from, env.timestamp, floor)) {
+    throw new ACEError('replay', 'message already seen or below the replay horizon');
+  }
+  // 10
+  let plaintext: Uint8Array;
+  try {
+    plaintext = await receiver.decrypt(decodeKemCiphertext(env.encryption.kemCiphertext), decodePayload(env.encryption.payload), env.conversationId);
+  } catch (e) {
+    if (e instanceof ACEError) throw e;
+    throw new ACEError('identity_unavailable', `identity decrypt failed: ${e instanceof Error ? e.name : typeof e}`, { cause: e });
+  }
+  // 11-12
+  const body = decodeBody(env.type, plaintext);
+  // 13
+  if (isEconomicType(env.type)) threads.apply(eventOf(env), body);
+  return {
+    messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, type: env.type,
+    threadId: env.threadId ?? null, timestamp: env.timestamp, body,
+  };
 }

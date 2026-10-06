@@ -1,190 +1,162 @@
+/** signData construction and strict ed25519 / secp256k1 verification. Internal. */
+
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
-import type { SigningScheme } from './types.js';
-import { toBase64, fromBase64 } from './identity.js';
+import { keccak_256 } from '@noble/hashes/sha3.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
+import bs58 from 'bs58';
+import { ACEError } from './errors.js';
+import { bytesEqual, MAX_SAFE_INTEGER, utf8 } from './encoding.js';
 
-const _encoder = new TextEncoder();
+const DOMAIN_PREFIX = utf8('ace.v1');
+const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+const SECP256K1_HALF_N = SECP256K1_N >> 1n;
+const ED25519_L = 2n ** 252n + 27742317777372353535851937790883648493n;
 
-// Unified domain prefix — action field provides domain separation
-const _DOMAIN_PREFIX = _encoder.encode('ace.v1');
+const SMALL_ORDER = [
+  '0000000000000000000000000000000000000000000000000000000000000000',
+  '0100000000000000000000000000000000000000000000000000000000000000',
+  '26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05',
+  'c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a',
+  'ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f',
+  'edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f',
+  'eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f',
+];
 
-// secp256k1 curve order N and N/2 — used to enforce canonical low-S signatures.
-const _SECP256K1_ORDER = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
-const _SECP256K1_HALF_ORDER = _SECP256K1_ORDER >> 1n;
-
-function _bytesToBigIntBE(bytes: Uint8Array): bigint {
-  let x = 0n;
-  for (const b of bytes) x = (x << 8n) | BigInt(b);
-  return x;
-}
-
-/** Encode a string as length-prefixed bytes: [len(4 BE)] || UTF-8(str) */
-function encodeLengthPrefixed(field: string): Uint8Array[] {
-  const bytes = _encoder.encode(field);
-  const len = new DataView(new ArrayBuffer(4));
-  len.setUint32(0, bytes.length, false);
-  return [new Uint8Array(len.buffer), bytes];
-}
-
-/** Validate and encode a timestamp as 8-byte big-endian */
-function encodeTimestamp(ts: number): Uint8Array {
-  if (ts < 0 || ts > Number.MAX_SAFE_INTEGER || !Number.isSafeInteger(ts)) {
-    throw new Error(
-      `Invalid timestamp: must be a finite number in [0, ${Number.MAX_SAFE_INTEGER}], got ${ts}`,
-    );
+function concat(parts: Uint8Array[]): Uint8Array {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Uint8Array(n);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
   }
-  const buf = new ArrayBuffer(8);
-  const view = new DataView(buf);
-  view.setUint32(0, Math.floor(ts / 0x100000000), false);
-  view.setUint32(4, ts >>> 0, false);
-  return new Uint8Array(buf);
+  return out;
 }
 
-/** Concatenate parts and return SHA-256 digest */
-function concatAndHash(parts: Uint8Array[]): Uint8Array {
-  const totalLen = parts.reduce((sum, p) => sum + p.length, 0);
-  const buffer = new Uint8Array(totalLen);
-  let offset = 0;
-  for (const part of parts) {
-    buffer.set(part, offset);
-    offset += part.length;
-  }
-  return sha256(buffer);
+function u32be(n: number): Uint8Array {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, n, false);
+  return b;
 }
 
-/** Encode a binary blob as length-prefixed: [len(4 BE)] || bytes */
-function encodeLengthPrefixedBytes(data: Uint8Array): Uint8Array[] {
-  const len = new DataView(new ArrayBuffer(4));
-  len.setUint32(0, data.length, false);
-  return [new Uint8Array(len.buffer), data];
-}
-
-import { constantTimeEqual } from './utils.js';
-
-/**
- * Encode multiple fields (string or binary) into a single payload blob.
- * Each field is length-prefixed: [len(4 BE)] || data.
- */
+/** `len(4 BE) || bytes` per field; strings are UTF-8. */
 export function encodePayload(...fields: Array<string | Uint8Array>): Uint8Array {
   const parts: Uint8Array[] = [];
-  for (const field of fields) {
-    if (typeof field === 'string') {
-      parts.push(...encodeLengthPrefixed(field));
-    } else {
-      parts.push(...encodeLengthPrefixedBytes(field));
-    }
+  for (const f of fields) {
+    const b = typeof f === 'string' ? utf8(f) : f;
+    parts.push(u32be(b.length), b);
   }
-  const totalLen = parts.reduce((sum, p) => sum + p.length, 0);
-  const result = new Uint8Array(totalLen);
-  let offset = 0;
-  for (const part of parts) {
-    result.set(part, offset);
-    offset += part.length;
-  }
-  return result;
+  return concat(parts);
 }
 
-const _EMPTY_PAYLOAD = new Uint8Array(0);
-
-/**
- * Unified signData construction with domain separation via action field:
- *
- * SHA-256(
- *   "ace.v1" ||
- *   len(action)[4 BE] || UTF-8(action) ||
- *   len(aceId)[4 BE] || UTF-8(aceId) ||
- *   timestamp[8 big-endian] ||
- *   len(payload)[4 BE] || payload
- * )
- *
- * Actions: "message", "register", "listen", "inbox", "unregister", "intent"
- * Payload: action-specific data built via encodePayload()
- */
-export function buildSignData(
-  action: string,
-  aceId: string,
-  timestamp: number,
-  payload: Uint8Array = _EMPTY_PAYLOAD,
-): Uint8Array {
-  const parts: Uint8Array[] = [_DOMAIN_PREFIX];
-  parts.push(...encodeLengthPrefixed(action));
-  parts.push(...encodeLengthPrefixed(aceId));
-  parts.push(encodeTimestamp(timestamp));
-  parts.push(...encodeLengthPrefixedBytes(payload));
-  return concatAndHash(parts);
+/** SHA-256("ace.v1" || lp(action) || lp(aceId) || ts[8 BE] || lp(payload)). */
+export function buildSignData(action: string, aceId: string, timestamp: number, payload: Uint8Array = new Uint8Array(0)): Uint8Array {
+  if (typeof timestamp !== 'number' || !Number.isInteger(timestamp) || timestamp < 0 || timestamp > MAX_SAFE_INTEGER) {
+    throw new ACEError('invalid_argument', 'timestamp must be an integer in [0, 2^53-1]');
+  }
+  const ts = new Uint8Array(8);
+  const view = new DataView(ts.buffer);
+  view.setUint32(0, Math.floor(timestamp / 0x100000000), false);
+  view.setUint32(4, timestamp >>> 0, false);
+  const a = utf8(action);
+  const id = utf8(aceId);
+  return sha256(concat([DOMAIN_PREFIX, u32be(a.length), a, u32be(id.length), id, ts, u32be(payload.length), payload]));
 }
 
-/**
- * Verify a signature against signData.
- * For ed25519: direct verification with public key.
- * For secp256k1: recover public key from signature and compare against expected key.
- */
-export function verifySignature(
-  signData: Uint8Array,
-  signature: Uint8Array,
-  scheme: SigningScheme,
-  signingPublicKey: Uint8Array,
-): boolean {
-  if (scheme === 'ed25519') {
-    return ed25519.verify(signature, signData, signingPublicKey);
-  } else if (scheme === 'secp256k1') {
-    // Extract compact(r||s) and recovery bit v from 65-byte signature
-    if (signature.length !== 65) {
+/** ed25519: 32 bytes. secp256k1: a 33-byte compressed point on the curve. */
+export function isValidSigningPublicKey(scheme: unknown, key: Uint8Array): boolean {
+  if (!(key instanceof Uint8Array)) return false;
+  if (scheme === 'ed25519') return key.length === 32;
+  if (scheme === 'secp256k1') {
+    if (key.length !== 33 || (key[0] !== 2 && key[0] !== 3)) return false;
+    try {
+      secp256k1.Point.fromBytes(key).assertValidity();
+      return true;
+    } catch {
       return false;
     }
-    const compact = signature.slice(0, 64);
-    const v = signature[64];
-    if (v !== 0 && v !== 1) {
-      return false; // Only recovery bits 0 and 1 are valid for secp256k1
-    }
-
-    // Reject out-of-range and non-canonical (high-S) signatures. ECDSA is
-    // malleable: (r, s) and (r, n - s) recover the same key, so accepting high-S
-    // lets an observer re-mint a valid signature with different bytes and slip
-    // past signature-keyed replay protection. Low-S makes the bytes canonical
-    // (matches how all ACE SDKs sign).
-    const r = _bytesToBigIntBE(signature.slice(0, 32));
-    const s = _bytesToBigIntBE(signature.slice(32, 64));
-    if (r < 1n || r >= _SECP256K1_ORDER) {
-      return false;
-    }
-    if (s < 1n || s > _SECP256K1_HALF_ORDER) {
-      return false;
-    }
-
-    // Recover public key (signData is already SHA-256 digest from buildSignData)
-    const sigObj = secp256k1.Signature.fromBytes(compact).addRecoveryBit(v);
-    const recovered = sigObj.recoverPublicKey(signData);
-    const recoveredCompressed = recovered.toBytes(true);
-
-    // Compare compressed public key bytes directly (constant-time)
-    return constantTimeEqual(recoveredCompressed, signingPublicKey);
   }
   return false;
 }
 
-/**
- * Encode a signature to its wire format.
- * ed25519: Base64
- * secp256k1: 0x + hex(r || s || v)
- */
-export function encodeSignature(signature: Uint8Array, scheme: SigningScheme): string {
-  if (scheme === 'ed25519') {
-    return toBase64(signature);
-  } else {
-    return '0x' + bytesToHex(signature);
+function leToBigInt(b: Uint8Array): bigint {
+  let x = 0n;
+  for (let i = b.length - 1; i >= 0; i--) x = (x << 8n) | BigInt(b[i]);
+  return x;
+}
+
+function beToBigInt(b: Uint8Array): bigint {
+  let x = 0n;
+  for (const v of b) x = (x << 8n) | BigInt(v);
+  return x;
+}
+
+function ed25519PointOk(enc: Uint8Array): boolean {
+  const b = Uint8Array.from(enc);
+  b[31] &= 0x7f;
+  if (b[31] === 0x7f && b[0] >= 0xed) {
+    let all = true;
+    for (let i = 1; i < 31; i++) if (b[i] !== 0xff) { all = false; break; }
+    if (all) return false; // non-canonical y >= p
+  }
+  return !SMALL_ORDER.includes(bytesToHex(b));
+}
+
+/** Strict ed25519 (signing-schemes/ed25519.md "Verification (strict)"). */
+export function verifyEd25519(signData: Uint8Array, sig: Uint8Array, publicKey: Uint8Array): boolean {
+  if (sig.length !== 64 || publicKey.length !== 32) return false;
+  if (leToBigInt(sig.subarray(32)) >= ED25519_L) return false;
+  if (!ed25519PointOk(publicKey) || !ed25519PointOk(sig.subarray(0, 32))) return false;
+  try {
+    return ed25519.verify(sig, signData, publicKey, { zip215: false });
+  } catch {
+    return false;
   }
 }
 
-/**
- * Decode a signature from its wire format.
- */
-export function decodeSignature(encoded: string, scheme: SigningScheme): Uint8Array {
-  if (scheme === 'ed25519') {
-    return fromBase64(encoded);
-  } else {
-    return hexToBytes(encoded.startsWith('0x') ? encoded.slice(2) : encoded);
+/** Strict secp256k1: r in [1, n-1], s in [1, n/2], v in {0, 1}; recovered key compared in constant time. */
+export function verifySecp256k1(signData: Uint8Array, sig: Uint8Array, publicKey: Uint8Array): boolean {
+  if (sig.length !== 65 || signData.length !== 32 || !isValidSigningPublicKey('secp256k1', publicKey)) return false;
+  const r = beToBigInt(sig.subarray(0, 32));
+  const s = beToBigInt(sig.subarray(32, 64));
+  const v = sig[64];
+  if ((v !== 0 && v !== 1) || r < 1n || r >= SECP256K1_N || s < 1n || s > SECP256K1_HALF_N) return false;
+  try {
+    const recovered = secp256k1.Signature.fromBytes(sig.slice(0, 64), 'compact')
+      .addRecoveryBit(v)
+      .recoverPublicKey(signData)
+      .toBytes(true);
+    return bytesEqual(recovered, publicKey);
+  } catch {
+    return false;
   }
+}
+
+export function verifySignature(signData: Uint8Array, sig: Uint8Array, scheme: unknown, publicKey: Uint8Array): boolean {
+  if (scheme === 'ed25519') return verifyEd25519(signData, sig, publicKey);
+  if (scheme === 'secp256k1') return verifySecp256k1(signData, sig, publicKey);
+  return false;
+}
+
+function eip55(hex40: string): string {
+  const addr = hex40.toLowerCase();
+  const h = bytesToHex(keccak_256(utf8(addr)));
+  let out = '0x';
+  for (let i = 0; i < addr.length; i++) out += parseInt(h[i], 16) >= 8 ? addr[i].toUpperCase() : addr[i];
+  return out;
+}
+
+/** ed25519: Base58 of the key. secp256k1: EIP-55 address of the compressed key. */
+export function signingAddress(scheme: string, signingPublicKey: Uint8Array): string {
+  if (scheme === 'ed25519') return bs58.encode(signingPublicKey);
+  const uncompressed = secp256k1.Point.fromBytes(signingPublicKey).toBytes(false);
+  return eip55(bytesToHex(keccak_256(uncompressed.subarray(1)).subarray(-20)));
+}
+
+/** `ace:sha256:hex(SHA-256(signingPublicKey))`. */
+export function computeACEId(signingPublicKey: Uint8Array): string {
+  return `ace:sha256:${bytesToHex(sha256(signingPublicKey))}`;
 }
