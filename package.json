@@ -1,7 +1,7 @@
 {
   "name": "@ace-protocol/sdk",
   "version": "0.2.0",
-  "description": "ACE Protocol SDK — Agent Commerce Engine for agent-to-agent commerce messaging",
+  "description": "ACE Protocol SDK \u2014 Agent Commerce Engine for agent-to-agent commerce messaging",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -20,11 +20,11 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && tsc --noEmit --target ES2022 --module NodeNext --strict --skipLibCheck examples/quickstart.ts",
     "prepublishOnly": "npm run lint && npm run test && npm run build"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.19.0"
   },
   "keywords": [
     "ace",

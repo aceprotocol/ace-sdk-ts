@@ -30,7 +30,7 @@ The `kemCiphertext` is part of the signed message payload, so a relay cannot swa
 npm install @ace-protocol/sdk
 ```
 
-Requires Node.js >= 20.0.0.
+Requires Node.js >= 20.19.0.
 
 ## Quick Start
 
@@ -128,3 +128,18 @@ console.log(parsed.body); // { need: 'Translate 500 words EN→FR', ... }
 ## License
 
 Apache-2.0 — see [LICENSE](./LICENSE) for details.
+
+## Validate unpublished SDK changes in a consumer
+
+Run `npm ci` in this SDK, then:
+
+```sh
+node scripts/install-local.mjs --update-locks /absolute/path/to/ace-cli /absolute/path/to/relay
+```
+
+The script builds and packs this source, records the actual tarball integrity in consumer
+lockfiles, seeds npm's content-addressed cache, and runs `npm ci`. Omit `--update-locks`
+to verify that the current source exactly matches the locked artifact. No package is
+published. Release the same SDK artifact before relying on registry-only installation.
+The SDK tests execute `examples/quickstart.ts`; interoperability fixtures are included
+in `tests/fixtures` with a source revision and SHA-256 digest.

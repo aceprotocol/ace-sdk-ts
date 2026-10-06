@@ -85,14 +85,6 @@ function buildSignedMessagePayload(
 
 type BodyType = Record<string, unknown>;
 
-function requireFields(body: BodyType, fields: string[], typeName: string): void {
-  for (const field of fields) {
-    if (!Object.hasOwn(body, field) || body[field] === undefined || body[field] === null) {
-      throw new Error(`${typeName} body requires '${field}' field`);
-    }
-  }
-}
-
 const MAX_SHORT_STRING = 4096;
 const MAX_LONG_STRING = 65536;
 
@@ -379,6 +371,8 @@ export interface ParsedMessage<T = Record<string, unknown>> {
 }
 
 export interface ParseMessageOptions {
+  /** Offline lower bound; caller must persist replay state and its sync watermark. */
+  oldestTimestamp?: number;
   stateMachine: ThreadStateMachine;
   expectedScheme?: SigningScheme;
   replayDetector?: ReplayDetector;
@@ -386,6 +380,7 @@ export interface ParseMessageOptions {
 }
 
 export interface ParseMessageFromRegistrationOptions {
+  oldestTimestamp?: number;
   stateMachine: ThreadStateMachine;
   replayDetector?: ReplayDetector;
 }
@@ -447,7 +442,10 @@ export async function parseMessage(
   requireThreadIdForEconomic(msg.type, msg.threadId);
 
   // 2. Timestamp freshness (pipeline step 2 — BEFORE expensive ops)
-  checkTimestampFreshness(msg.timestamp);
+  checkTimestampFreshness(msg.timestamp, opts.oldestTimestamp);
+  if (opts.oldestTimestamp !== undefined && !opts.replayDetector) {
+    throw new Error('Offline delivery requires a ReplayDetector');
+  }
 
   // 3. Replay detection (pipeline step 3 — BEFORE signature verification)
   // Economic messages REQUIRE replay detection — replaying payment/receipt
@@ -570,6 +568,7 @@ export async function parseMessageFromRegistration(
     receiver,
     getRegistrationSigningPublicKey(senderRegistration),
     {
+      oldestTimestamp: opts.oldestTimestamp,
       stateMachine: opts.stateMachine,
       expectedScheme: senderRegistration.signing.scheme,
       replayDetector: opts.replayDetector,
@@ -592,6 +591,7 @@ export async function parseMessageFromPeer(
   opts: ParseMessageFromRegistrationOptions,
 ): Promise<ParsedMessage> {
   return parseMessage(msg, receiver, sender.signingPublicKey, {
+    oldestTimestamp: opts.oldestTimestamp,
     stateMachine: opts.stateMachine,
     expectedScheme: sender.scheme,
     replayDetector: opts.replayDetector,

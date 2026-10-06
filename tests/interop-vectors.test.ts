@@ -75,7 +75,7 @@ interface Vectors {
 }
 
 function loadVectors(): Vectors {
-  const path = new URL('../../spec/test-vectors.json', import.meta.url);
+  const path = new URL('./fixtures/test-vectors.json', import.meta.url);
   return JSON.parse(readFileSync(path, 'utf8'));
 }
 

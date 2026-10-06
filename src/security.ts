@@ -13,13 +13,16 @@ export function validateMessageId(messageId: string): void {
  * Check that a timestamp is within the 5-minute freshness window.
  * Rejects messages with |now - timestamp| > 5 minutes.
  */
-export function checkTimestampFreshness(timestamp: number): void {
-  if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
-    throw new Error('Invalid timestamp: must be a finite number');
+export function checkTimestampFreshness(timestamp: number, oldestTimestamp?: number): void {
+  if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
+    throw new Error('Invalid timestamp: must be a non-negative safe integer');
   }
   const now = Math.floor(Date.now() / 1000);
+  if (oldestTimestamp !== undefined && (!Number.isSafeInteger(oldestTimestamp) || oldestTimestamp < 0 || oldestTimestamp > now)) {
+    throw new Error('Invalid offline timestamp floor');
+  }
   const drift = Math.abs(now - timestamp);
-  if (drift > MAX_DRIFT_SECONDS) {
+  if (timestamp < (oldestTimestamp ?? now - MAX_DRIFT_SECONDS) || timestamp > now + MAX_DRIFT_SECONDS) {
     throw new Error(
       `Timestamp not fresh: drift ${drift}s exceeds max ${MAX_DRIFT_SECONDS}s`,
     );
