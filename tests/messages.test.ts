@@ -435,7 +435,7 @@ describe('Messages', () => {
         parseMessage(msg, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM(), replayDetector: detector }),
       ).rejects.toThrow(new RegExp(`X-Wing KEM ciphertext must be exactly 1120 bytes, got ${len}`));
       // Nothing enters the seen store before the signature verifies.
-      expect(detector.accepts(msg.messageId, msg.timestamp)).toBe(true);
+      expect(detector.accepts(msg.messageId, msg.from, msg.timestamp)).toBe(true);
     });
 
     it('rejects missing kemCiphertext', async () => {

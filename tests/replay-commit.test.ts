@@ -70,7 +70,7 @@ describe('the seen-store entry is kept once the signature has verified', () => {
     // It got past the signature check and failed at decryption.
     expect((err as Error).message).not.toMatch(/Signature verification failed/);
     // The authentic message is one-shot: its messageId stays committed.
-    expect(detector.accepts(msg.messageId, msg.timestamp)).toBe(false);
+    expect(detector.accepts(msg.messageId, msg.from, msg.timestamp)).toBe(false);
     // A second delivery of the same authentic envelope is rejected as a replay.
     await expect(
       parseMessage(msg, bob, alice.getSigningPublicKey(), { stateMachine: new ThreadStateMachine(), replayDetector: detector }),

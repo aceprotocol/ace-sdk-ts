@@ -10,7 +10,7 @@ async function setup() {
     parseMessage(msg, bob, alice.getSigningPublicKey(), { stateMachine: new ThreadStateMachine(), replayDetector, oldestTimestamp });
   // A store that has been running since before the receiver went offline.
   const runningStore = (capacity?: number) => ReplayDetector.fromExport({ horizon: now - 7200, entries: [] }, capacity);
-  return { now, create, parse, runningStore };
+  return { bob, now, create, parse, runningStore };
 }
 
 afterEach(() => { vi.useRealTimers(); });
@@ -49,6 +49,17 @@ it('backlog evicted at capacity cannot be replayed', async () => {
   await parse(a, store, now - 7200);
   await parse(b, store, now - 7200);
   await expect(parse(a, store, now - 7200)).rejects.toThrow(/Replay/);
+});
+
+it('a flood from one sender does not block others', async () => {
+  const { bob, now, create, parse } = await setup();
+  const mallory = await SoftwareIdentity.generate('ed25519');
+  const store = new ReplayDetector(3);
+  for (let i = 0; i < 4; i++) {
+    const flood = await createMessage({ sender: mallory, recipientPubKey: bob.getEncryptionPublicKey(), recipientACEId: bob.getACEId(), type: 'text', body: { message: 'flood' }, stateMachine: new ThreadStateMachine(), timestamp: now + 300 });
+    await parseMessage(flood, bob, mallory.getSigningPublicKey(), { stateMachine: new ThreadStateMachine(), replayDetector: store });
+  }
+  expect((await parse(await create(now), store)).body).toEqual({ message: 'offline' });
 });
 
 it('backlog evicted by the online floor cannot be replayed', async () => {

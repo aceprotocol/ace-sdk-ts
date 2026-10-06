@@ -32,18 +32,21 @@ export function checkTimestampFreshness(timestamp: number, oldestTimestamp?: num
 export interface ReplayDetectorExport {
   /** Messages with `timestamp <= horizon` are rejected. */
   horizon: number;
-  /** `[messageId, signed envelope timestamp]` pairs. */
-  entries: [string, number][];
+  /** Messages from `sender` with `timestamp <= senderHorizons[sender]` are rejected. */
+  senderHorizons?: Record<string, number>;
+  /** `[messageId, sender ACE ID, signed envelope timestamp]` triples. */
+  entries: [string, string, number][];
 }
 
 /**
  * Seen store with a replay horizon (06-security § Replay Protection).
  *
- * Holds `(messageId, timestamp)` for every message whose signature verified.
- * Rejects any message with `timestamp <= horizon`, so an entry can be removed
- * once the horizon covers it: only the smallest-timestamp entry is removed,
- * and the horizon moves up to its timestamp. Removal happens when the entry
- * falls below the acceptance floor or the store exceeds `capacity`.
+ * Holds `(messageId, sender, timestamp)` for every message whose signature
+ * verified. Rejects any message with `timestamp <= horizon`, or `<=` its
+ * sender's horizon, so an entry can be removed once a horizon covers it: only
+ * the smallest-timestamp entry is removed. Below the acceptance floor it raises
+ * the horizon; over `capacity` it raises only its sender's horizon, so a sender
+ * flooding the store cannot block anyone else.
  *
  * SAFETY: This class is NOT thread-safe. Do not share instances across
  * Worker Threads or concurrent event loops.
@@ -52,9 +55,10 @@ export interface ReplayDetectorExport {
  */
 export class ReplayDetector {
   private readonly ids = new Set<string>();
-  // Min-heap of [timestamp, messageId].
-  private readonly heap: [number, string][] = [];
+  // Min-heap of [timestamp, messageId, sender].
+  private readonly heap: [number, string, string][] = [];
   private _horizon = Math.floor(Date.now() / 1000) - MAX_DRIFT_SECONDS;
+  private senderHorizons = new Map<string, number>();
 
   constructor(private readonly capacity: number = 100_000) {
     if (!Number.isSafeInteger(capacity) || capacity < 1) {
@@ -66,59 +70,101 @@ export class ReplayDetector {
     return this._horizon;
   }
 
-  /** Pipeline steps 2–3: true if `timestamp` is above the horizon and `messageId` is unseen. */
-  accepts(messageId: string, timestamp: number): boolean {
-    return timestamp > this._horizon && !this.ids.has(messageId);
+  /** Pipeline steps 2–3: true if `timestamp` is above both horizons and `messageId` is unseen. */
+  accepts(messageId: string, sender: string, timestamp: number): boolean {
+    return timestamp > this._horizon
+      && timestamp > (this.senderHorizons.get(sender) ?? this._horizon)
+      && !this.ids.has(messageId);
   }
 
   /**
    * Pipeline step 4: record a message whose signature has verified.
-   * Returns false if it is a duplicate or at/below the horizon.
+   * Returns false if it is a duplicate or at/below a horizon.
    * `floor` is the acceptance floor (default `now - 5 min`).
    */
-  commit(messageId: string, timestamp: number, floor: number = Math.floor(Date.now() / 1000) - MAX_DRIFT_SECONDS): boolean {
-    if (!this.accepts(messageId, timestamp)) return false;
+  commit(messageId: string, sender: string, timestamp: number, floor: number = Math.floor(Date.now() / 1000) - MAX_DRIFT_SECONDS): boolean {
+    if (!this.accepts(messageId, sender, timestamp)) return false;
     this.ids.add(messageId);
-    this.push([timestamp, messageId]);
+    this.push([timestamp, messageId, sender]);
     this.evict(floor);
     return true;
   }
 
   export(): ReplayDetectorExport {
-    return { horizon: this._horizon, entries: this.heap.map(([ts, id]) => [id, ts]) };
+    return {
+      horizon: this._horizon,
+      senderHorizons: Object.fromEntries(this.senderHorizons),
+      entries: this.heap.map(([ts, id, sender]) => [id, sender, ts]),
+    };
   }
 
   static fromExport(data: ReplayDetectorExport, capacity: number = 100_000): ReplayDetector {
     const detector = new ReplayDetector(capacity);
-    if (!Number.isSafeInteger(data?.horizon) || data.horizon < 0 || !Array.isArray(data.entries)) {
+    const senderHorizons: unknown = data?.senderHorizons ?? {};
+    if (!Number.isSafeInteger(data?.horizon) || data.horizon < 0 || !Array.isArray(data.entries)
+      || typeof senderHorizons !== 'object' || senderHorizons === null || Array.isArray(senderHorizons)) {
       throw new Error('fromExport: invalid replay state');
     }
     detector._horizon = data.horizon;
+    for (const [sender, h] of Object.entries(senderHorizons)) {
+      if (sender === '' || !Number.isSafeInteger(h) || h < 0) {
+        throw new Error('fromExport: invalid replay state');
+      }
+      detector.senderHorizons.set(sender, h);
+    }
     for (const entry of data.entries) {
-      const [id, ts]: unknown[] = Array.isArray(entry) ? entry : [];
+      const [id, sender, ts]: unknown[] = Array.isArray(entry) ? entry : [];
       if (typeof id !== 'string' || !MESSAGE_ID_V4_PATTERN.test(id)) {
         throw new Error(`fromExport: invalid messageId '${sanitizeForError(String(id), 50)}'`);
       }
-      if (typeof ts !== 'number' || !Number.isSafeInteger(ts) || ts <= data.horizon || detector.ids.has(id)) {
+      if (typeof sender !== 'string' || sender === '' || typeof ts !== 'number' || !Number.isSafeInteger(ts)
+        || !detector.accepts(id, sender, ts)) {
         throw new Error('fromExport: invalid entry');
       }
       detector.ids.add(id);
-      detector.push([ts, id]);
+      detector.push([ts, id, sender]);
     }
     detector.evict(0);
     return detector;
   }
 
-  /** Remove smallest-timestamp entries while below `floor` or over capacity. */
+  /**
+   * Remove smallest-timestamp entries: below `floor` they raise the horizon,
+   * over capacity they raise only their sender's horizon.
+   */
   private evict(floor: number): void {
-    while (this.heap.length > 0 && (this.heap[0][0] < floor || this.heap.length > this.capacity)) {
+    while (this.heap.length > 0 && this.heap[0][0] < floor) {
       const [ts, id] = this.pop();
       this.ids.delete(id);
-      this._horizon = ts;
+      this._horizon = Math.max(this._horizon, ts);
+    }
+    while (this.heap.length > this.capacity) {
+      const [ts, id, sender] = this.pop();
+      this.ids.delete(id);
+      this.senderHorizons.set(sender, Math.max(this.senderHorizons.get(sender) ?? ts, ts));
+    }
+    this.compactSenderHorizons();
+  }
+
+  /**
+   * Keep at most `capacity` sender horizons: drop those the horizon already
+   * covers, then fold the lowest half into the horizon (amortized O(log n)).
+   */
+  private compactSenderHorizons(): void {
+    if (this.senderHorizons.size <= this.capacity) return;
+    for (const [sender, h] of this.senderHorizons) {
+      if (h <= this._horizon) this.senderHorizons.delete(sender);
+    }
+    const excess = this.senderHorizons.size - Math.floor(this.capacity / 2);
+    if (excess <= 0) return;
+    const lowest = [...this.senderHorizons].sort((a, b) => a[1] - b[1]).slice(0, excess);
+    for (const [sender, h] of lowest) {
+      this.senderHorizons.delete(sender);
+      this._horizon = Math.max(this._horizon, h);
     }
   }
 
-  private push(item: [number, string]): void {
+  private push(item: [number, string, string]): void {
     const h = this.heap;
     h.push(item);
     for (let i = h.length - 1; i > 0;) {
@@ -129,7 +175,7 @@ export class ReplayDetector {
     }
   }
 
-  private pop(): [number, string] {
+  private pop(): [number, string, string] {
     const h = this.heap;
     const top = h[0];
     const last = h.pop()!;

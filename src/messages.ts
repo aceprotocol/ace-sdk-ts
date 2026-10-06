@@ -371,7 +371,7 @@ export interface ParsedMessage<T = Record<string, unknown>> {
 }
 
 export interface ParseMessageOptions {
-  /** Offline acceptance floor; use the same value for every message of one backlog. */
+  /** Offline acceptance floor; use it for every message, live ones included, until the backlog is done. */
   oldestTimestamp?: number;
   stateMachine: ThreadStateMachine;
   expectedScheme?: SigningScheme;
@@ -444,7 +444,7 @@ export async function parseMessage(
   // 2–3. Timestamp freshness, replay horizon and seen check — BEFORE expensive ops
   checkTimestampFreshness(msg.timestamp, opts.oldestTimestamp);
   const replayError = () => new Error(`Replay detected: messageId '${msg.messageId}' already processed or below replay horizon`);
-  if (!opts.replayDetector.accepts(msg.messageId, msg.timestamp)) {
+  if (!opts.replayDetector.accepts(msg.messageId, msg.from, msg.timestamp)) {
     throw replayError();
   }
 
@@ -480,7 +480,7 @@ export async function parseMessage(
     throw new Error('Signature verification failed');
   }
   // Commit now: an authentic message is one-shot, even if a later step fails.
-  if (!opts.replayDetector.commit(msg.messageId, msg.timestamp, opts.oldestTimestamp)) {
+  if (!opts.replayDetector.commit(msg.messageId, msg.from, msg.timestamp, opts.oldestTimestamp)) {
     throw replayError();
   }
 

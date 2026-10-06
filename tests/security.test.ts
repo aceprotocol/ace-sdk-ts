@@ -38,6 +38,7 @@ describe('Security', () => {
   describe('ReplayDetector', () => {
     const T = 1_800_000_000;
     const id = (n: number) => `550e8400-e29b-41d4-a716-4466554400${String(n).padStart(2, '0')}`;
+    const ALICE = 'ace:sha256:alice', MALLORY = 'ace:sha256:mallory';
     beforeEach(() => { vi.useFakeTimers({ now: T * 1000 }); });
     afterEach(() => { vi.useRealTimers(); });
 
@@ -47,71 +48,109 @@ describe('Security', () => {
 
     it('rejects duplicates and timestamps at or below the horizon', () => {
       const d = new ReplayDetector();
-      expect(d.commit(id(1), T)).toBe(true);
-      expect(d.accepts(id(1), T)).toBe(false);
-      expect(d.commit(id(1), T)).toBe(false);
-      expect(d.accepts(id(2), T - 300)).toBe(false);
-      expect(d.accepts(id(2), T - 299)).toBe(true);
+      expect(d.commit(id(1), ALICE, T)).toBe(true);
+      expect(d.accepts(id(1), ALICE, T)).toBe(false);
+      expect(d.commit(id(1), ALICE, T)).toBe(false);
+      expect(d.accepts(id(2), ALICE, T - 300)).toBe(false);
+      expect(d.accepts(id(2), ALICE, T - 299)).toBe(true);
     });
 
     it('keeps an entry until it falls below the floor, then raises the horizon to it', () => {
       const d = new ReplayDetector();
-      d.commit(id(1), T + 300); // max future drift: acceptable until T + 600
+      d.commit(id(1), ALICE, T + 300); // max future drift: acceptable until T + 600
       vi.advanceTimersByTime(450_000);
-      d.commit(id(2), T + 450);
-      expect(d.accepts(id(1), T + 300)).toBe(false);
+      d.commit(id(2), ALICE, T + 450);
+      expect(d.accepts(id(1), ALICE, T + 300)).toBe(false);
       vi.advanceTimersByTime(200_000);
-      d.commit(id(3), T + 650); // floor T + 350 > T + 300: id(1) removed
+      d.commit(id(3), ALICE, T + 650); // floor T + 350 > T + 300: id(1) removed
       expect(d.horizon).toBe(T + 300);
-      expect(d.accepts(id(1), T + 300)).toBe(false);
+      expect(d.accepts(id(1), ALICE, T + 300)).toBe(false);
     });
 
     it('a fixed earlier floor keeps entries; only capacity removes them', () => {
       // A store that has been running since before the receiver went offline.
       const d = ReplayDetector.fromExport({ horizon: T - 7200, entries: [] }, 2);
-      d.commit(id(1), T - 3000, T - 7200);
-      d.commit(id(2), T - 1000, T - 7200);
+      d.commit(id(1), ALICE, T - 3000, T - 7200);
+      d.commit(id(2), ALICE, T - 1000, T - 7200);
       expect(d.horizon).toBe(T - 7200); // nothing removed
-      d.commit(id(3), T - 2000, T - 7200);
-      expect(d.horizon).toBe(T - 3000);
+      d.commit(id(3), ALICE, T - 2000, T - 7200);
+      expect(d.horizon).toBe(T - 7200);
+      expect(d.export().senderHorizons).toEqual({ [ALICE]: T - 3000 });
     });
 
-    it('at capacity removes the smallest timestamp, not the oldest insertion', () => {
+    it("at capacity removes the smallest timestamp and raises only its sender's horizon", () => {
       const d = new ReplayDetector(2);
-      d.commit(id(1), T - 10);
-      d.commit(id(2), T - 50);
-      d.commit(id(3), T - 20);
-      expect(d.horizon).toBe(T - 50);
+      d.commit(id(1), ALICE, T - 10);
+      d.commit(id(2), ALICE, T - 50);
+      d.commit(id(3), ALICE, T - 20);
+      expect(d.horizon).toBe(T - 300);
       for (const [n, ts] of [[1, T - 10], [2, T - 50], [3, T - 20]]) {
-        expect(d.accepts(id(n), ts)).toBe(false);
+        expect(d.accepts(id(n), ALICE, ts)).toBe(false);
       }
-      expect(d.accepts(id(4), T - 50)).toBe(false);
-      expect(d.accepts(id(4), T - 49)).toBe(true);
+      expect(d.accepts(id(4), ALICE, T - 50)).toBe(false);
+      expect(d.accepts(id(4), ALICE, T - 49)).toBe(true);
+      expect(d.accepts(id(4), MALLORY, T - 50)).toBe(true);
+    });
+
+    it('one sender flooding the store cannot block other senders', () => {
+      const d = new ReplayDetector(3);
+      for (let n = 1; n <= 4; n++) d.commit(id(n), MALLORY, T + 300);
+      expect(d.horizon).toBe(T - 300);
+      expect(d.accepts(id(5), MALLORY, T + 300)).toBe(false);
+      expect(d.commit(id(5), ALICE, T)).toBe(true);
+    });
+
+    it('sender horizons are bounded by capacity, folding the lowest into the horizon', () => {
+      const d = new ReplayDetector(2);
+      for (let n = 1; n <= 6; n++) d.commit(id(n), `ace:sha256:s${n}`, T + n);
+      expect(Object.keys(d.export().senderHorizons ?? {}).length).toBeLessThanOrEqual(2);
+      expect(d.horizon).toBeGreaterThan(T - 300);
+      for (let n = 1; n <= 4; n++) {
+        expect(d.accepts(id(n), `ace:sha256:s${n}`, T + n)).toBe(false);
+      }
     });
 
     it('round-trips through export/fromExport', () => {
       const d = new ReplayDetector();
-      d.commit(id(1), T - 10);
-      d.commit(id(2), T - 20);
+      d.commit(id(1), ALICE, T - 10);
+      d.commit(id(2), ALICE, T - 20);
       const restored = ReplayDetector.fromExport(d.export());
       expect(restored.horizon).toBe(d.horizon);
-      expect(restored.accepts(id(1), T - 10)).toBe(false);
-      expect(restored.accepts(id(2), T - 20)).toBe(false);
-      expect(restored.accepts(id(3), T - 20)).toBe(true);
+      expect(restored.accepts(id(1), ALICE, T - 10)).toBe(false);
+      expect(restored.accepts(id(2), ALICE, T - 20)).toBe(false);
+      expect(restored.accepts(id(3), ALICE, T - 20)).toBe(true);
     });
 
-    it('fromExport over capacity removes the smallest timestamps and raises the horizon', () => {
-      const entries: [string, number][] = [[id(1), T - 30], [id(2), T - 10], [id(3), T - 20]];
+    it('round-trips sender horizons through export/fromExport', () => {
+      const d = new ReplayDetector(1);
+      d.commit(id(1), MALLORY, T + 10);
+      d.commit(id(2), ALICE, T + 20);
+      const restored = ReplayDetector.fromExport(JSON.parse(JSON.stringify(d.export())), 1);
+      expect(restored.export()).toEqual(d.export());
+      expect(restored.accepts(id(3), MALLORY, T + 10)).toBe(false);
+      expect(restored.accepts(id(3), ALICE, T + 10)).toBe(true);
+    });
+
+    it('fromExport over capacity removes the smallest timestamps and raises their sender horizon', () => {
+      const entries: [string, string, number][] = [[id(1), ALICE, T - 30], [id(2), ALICE, T - 10], [id(3), ALICE, T - 20]];
       const restored = ReplayDetector.fromExport({ horizon: T - 300, entries }, 2);
-      expect(restored.horizon).toBe(T - 30);
+      expect(restored.horizon).toBe(T - 300);
+      expect(restored.export().senderHorizons).toEqual({ [ALICE]: T - 30 });
       expect(restored.export().entries).toHaveLength(2);
     });
 
     it('fromExport rejects malformed state', () => {
       expect(() => ReplayDetector.fromExport({ horizon: -1, entries: [] })).toThrow(/invalid replay state/);
-      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [['msg-1', T + 1]] })).toThrow(/invalid messageId/);
-      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), T]] })).toThrow(/invalid entry/);
-      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), T + 1], [id(1), T + 2]] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: { '': T }, entries: [] })).toThrow(/invalid replay state/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: { [ALICE]: 1.5 }, entries: [] })).toThrow(/invalid replay state/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: { [ALICE]: -1 }, entries: [] })).toThrow(/invalid replay state/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: [] as any, entries: [] })).toThrow(/invalid replay state/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [['msg-1', ALICE, T + 1]] })).toThrow(/invalid messageId/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), '', T + 1]] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), T + 1] as any] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), ALICE, T]] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: { [ALICE]: T + 5 }, entries: [[id(1), ALICE, T + 5]] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), ALICE, T + 1], [id(1), ALICE, T + 2]] })).toThrow(/invalid entry/);
     });
 
     it('rejects a non-positive capacity', () => {
