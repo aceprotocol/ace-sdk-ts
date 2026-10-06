@@ -28,7 +28,7 @@ export { computeConversationId, decryptWithSeed, kemPublicKeyFromSeed, generateK
 export { decodeEnvelope, verifyEnvelopeSignature, envelopeFingerprint } from './envelope.js';
 export { createMessage, parseMessage, validateBody } from './messages.js';
 export {
-  VerifiedPeer, verifyPeerRecord, verifyRegistrationFile, fetchRegistrationFile, validateProfile,
+  VerifiedPeer, verifyPeerRecord, verifyRegistrationFile, fetchRegistrationFile, validateProfile, isBlockedAddress,
 } from './discovery.js';
 export { createRegistrationFile, createRegistrationRequest, verifyRegistrationRequest } from './registration.js';
 export { createAuthHeaders, parseAuthHeaders, verifyAuthHeaders } from './auth.js';

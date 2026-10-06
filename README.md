@@ -133,6 +133,7 @@ Economic messages require a `threadId` and follow the transition table of the sp
 
 - `VerifiedPeer` — only obtainable from `verifyPeerRecord`, `verifyRegistrationFile`, `verifyRegistrationRequest`, `PeerStore` or `RelayClient`. Its `profile` is unverified relay metadata.
 - `fetchRegistrationFile(domain, { timeoutMs?, maxBytes?, allowPrivateAddresses? })` — SSRF-checked (the DNS check needs Node), no redirects
+- `isBlockedAddress(ip)` — the SSRF policy behind `fetchRegistrationFile`: true for any non-public address (or non-IP input); IPv4-mapped and NAT64 addresses are judged by the embedded IPv4. For callers that open their own connections (e.g. direct delivery).
 - `validateProfile`, `createRegistrationRequest`, `verifyRegistrationRequest` (returns `{ request, peer, requestDigest }`)
 - `createAuthHeaders`, `parseAuthHeaders`, `verifyAuthHeaders` for `listen` / `inbox` / `unregister` / `intent`
 

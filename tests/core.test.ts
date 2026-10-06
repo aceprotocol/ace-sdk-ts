@@ -20,7 +20,7 @@ const VALUE_EXPORTS = [
   'SoftwareIdentity', 'computeACEId', 'toBase64', 'fromBase64', 'computeConversationId', 'decryptWithSeed',
   'kemPublicKeyFromSeed', 'generateKemSeed', 'decodeEnvelope', 'verifyEnvelopeSignature', 'envelopeFingerprint',
   'isACEId', 'isMessageId', 'isThreadId', 'isConversationId', 'createMessage', 'parseMessage', 'validateBody',
-  'VerifiedPeer', 'verifyPeerRecord', 'verifyRegistrationFile', 'fetchRegistrationFile', 'validateProfile',
+  'VerifiedPeer', 'verifyPeerRecord', 'verifyRegistrationFile', 'fetchRegistrationFile', 'validateProfile', 'isBlockedAddress',
   'createRegistrationRequest', 'verifyRegistrationRequest', 'createAuthHeaders', 'parseAuthHeaders', 'verifyAuthHeaders',
   'ReplayDetector', 'ThreadStateMachine', 'ThreadStore', 'PeerStore', 'Inbox', 'Outbox', 'RelayClient', 'MemoryStore',
 ];

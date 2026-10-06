@@ -464,7 +464,11 @@ function v4Blocked(n: number): boolean {
   return V4_BLOCKED.some(([net, p]) => Math.floor(n / 2 ** (32 - p)) === Math.floor(net / 2 ** (32 - p)));
 }
 
-/** Internal: SSRF blocklist (design §2.8). IPv4-mapped and 64:ff9b::/96 are judged by the embedded IPv4. */
+/**
+ * SSRF blocklist (design §2.8): true for any address that is not public, or not an IP literal.
+ * IPv4-mapped and 64:ff9b::/96 are judged by the embedded IPv4. Exported so callers that open
+ * their own connections (e.g. direct delivery) apply the same policy.
+ */
 export function isBlockedAddress(ip: string): boolean {
   const v4 = parseV4(ip);
   if (v4 !== null) return v4Blocked(v4);
