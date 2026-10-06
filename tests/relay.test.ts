@@ -222,6 +222,19 @@ describe('RelayClient', () => {
     await until(() => relay.openListens === 0);
   });
 
+  it('listen: an error thrown in at the yield propagates as is (no reconnect) and closes the connection', async () => {
+    const a = await registered('a');
+    const thrown = [new ACEError('relay_unavailable', 'from the consumer'), new Error('consumer bug')];
+    for (const err of thrown) {
+      relay.enqueueRaw(a.id, { n: 0 });
+      const gen = a.relay!.listen(a.identity);
+      expect((await gen.next()).value?.message).toEqual({ n: 0 });
+      await expect(gen.throw(err)).rejects.toBe(err);
+      await until(() => relay.openListens === 0);
+    }
+    expect(relay.requests.filter(([, p]) => p === '/v1/listen').length).toBe(2);
+  });
+
   it('listen: onOpen runs per connection; an exception from it ends the iteration (no reconnect)', async () => {
     const a = await registered('a');
     relay.dropListens = 2;

@@ -14,6 +14,8 @@ const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const SSE_FRAME_LIMIT = MAX_ENVELOPE_BYTES + 512;
 const MAX_FAILED_CONNECTS = 10;
 const MAX_BACKOFF_MS = 30_000;
+/** Yielded by #listenOnce once a connection is established (listen runs onOpen). */
+const CONNECTED = Symbol('connected');
 const LISTEN_IDLE_MS = 90_000;
 
 export function isStreamId(v: unknown): v is string {
@@ -280,48 +282,53 @@ export class RelayClient {
     let since = o.since ?? '-';
     if (since !== '-' && !isStreamId(since)) throw new ACEError('invalid_argument', "since must be '-' or '<ms>-<seq>'");
     const signal = o.signal;
-    // an exception from onOpen ends the iteration as is (it is not a connection failure)
-    let hookFailure: { error: unknown } | null = null;
-    const onOpen = o.onOpen === undefined ? undefined : () => {
-      try {
-        o.onOpen!();
-      } catch (e) {
-        hookFailure = { error: e };
-        throw e;
-      }
-    };
     let failures = 0;
     while (!signal?.aborted) {
+      // Only reading the stream is inside the try: an error from onOpen, or one thrown in at
+      // the yield (`.throw()`), is the caller's and propagates as is — never a reconnect.
+      const stream = this.#listenOnce(identity, since, signal);
       try {
-        for await (const ev of this.#listenOnce(identity, since, signal, onOpen)) {
+        while (true) {
+          let next: IteratorResult<ListenEvent | null | typeof CONNECTED, void>;
+          try {
+            next = await stream.next();
+          } catch (e) {
+            if (signal?.aborted) return;
+            const err = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'listen failed', { cause: e });
+            if (err.code !== 'relay_unavailable') throw err;
+            failures++;
+            if (failures >= MAX_FAILED_CONNECTS) throw err;
+            let delay = Math.min(this.#reconnectBaseMs * 2 ** (failures - 1), MAX_BACKOFF_MS);
+            if (err.retryAfterSeconds !== undefined) delay = Math.min(Math.max(delay, err.retryAfterSeconds * 1000), MAX_BACKOFF_MS);
+            await sleep(delay, signal);
+            break;
+          }
           if (signal?.aborted) return; // checked on every frame, heartbeats included
+          if (next.done) { // clean end or drain: reconnect at once
+            failures = 0;
+            break;
+          }
+          const ev = next.value;
+          if (ev === CONNECTED) {
+            o.onOpen?.();
+            continue;
+          }
           failures = 0;
           if (ev === null) continue;
           yield ev;
           since = ev.streamId;
-          if (signal?.aborted) return;
         }
-        if (signal?.aborted) return;
-        failures = 0;
-        continue;
-      } catch (e) {
-        if (hookFailure !== null) throw (hookFailure as { error: unknown }).error;
-        if (signal?.aborted) return;
-        const err = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'listen failed', { cause: e });
-        if (err.code !== 'relay_unavailable') throw err;
-        failures++;
-        if (failures >= MAX_FAILED_CONNECTS) throw err;
-        let delay = Math.min(this.#reconnectBaseMs * 2 ** (failures - 1), MAX_BACKOFF_MS);
-        if (err.retryAfterSeconds !== undefined) delay = Math.min(Math.max(delay, err.retryAfterSeconds * 1000), MAX_BACKOFF_MS);
-        await sleep(delay, signal);
+      } finally {
+        await stream.return();
       }
     }
   }
 
-  /** One listen connection: yields events, or null for frames that carry no message. */
+  /** One listen connection: yields CONNECTED once established, then events, or null for
+   * frames that carry no message. */
   async *#listenOnce(
-    identity: ACEIdentity, since: string, signal?: AbortSignal, onOpen?: () => void,
-  ): AsyncGenerator<ListenEvent | null, void, undefined> {
+    identity: ACEIdentity, since: string, signal?: AbortSignal,
+  ): AsyncGenerator<ListenEvent | null | typeof CONNECTED, void, undefined> {
     // Linked controller: aborts the fetch (and its body) on caller abort, connect timeout, or
     // generator exit. parseSSE also watches it and cancels the body reader itself, because
     // undici does not always cancel a body that is already streaming.
@@ -350,7 +357,7 @@ export class RelayClient {
       }
       const media = (res!.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
       if (media !== 'text/event-stream' || res!.body === null) throw protocolError('listen response is not an event stream');
-      onOpen?.();
+      yield CONNECTED;
       try {
         for await (const ev of parseSSE(res!.body, LISTEN_IDLE_MS, controller.signal)) {
           if (controller.signal.aborted) return;
