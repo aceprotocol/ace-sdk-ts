@@ -63,6 +63,28 @@ describe('encryption-key binding (relay MITM defense)', () => {
     expect(() => verifyPeerResponse(poisoned)).toThrow(/binding failed verification/);
   });
 
+  it('rejects a 32-byte (non-X-Wing) encryption key even with a signature over it', async () => {
+    const identity = await SoftwareIdentity.generate('ed25519');
+    const encB64 = toBase64(new Uint8Array(32));
+    const signB64 = toBase64(identity.getSigningPublicKey());
+    const registeredAt = 1741000000;
+    const signData = buildSignData('register', identity.getACEId(), registeredAt, encodePayload(encB64, signB64));
+    const { signature, scheme } = await identity.sign(signData);
+    const resp: RelayPeerResponse = {
+      aceId: identity.getACEId(),
+      scheme,
+      encryptionPublicKey: encB64,
+      signingPublicKey: signB64,
+      registrationSignature: encodeSignature(signature, scheme),
+      registeredAt,
+    };
+    expect(verifyEncryptionKeyBinding(
+      resp.aceId, resp.scheme, resp.encryptionPublicKey, resp.signingPublicKey,
+      registeredAt, resp.registrationSignature!,
+    )).toBe(false);
+    expect(() => verifyPeerResponse(resp)).toThrow(/binding failed verification/);
+  });
+
   it('rejects a missing binding signature', async () => {
     const identity = await SoftwareIdentity.generate('secp256k1');
     const resp = await relayPeerResponse(identity);

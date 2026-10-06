@@ -1,6 +1,5 @@
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
-import { x25519 } from '@noble/curves/ed25519.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { keccak_256 } from '@noble/hashes/sha3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
@@ -8,7 +7,12 @@ import bs58 from 'bs58';
 import type {
   ACEIdentity, SigningScheme, IdentityTier, RegistrationFile,
 } from './types.js';
-import { decrypt as decryptPayload } from './encryption.js';
+import {
+  decrypt as decryptPayload,
+  generateKemSeed,
+  kemPublicKeyFromSeed,
+  validateSeed,
+} from './encryption.js';
 
 /**
  * Apply EIP-55 mixed-case checksum to an Ethereum address.
@@ -36,41 +40,18 @@ export function secp256k1Address(pubKeyBytes: Uint8Array): string {
   return eip55Checksum('0x' + bytesToHex(hash.slice(-20)));
 }
 
-/** Portable Base64 encoding (no Buffer dependency). */
-export function toBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
-/** Portable Base64 decoding (no Buffer dependency). */
-export function fromBase64(str: string): Uint8Array {
-  let binary: string;
-  try {
-    binary = atob(str);
-  } catch {
-    throw new Error('Invalid Base64 input');
-  }
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
 export function computeACEId(signingPublicKeyBytes: Uint8Array): string {
   const hash = sha256(signingPublicKeyBytes);
   return `ace:sha256:${bytesToHex(hash)}`;
 }
 
-import { constantTimeEqual } from './utils.js';
+import { constantTimeEqual, toBase64, fromBase64 } from './utils.js';
+export { toBase64, fromBase64 };
 
 export interface SoftwareIdentityExport {
   scheme: SigningScheme;
   signingPrivateKey: string; // Base64
-  encryptionPrivateKey: string; // Base64
+  encryptionPrivateKey: string; // Base64 (32-byte X-Wing seed)
 }
 
 /**
@@ -86,8 +67,10 @@ export interface SoftwareIdentityBinaryExport {
 export class SoftwareIdentity implements ACEIdentity {
   private readonly scheme: SigningScheme;
   private readonly signingPrivateKey: Uint8Array;
+  /** 32-byte X-Wing seed — the encryption private key. */
   private readonly encryptionPrivateKey: Uint8Array;
   private readonly signingPublicKey: Uint8Array;
+  /** 1216-byte X-Wing public key derived from the seed. */
   private readonly encryptionPublicKey: Uint8Array;
   private readonly signingPubUncompressed: Uint8Array | null; // cached for secp256k1
   private readonly aceId: string;
@@ -97,6 +80,7 @@ export class SoftwareIdentity implements ACEIdentity {
     signingPrivateKey: Uint8Array,
     encryptionPrivateKey: Uint8Array,
   ) {
+    validateSeed(encryptionPrivateKey);
     this.scheme = scheme;
     this.signingPrivateKey = signingPrivateKey;
     this.encryptionPrivateKey = encryptionPrivateKey;
@@ -109,7 +93,7 @@ export class SoftwareIdentity implements ACEIdentity {
       this.signingPublicKey = secp256k1.getPublicKey(signingPrivateKey, true); // compressed
       this.signingPubUncompressed = secp256k1.getPublicKey(signingPrivateKey, false);
     }
-    this.encryptionPublicKey = x25519.getPublicKey(encryptionPrivateKey);
+    this.encryptionPublicKey = kemPublicKeyFromSeed(encryptionPrivateKey);
     this.aceId = computeACEId(this.signingPublicKey);
   }
 
@@ -117,7 +101,7 @@ export class SoftwareIdentity implements ACEIdentity {
     const signingPrivateKey = scheme === 'ed25519'
       ? ed25519.utils.randomSecretKey()
       : secp256k1.utils.randomSecretKey();
-    const encryptionPrivateKey = x25519.utils.randomSecretKey();
+    const encryptionPrivateKey = generateKemSeed();
     return new SoftwareIdentity(scheme, signingPrivateKey, encryptionPrivateKey);
   }
 
@@ -130,11 +114,11 @@ export class SoftwareIdentity implements ACEIdentity {
   }
 
   async decrypt(
-    ephemeralPub: Uint8Array,
+    kemCiphertext: Uint8Array,
     payload: Uint8Array,
     conversationId: string,
   ): Promise<Uint8Array> {
-    return decryptPayload(ephemeralPub, payload, this.encryptionPrivateKey, conversationId);
+    return decryptPayload(kemCiphertext, payload, this.encryptionPrivateKey, conversationId);
   }
 
   async sign(data: Uint8Array): Promise<{ signature: Uint8Array; scheme: SigningScheme }> {

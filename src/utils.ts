@@ -15,3 +15,27 @@ export function sanitizeForError(s: string, maxLen: number = 32): string {
 
 /** Pattern matching control characters (U+0000–U+001F and U+007F). */
 export const CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f]/;
+
+/** Portable Base64 encoding (no Buffer dependency). */
+export function toBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/** Portable Base64 decoding (no Buffer dependency). */
+export function fromBase64(str: string): Uint8Array {
+  let binary: string;
+  try {
+    binary = atob(str);
+  } catch {
+    throw new Error('Invalid Base64 input');
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}

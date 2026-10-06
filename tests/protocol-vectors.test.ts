@@ -13,10 +13,14 @@ describe('Protocol Vectors', () => {
   });
 
   it('matches conversationId golden vector', () => {
-    const pubA = Uint8Array.from(Array.from({ length: 32 }, (_, i) => i + 1));
-    const pubB = Uint8Array.from(Array.from({ length: 32 }, (_, i) => 255 - i));
+    // X-Wing public keys are 1216 bytes; patterns wrap mod 256.
+    const pubA = Uint8Array.from(Array.from({ length: 1216 }, (_, i) => (i + 1) & 0xff));
+    const pubB = Uint8Array.from(Array.from({ length: 1216 }, (_, i) => (255 - i) & 0xff));
     expect(computeConversationId(pubA, pubB)).toBe(
-      'fcdad8d0e1cbe6726f86938e504f6a7290c6d458181ced3e199cd25bf694cb40',
+      'cd42dbed37b97cd015b5b02119ecd6b27eceabb740e238c29075cdc17a558474',
+    );
+    expect(computeConversationId(pubB, pubA)).toBe(
+      'cd42dbed37b97cd015b5b02119ecd6b27eceabb740e238c29075cdc17a558474',
     );
   });
 

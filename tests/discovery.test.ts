@@ -35,7 +35,7 @@ describe('Discovery', () => {
       signing: {
         scheme: 'ed25519',
         address: '5Ht7RkVSupHeNbGWiHfwJ3RYn4RZfpAv5tk2UrQKbkWR',
-        encryptionPublicKey: toBase64(new Uint8Array(32)),
+        encryptionPublicKey: toBase64(new Uint8Array(1216)),
       },
     };
 
@@ -72,6 +72,29 @@ describe('Discovery', () => {
       expect(() => validateRegistrationFile(bad)).toThrow(/endpoint/);
     });
 
+    it.each([1215, 1217])('rejects encryptionPublicKey that decodes to %i bytes (not an X-Wing key)', (len) => {
+      const bad: RegistrationFile = {
+        ...validReg,
+        signing: { ...validReg.signing, encryptionPublicKey: toBase64(new Uint8Array(len)) },
+      };
+      expect(() => validateRegistrationFile(bad)).toThrow(new RegExp(`X-Wing public key must be exactly 1216 bytes, got ${len}`));
+    });
+
+    it('rejects an oversized encryptionPublicKey by Base64 length before decoding', () => {
+      const bad: RegistrationFile = {
+        ...validReg,
+        signing: { ...validReg.signing, encryptionPublicKey: 'A'.repeat(1628) },
+      };
+      expect(() => validateRegistrationFile(bad)).toThrow(/Base64 length 1628 exceeds 1624/);
+    });
+
+    it('accepts a real SoftwareIdentity registration (1216-byte key)', async () => {
+      const id = await SoftwareIdentity.generate('ed25519');
+      const reg = id.toRegistrationFile({ name: 'TestAgent', endpoint: 'https://test.example.com/ace' });
+      expect(() => validateRegistrationFile(reg)).not.toThrow();
+      expect(getRegistrationEncryptionPublicKey(reg)).toHaveLength(1216);
+    });
+
     it('rejects missing encryptionPublicKey', () => {
       const bad = {
         ...validReg,
@@ -86,7 +109,7 @@ describe('Discovery', () => {
         signing: {
           scheme: 'secp256k1',
           address: '0x' + 'a'.repeat(40),
-          encryptionPublicKey: toBase64(new Uint8Array(32)),
+          encryptionPublicKey: toBase64(new Uint8Array(1216)),
         },
       };
       expect(() => validateRegistrationFile(bad)).toThrow(/signingPublicKey/);

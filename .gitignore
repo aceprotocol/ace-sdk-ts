@@ -12,3 +12,6 @@ dist/
 *.pfx
 identity-export.json
 .idea/
+
+# npm pack output
+ace-protocol-sdk-*.tgz

@@ -3,7 +3,7 @@ import type {
 } from './types.js';
 import { isEconomicType } from './types.js';
 import { toBase64, fromBase64, computeACEId } from './identity.js';
-import { computeConversationId, encrypt, MAX_PAYLOAD_SIZE } from './encryption.js';
+import { computeConversationId, encrypt, decodeKemCiphertext, MAX_PAYLOAD_SIZE } from './encryption.js';
 import { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
 import { checkTimestampFreshness, validateMessageId, ReplayDetector } from './security.js';
 import {
@@ -68,16 +68,16 @@ function buildSignedMessagePayload(
   conversationId: string,
   messageId: string,
   threadId: string | undefined,
-  ephemeralPubKey: Uint8Array,
+  kemCiphertext: Uint8Array,
   payload: Uint8Array,
 ): Uint8Array {
-  // ephemeralPubKey is signed too: it is what the recipient uses to derive the
-  // decryption key, so it is part of the sender's commitment. Omitting it would
-  // let a relay swap the ephemeral key (garbling the message) without breaking
-  // the signature.
+  // kemCiphertext is signed too: it is what the recipient decapsulates to derive
+  // the decryption key, so it is part of the sender's commitment. Omitting it
+  // would let a relay swap the KEM ciphertext (garbling the message) without
+  // breaking the signature.
   return encodePayload(
     type, to, conversationId, messageId, normalizeThreadId(threadId),
-    ephemeralPubKey, payload,
+    kemCiphertext, payload,
   );
 }
 
@@ -277,7 +277,7 @@ function validateThreadReferences(
 
 export interface CreateMessageOptions {
   sender: ACEIdentity;
-  recipientPubKey: Uint8Array; // X25519 encryption public key
+  recipientPubKey: Uint8Array; // X-Wing encryption public key (1216 bytes)
   recipientACEId: string;
   type: MessageType;
   body: BodyType;
@@ -317,7 +317,7 @@ export async function createMessage(
   // 3. Encrypt body
   const bodyJson = JSON.stringify(opts.body);
   const bodyBytes = _encoder.encode(bodyJson);
-  const { ephemeralPubKey, payload } = await encrypt(
+  const { kemCiphertext, payload } = await encrypt(
     bodyBytes,
     opts.recipientPubKey,
     conversationId,
@@ -330,7 +330,7 @@ export async function createMessage(
     conversationId,
     messageId,
     opts.threadId,
-    ephemeralPubKey,
+    kemCiphertext,
     payload,
   );
   const signData = buildSignData('message', fromId, timestamp, messagePayload);
@@ -349,7 +349,7 @@ export async function createMessage(
     type: opts.type,
     timestamp,
     encryption: {
-      ephemeralPubKey: toBase64(ephemeralPubKey),
+      kemCiphertext: toBase64(kemCiphertext),
       payload: toBase64(payload),
     },
     signature: {
@@ -412,8 +412,11 @@ export async function parseMessage(
   validateMessageId(msg.messageId);
 
   // Validate encryption and signature envelopes exist
-  if (!msg.encryption?.payload || !msg.encryption?.ephemeralPubKey) {
+  if (!msg.encryption?.payload || !msg.encryption?.kemCiphertext) {
     throw new Error('Missing required encryption fields');
+  }
+  if (typeof msg.encryption.payload !== 'string') {
+    throw new Error('encryption.payload must be a Base64 string');
   }
   if (!msg.signature?.scheme || !msg.signature?.value) {
     throw new Error('Missing required signature fields');
@@ -458,98 +461,97 @@ export async function parseMessage(
     }
   }
 
-  // 4. Verify signature BEFORE decryption (pipeline step 4)
-  const estimatedPayloadBytes = estimateBase64DecodedLength(msg.encryption.payload);
-  if (estimatedPayloadBytes > MAX_PAYLOAD_SIZE) {
-    opts.replayDetector?.release(msg.messageId);
-    throw new Error(
-      `Payload too large: estimated decoded size ${estimatedPayloadBytes} bytes exceeds max ${MAX_PAYLOAD_SIZE}`,
-    );
-  }
-  const payloadBytes = fromBase64(msg.encryption.payload);
-  const ephemeralPubKey = fromBase64(msg.encryption.ephemeralPubKey);
-  const messagePayload = buildSignedMessagePayload(
-    msg.type,
-    msg.to,
-    msg.conversationId,
-    msg.messageId,
-    msg.threadId,
-    ephemeralPubKey,
-    payloadBytes,
-  );
-  const signData = buildSignData('message', msg.from, msg.timestamp, messagePayload);
-
-  const sigBytes = decodeSignature(msg.signature.value, msg.signature.scheme);
-  let valid: boolean;
+  // Replay rule (cross-SDK): a failure BEFORE the signature verifies releases
+  // the reservation (an unsigned envelope must not burn a messageId); once the
+  // signature has verified the reservation is kept on ANY later failure
+  // (decrypt, body schema, state machine) — an authentic message is one-shot
+  // regardless of outcome, so a captured authentic message rejected now cannot
+  // be replayed later when the state allows.
+  let authenticated = false;
   try {
-    valid = verifySignature(
-      signData,
-      sigBytes,
-      msg.signature.scheme,
-      senderSigningPubKey,
+    // 4. Verify signature BEFORE decryption (pipeline step 4).
+    const estimatedPayloadBytes = estimateBase64DecodedLength(msg.encryption.payload);
+    if (estimatedPayloadBytes > MAX_PAYLOAD_SIZE) {
+      throw new Error(
+        `Payload too large: estimated decoded size ${estimatedPayloadBytes} bytes exceeds max ${MAX_PAYLOAD_SIZE}`,
+      );
+    }
+    const payloadBytes = fromBase64(msg.encryption.payload);
+    // Schema check: the X-Wing ciphertext has a fixed size. Rejected before any
+    // signature verification or decapsulation runs.
+    const kemCiphertext = decodeKemCiphertext(msg.encryption.kemCiphertext);
+    const messagePayload = buildSignedMessagePayload(
+      msg.type,
+      msg.to,
+      msg.conversationId,
+      msg.messageId,
+      msg.threadId,
+      kemCiphertext,
+      payloadBytes,
     );
-  } catch {
-    opts.replayDetector?.release(msg.messageId);
-    throw new Error('Signature verification failed');
-  }
+    const signData = buildSignData('message', msg.from, msg.timestamp, messagePayload);
+    const sigBytes = decodeSignature(msg.signature.value, msg.signature.scheme);
+    let valid = false;
+    try {
+      valid = verifySignature(signData, sigBytes, msg.signature.scheme, senderSigningPubKey);
+    } catch {
+      // Malformed signature/key bytes → treat as failed verification.
+    }
+    if (!valid) {
+      throw new Error('Signature verification failed');
+    }
+    authenticated = true;
 
-  if (!valid) {
-    opts.replayDetector?.release(msg.messageId);
-    throw new Error('Signature verification failed');
-  }
-
-  // 5. Decrypt body via identity's decrypt method (pipeline step 5) —
-  // ephemeralPubKey was decoded and signature-verified above.
-  let decrypted: Uint8Array;
-  try {
-    decrypted = await receiver.decrypt(
-      ephemeralPubKey,
+    // 5. Decrypt body via identity's decrypt method (pipeline step 5) —
+    // kemCiphertext was length-checked and signature-verified above.
+    const decrypted = await receiver.decrypt(
+      kemCiphertext,
       payloadBytes,
       msg.conversationId,
     );
-  } catch (e) {
-    opts.replayDetector?.release(msg.messageId);
-    throw e;
+
+    const rawParsed: unknown = JSON.parse(_decoder.decode(decrypted));
+    if (typeof rawParsed !== 'object' || rawParsed === null || Array.isArray(rawParsed)) {
+      throw new Error('Decrypted body must be a JSON object');
+    }
+    // Guard against deeply nested JSON that could cause stack overflow or CPU exhaustion
+    assertMaxDepth(rawParsed, MAX_JSON_DEPTH);
+    // Isolate from Object.prototype to prevent prototype pollution via __proto__/constructor keys
+    const body = Object.assign(Object.create(null), rawParsed) as BodyType;
+
+    // 6. Validate body schema (pipeline step 6)
+    validateBody(msg.type, body);
+    validateThreadReferences(
+      msg.type,
+      body,
+      opts.stateMachine,
+      msg.conversationId,
+      normalizeThreadId(msg.threadId),
+    );
+
+    // 7. State machine validation (pipeline step 7 — after all security checks)
+    opts.stateMachine.transition(
+      msg.conversationId,
+      msg.threadId ?? '',
+      msg.type,
+      msg.messageId,
+      msg.timestamp,
+    );
+
+    return {
+      messageId: msg.messageId,
+      from: msg.from,
+      to: msg.to,
+      conversationId: msg.conversationId,
+      type: msg.type,
+      threadId: msg.threadId,
+      timestamp: msg.timestamp,
+      body,
+    };
+  } catch (err) {
+    if (!authenticated) opts.replayDetector?.release(msg.messageId);
+    throw err;
   }
-
-  const rawParsed: unknown = JSON.parse(_decoder.decode(decrypted));
-  if (typeof rawParsed !== 'object' || rawParsed === null || Array.isArray(rawParsed)) {
-    throw new Error('Decrypted body must be a JSON object');
-  }
-  // Guard against deeply nested JSON that could cause stack overflow or CPU exhaustion
-  assertMaxDepth(rawParsed, MAX_JSON_DEPTH);
-  // Isolate from Object.prototype to prevent prototype pollution via __proto__/constructor keys
-  const body = Object.assign(Object.create(null), rawParsed) as BodyType;
-
-  // 6. Validate body schema (pipeline step 6)
-  validateBody(msg.type, body);
-  validateThreadReferences(
-    msg.type,
-    body,
-    opts.stateMachine,
-    msg.conversationId,
-    normalizeThreadId(msg.threadId),
-  );
-
-  // 7. State machine validation (pipeline step 7 — after all security checks)
-  opts.stateMachine.transition(
-    msg.conversationId,
-    msg.threadId ?? '',
-    msg.type,
-    msg.messageId,
-    msg.timestamp,
-  );
-
-  return {
-    messageId: msg.messageId,
-    from: msg.from,
-    to: msg.to,
-    conversationId: msg.conversationId,
-    type: msg.type,
-    threadId: msg.threadId,
-    timestamp: msg.timestamp,
-    body,
-  };
 }
 
 export async function parseMessageFromRegistration(
@@ -580,7 +582,7 @@ export async function parseMessageFromRegistration(
  * Safe path for messages whose sender keys came from a relay.
  *
  * `sender` must be a {@link VerifiedPeer} — obtainable only after its encryption-key
- * binding was verified — so the recipient never trusts a relay-substituted X25519
+ * binding was verified — so the recipient never trusts a relay-substituted X-Wing
  * key. `conversationId` is recomputed from the verified keys and must match.
  */
 export async function parseMessageFromPeer(

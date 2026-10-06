@@ -1,6 +1,6 @@
 {
   "name": "@ace-protocol/sdk",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "ACE Protocol SDK — Agent Commerce Engine for agent-to-agent commerce messaging",
   "type": "module",
   "main": "dist/index.js",
@@ -34,6 +34,9 @@
     "a2a",
     "cryptography",
     "e2e-encryption",
+    "post-quantum",
+    "x-wing",
+    "ml-kem",
     "digital-signature"
   ],
   "repository": {
@@ -46,6 +49,7 @@
   "dependencies": {
     "@noble/curves": "^2.0.0",
     "@noble/hashes": "^2.0.0",
+    "@noble/post-quantum": "^0.7.1",
     "bs58": "^6.0.0"
   },
   "devDependencies": {

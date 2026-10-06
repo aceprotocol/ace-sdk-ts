@@ -5,9 +5,11 @@ export type HardwareBacking = 'secure-enclave' | 'tpm' | 'hsm' | 'tee';
 export type IdentityTier = 0 | 1;
 
 export interface ACEIdentity {
+  /** X-Wing (X25519 + ML-KEM-768) public key, 1216 bytes. */
   getEncryptionPublicKey(): Uint8Array;
   getSigningPublicKey(): Uint8Array;
-  decrypt(ephemeralPub: Uint8Array, payload: Uint8Array, conversationId: string): Promise<Uint8Array>;
+  /** Decrypt an ACE payload given the 1120-byte X-Wing KEM ciphertext. */
+  decrypt(kemCiphertext: Uint8Array, payload: Uint8Array, conversationId: string): Promise<Uint8Array>;
   sign(data: Uint8Array): Promise<{ signature: Uint8Array; scheme: SigningScheme }>;
   getAddress(): string;
   getSigningScheme(): SigningScheme;
@@ -81,7 +83,7 @@ export interface SigningConfig {
   scheme: SigningScheme;
   address: string;
   signingPublicKey?: string; // Base64, required for secp256k1
-  encryptionPublicKey: string; // Base64, always required
+  encryptionPublicKey: string; // Base64 X-Wing public key (1216 bytes), always required
 }
 
 export interface RegistrationFile {
@@ -116,7 +118,7 @@ export const SYSTEM_TYPES: ReadonlySet<MessageType> = new Set(['info']);
 export const SOCIAL_TYPES: ReadonlySet<MessageType> = new Set(['text']);
 
 export interface EncryptionEnvelope {
-  ephemeralPubKey: string; // Base64
+  kemCiphertext: string; // Base64(X-Wing ciphertext, 1120 bytes)
   payload: string; // Base64(nonce || ciphertext || tag)
 }
 

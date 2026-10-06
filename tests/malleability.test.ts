@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { SoftwareIdentity, buildSignData, encodePayload, verifySignature } from '../src/index.js';
+import {
+  SoftwareIdentity, buildSignData, encodePayload, verifySignature,
+  createMessage, parseMessage, kemEncapsulate, toBase64,
+  ThreadStateMachine, ReplayDetector, type SigningScheme,
+} from '../src/index.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 const ORDER = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
@@ -61,5 +65,59 @@ describe('secp256k1 signature malleability', () => {
     const bad = new Uint8Array(signature);
     bad[64] = 2;
     expect(verifySignature(sd, bad, scheme, id.getSigningPublicKey())).toBe(false);
+  });
+});
+
+// The X-Wing KEM ciphertext is part of the signed commitment: a relay that swaps
+// it must break SIGNATURE verification, not merely fail decryption later.
+describe('kemCiphertext is signed (relay swap defense)', () => {
+  const SCHEMES: SigningScheme[] = ['ed25519', 'secp256k1'];
+
+  it.each(SCHEMES)('swapping kemCiphertext fails signature verification (%s)', async (scheme) => {
+    const sender = await SoftwareIdentity.generate(scheme);
+    const receiver = await SoftwareIdentity.generate('ed25519');
+
+    const msg = await createMessage({
+      sender,
+      recipientPubKey: receiver.getEncryptionPublicKey(),
+      recipientACEId: receiver.getACEId(),
+      type: 'text',
+      body: { message: 'hi' },
+      stateMachine: new ThreadStateMachine(),
+    });
+
+    // Swap in a different, perfectly valid X-Wing ciphertext for the same
+    // recipient, as a malicious relay might.
+    const { kemCiphertext } = kemEncapsulate(receiver.getEncryptionPublicKey());
+    msg.encryption.kemCiphertext = toBase64(kemCiphertext);
+
+    await expect(
+      parseMessage(msg, receiver, sender.getSigningPublicKey(), {
+        stateMachine: new ThreadStateMachine(),
+        replayDetector: new ReplayDetector(),
+      }),
+    ).rejects.toThrow(/Signature verification failed/);
+  });
+
+  it('a single flipped bit in kemCiphertext fails signature verification', async () => {
+    const sender = await SoftwareIdentity.generate('ed25519');
+    const receiver = await SoftwareIdentity.generate('ed25519');
+    const msg = await createMessage({
+      sender,
+      recipientPubKey: receiver.getEncryptionPublicKey(),
+      recipientACEId: receiver.getACEId(),
+      type: 'text',
+      body: { message: 'hi' },
+      stateMachine: new ThreadStateMachine(),
+    });
+    const bytes = Uint8Array.from(atob(msg.encryption.kemCiphertext), (c) => c.charCodeAt(0));
+    bytes[500] ^= 0x80;
+    msg.encryption.kemCiphertext = toBase64(bytes);
+
+    await expect(
+      parseMessage(msg, receiver, sender.getSigningPublicKey(), {
+        stateMachine: new ThreadStateMachine(),
+      }),
+    ).rejects.toThrow(/Signature verification failed/);
   });
 });

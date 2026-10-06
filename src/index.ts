@@ -38,7 +38,14 @@ export {
 } from './types.js';
 
 export { SoftwareIdentity, type SoftwareIdentityExport, type SoftwareIdentityBinaryExport, computeACEId, toBase64, fromBase64, secp256k1Address } from './identity.js';
-export { computeConversationId, encrypt, decrypt, getACEDHSalt, MAX_PAYLOAD_SIZE, MAX_PLAINTEXT_SIZE } from './encryption.js';
+export {
+  computeConversationId, encrypt, decrypt, getACEKemSalt,
+  kemEncapsulate, kemDecapsulate, kemPublicKeyFromSeed, generateKemSeed,
+  validatePublicKey, validateKemCiphertext, validateSeed,
+  decodeKemPublicKey, decodeKemCiphertext,
+  KEM_SEED_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_CIPHERTEXT_SIZE,
+  MAX_PAYLOAD_SIZE, MAX_PLAINTEXT_SIZE,
+} from './encryption.js';
 export { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
 export { createMessage, parseMessage, parseMessageFromRegistration, parseMessageFromPeer, validateBody, type CreateMessageOptions, type ParsedMessage, type ParseMessageOptions, type ParseMessageFromRegistrationOptions } from './messages.js';
 export { validateRegistrationFile, validateACEId, verifyRegistrationId, fetchRegistrationFile, getRegistrationSigningPublicKey, getRegistrationEncryptionPublicKey, validateProfile, verifyEncryptionKeyBinding, verifyPeerResponse, type FetchRegistrationFileOptions, type RelayPeerResponse, type VerifiedPeer } from './discovery.js';

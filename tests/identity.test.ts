@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { SoftwareIdentity, fromBase64 } from '../src/identity.js';
+import { SoftwareIdentity, fromBase64, toBase64 } from '../src/identity.js';
 import { buildSignData, encodePayload, verifySignature } from '../src/signing.js';
 import { computeConversationId, encrypt } from '../src/encryption.js';
 
@@ -11,7 +11,7 @@ describe('SoftwareIdentity', () => {
       expect(id.getSigningScheme()).toBe('ed25519');
       expect(id.getTier()).toBe(0);
       expect(id.getSigningPublicKey()).toHaveLength(32);
-      expect(id.getEncryptionPublicKey()).toHaveLength(32);
+      expect(id.getEncryptionPublicKey()).toHaveLength(1216);
     });
 
     it('derives deterministic ACE ID from signing key', async () => {
@@ -58,10 +58,28 @@ describe('SoftwareIdentity', () => {
     it('exports and imports private keys', async () => {
       const id = await SoftwareIdentity.generate('ed25519');
       const exported = id.exportPrivateKey();
+      // encryptionPrivateKey is the 32-byte X-Wing seed
+      expect(fromBase64(exported.encryptionPrivateKey)).toHaveLength(32);
       const restored = SoftwareIdentity.fromExport(exported);
       expect(restored.getACEId()).toBe(id.getACEId());
       expect(restored.getAddress()).toBe(id.getAddress());
       expect(restored.getSigningScheme()).toBe(id.getSigningScheme());
+      expect(bytesToHex(restored.getEncryptionPublicKey())).toBe(bytesToHex(id.getEncryptionPublicKey()));
+    });
+
+    it('rejects an encryptionPrivateKey that is not a 32-byte seed', async () => {
+      const id = await SoftwareIdentity.generate('ed25519');
+      const exported = id.exportPrivateKey();
+      expect(() => SoftwareIdentity.fromExport({
+        ...exported,
+        encryptionPrivateKey: toBase64(new Uint8Array(31)),
+      })).toThrow(/X-Wing seed must be exactly 32 bytes, got 31/);
+    });
+
+    it('registration file carries the 1216-byte X-Wing public key', async () => {
+      const id = await SoftwareIdentity.generate('ed25519');
+      const reg = id.toRegistrationFile({ name: 'T', endpoint: 'https://t.example.com/ace' });
+      expect(fromBase64(reg.signing.encryptionPublicKey)).toHaveLength(1216);
     });
 
     it('toJSON returns safe public info (no private keys)', async () => {
@@ -99,10 +117,10 @@ describe('SoftwareIdentity', () => {
 
       // Verify decryption works
       const convId = computeConversationId(restored.getEncryptionPublicKey(), restored.getEncryptionPublicKey());
-      const { ephemeralPubKey, payload } = await encrypt(
+      const { kemCiphertext, payload } = await encrypt(
         new TextEncoder().encode('test'), restored.getEncryptionPublicKey(), convId,
       );
-      const decrypted = await restored.decrypt(ephemeralPubKey, payload, convId);
+      const decrypted = await restored.decrypt(kemCiphertext, payload, convId);
       expect(new TextDecoder().decode(decrypted)).toBe('test');
     });
 
@@ -126,7 +144,7 @@ describe('SoftwareIdentity', () => {
       const id = await SoftwareIdentity.generate('secp256k1');
       expect(id.getSigningScheme()).toBe('secp256k1');
       expect(id.getSigningPublicKey()).toHaveLength(33); // compressed
-      expect(id.getEncryptionPublicKey()).toHaveLength(32);
+      expect(id.getEncryptionPublicKey()).toHaveLength(1216);
     });
 
     it('derives 0x-prefixed EIP-55 checksummed address', async () => {

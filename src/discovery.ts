@@ -3,6 +3,7 @@ import type { AgentProfile, RegistrationFile, SigningScheme } from './types.js';
 import { computeACEId, fromBase64, secp256k1Address } from './identity.js';
 import { buildSignData, encodePayload, verifySignature, decodeSignature } from './signing.js';
 import { constantTimeEqual, CONTROL_CHAR_PATTERN } from './utils.js';
+import { decodeKemPublicKey } from './encryption.js';
 
 const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_REGISTRATION_BYTES = 1_048_576;
@@ -75,6 +76,7 @@ export function validateRegistrationFile(reg: RegistrationFile): void {
   if (!reg.signing.encryptionPublicKey) {
     throw new Error('Missing required field: signing.encryptionPublicKey');
   }
+  decodeKemPublicKey(reg.signing.encryptionPublicKey);
 
   if (reg.signing.scheme === 'ed25519') {
     const addressPubKey = decodeEd25519Address(reg.signing.address);
@@ -134,18 +136,18 @@ export function getRegistrationSigningPublicKey(reg: RegistrationFile): Uint8Arr
 }
 
 /**
- * Extract the X25519 encryption public key from a validated registration file.
+ * Extract the X-Wing encryption public key (1216 bytes) from a validated registration file.
  */
 export function getRegistrationEncryptionPublicKey(reg: RegistrationFile): Uint8Array {
-  return fromBase64(reg.signing.encryptionPublicKey);
+  return decodeKemPublicKey(reg.signing.encryptionPublicKey);
 }
 
 // === Encryption-key binding (relay-sourced peer keys) ===
 //
 // `aceId` self-certifies only the SIGNING key (aceId === sha256(signingKey)). The
-// X25519 ENCRYPTION key is separate — on its own it is an unauthenticated claim.
+// X-Wing ENCRYPTION key is separate — on its own it is an unauthenticated claim.
 // A relay routes ciphertext and is untrusted by design, so it could hand a client
-// its own X25519 key and read messages the client believes are end-to-end
+// its own X-Wing key and read messages the client believes are end-to-end
 // encrypted. The binding below is the proof that closes that gap: the exact
 // signature the relay already requires at registration, verifiable with nothing
 // but the identity's own signing key.
@@ -175,7 +177,7 @@ export interface VerifiedPeer {
  *   buildSignData('register', aceId, timestamp,
  *                 encodePayload(encryptionPublicKey, signingPublicKey))
  * signed by the identity's signing key. This also re-checks
- * `aceId === sha256(signingPublicKey)`, so `true` means: this exact X25519 key was
+ * `aceId === sha256(signingPublicKey)`, so `true` means: this exact X-Wing key was
  * signed by the key that defines this identity.
  *
  * `encryptionPublicKey` / `signingPublicKey` MUST be the Base64 wire strings (the
@@ -192,6 +194,8 @@ export function verifyEncryptionKeyBinding(
   if (scheme !== 'ed25519' && scheme !== 'secp256k1') return false;
   if (!Number.isInteger(timestamp)) return false;
   try {
+    // The bound key must be a well-formed X-Wing public key.
+    decodeKemPublicKey(encryptionPublicKey);
     const signingPubBytes = fromBase64(signingPublicKey);
     // The signing key must be the one that defines this identity.
     if (computeACEId(signingPubBytes) !== aceId) return false;
@@ -209,7 +213,7 @@ export function verifyEncryptionKeyBinding(
  * Build a {@link VerifiedPeer} from a relay `GET /v1/peer` or `/v1/discover` entry.
  *
  * Throws if the binding signature is absent or fails — a relay that substitutes an
- * X25519 key cannot produce a passing binding, so a VerifiedPeer can only be
+ * X-Wing key cannot produce a passing binding, so a VerifiedPeer can only be
  * obtained for a genuine key. Use its keys with {@link parseMessageFromPeer}.
  */
 export function verifyPeerResponse(data: RelayPeerResponse): VerifiedPeer {
@@ -221,14 +225,11 @@ export function verifyPeerResponse(data: RelayPeerResponse): VerifiedPeer {
   if (scheme !== 'ed25519' && scheme !== 'secp256k1') {
     throw new Error(`Unsupported peer signing scheme: '${String(scheme).slice(0, 32)}'`);
   }
-  if (typeof encryptionPublicKey !== 'string' || typeof signingPublicKey !== 'string') {
-    throw new Error('Peer response signingPublicKey/encryptionPublicKey must be strings');
-  }
   if (registrationSignature === undefined || registeredAt === undefined) {
     throw new Error(
       'Peer response is missing the encryption-key binding (registrationSignature/registeredAt); ' +
       'its encryptionPublicKey cannot be trusted. Without the binding a relay could substitute ' +
-      'its own X25519 key and read messages meant to be end-to-end encrypted.',
+      'its own X-Wing key and read messages meant to be end-to-end encrypted.',
     );
   }
   if (!verifyEncryptionKeyBinding(aceId, scheme, encryptionPublicKey, signingPublicKey, registeredAt, registrationSignature)) {
@@ -237,11 +238,12 @@ export function verifyPeerResponse(data: RelayPeerResponse): VerifiedPeer {
       "this identity's signing key (possible key substitution / relay MITM).",
     );
   }
+  // The binding passed, so both strings are well-formed; decode them once here.
   return {
     aceId,
     scheme,
     signingPublicKey: fromBase64(signingPublicKey),
-    encryptionPublicKey: fromBase64(encryptionPublicKey),
+    encryptionPublicKey: decodeKemPublicKey(encryptionPublicKey),
   };
 }
 

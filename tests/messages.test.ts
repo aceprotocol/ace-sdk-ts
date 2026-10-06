@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SoftwareIdentity, toBase64 } from '../src/identity.js';
+import { SoftwareIdentity, toBase64, fromBase64 } from '../src/identity.js';
 import { ReplayDetector } from '../src/security.js';
 import { MAX_PAYLOAD_SIZE } from '../src/encryption.js';
 import { encrypt } from '../src/encryption.js';
@@ -146,7 +146,8 @@ describe('Messages', () => {
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
       );
       expect('body' in msg).toBe(false);
-      expect(msg.encryption.ephemeralPubKey).toBeTruthy();
+      expect(msg.encryption.kemCiphertext).toBeTruthy();
+      expect(fromBase64(msg.encryption.kemCiphertext)).toHaveLength(1120);
       expect(msg.encryption.payload).toBeTruthy();
       expect(msg.signature.scheme).toBe('ed25519');
       expect(msg.signature.value).toBeTruthy();
@@ -405,7 +406,7 @@ describe('Messages', () => {
           type: 'text',
           timestamp: Math.floor(Date.now() / 1000),
           encryption: {
-            ephemeralPubKey: 'AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+            kemCiphertext: toBase64(new Uint8Array(1120)),
             payload: oversizedPayload,
           },
           signature: {
@@ -416,12 +417,49 @@ describe('Messages', () => {
       ).rejects.toThrow(/Payload too large/);
     });
 
+    it.each([1119, 1121])('rejects kemCiphertext of %i bytes before signature check or decapsulation', async (len) => {
+      const sender = await SoftwareIdentity.generate('ed25519');
+      const receiver = await SoftwareIdentity.generate('ed25519');
+      const msg = await createMessage({
+        sender,
+        recipientPubKey: receiver.getEncryptionPublicKey(),
+        recipientACEId: receiver.getACEId(),
+        type: 'text',
+        body: { message: 'hello' },
+        stateMachine: makeSM(),
+      });
+      msg.encryption.kemCiphertext = toBase64(new Uint8Array(len).fill(0xaa));
+      const detector = new ReplayDetector();
+      await expect(
+        parseMessage(msg, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM(), replayDetector: detector }),
+      ).rejects.toThrow(new RegExp(`X-Wing KEM ciphertext must be exactly 1120 bytes, got ${len}`));
+      // The replay reservation must be released on schema failure.
+      expect(detector.checkAndReserve(msg.messageId)).toBe(true);
+    });
+
+    it('rejects missing kemCiphertext', async () => {
+      const sender = await SoftwareIdentity.generate('ed25519');
+      const receiver = await SoftwareIdentity.generate('ed25519');
+      const msg = await createMessage({
+        sender,
+        recipientPubKey: receiver.getEncryptionPublicKey(),
+        recipientACEId: receiver.getACEId(),
+        type: 'text',
+        body: { message: 'hello' },
+        stateMachine: makeSM(),
+      });
+      delete (msg.encryption as Partial<typeof msg.encryption>).kemCiphertext;
+      await expect(
+        parseMessage(msg, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM() }),
+      ).rejects.toThrow(/Missing required encryption fields/);
+    });
+
     it('rejects conversationId that is not bound to sender and recipient encryption keys', async () => {
       const sender = await SoftwareIdentity.generate('ed25519');
       const receiver = await SoftwareIdentity.generate('ed25519');
       const bogusConversationId = 'b'.repeat(64);
       const bodyBytes = new TextEncoder().encode(JSON.stringify({ message: 'bound check' }));
-      const { ephemeralPubKey, payload } = await encrypt(
+      const { kemCiphertext, payload } = await encrypt(
         bodyBytes,
         receiver.getEncryptionPublicKey(),
         bogusConversationId,
@@ -441,7 +479,7 @@ describe('Messages', () => {
         type: 'text' as const,
         timestamp,
         encryption: {
-          ephemeralPubKey: toBase64(ephemeralPubKey),
+          kemCiphertext: toBase64(kemCiphertext),
           payload: toBase64(payload),
         },
         signature: {
