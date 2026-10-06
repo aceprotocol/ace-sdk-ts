@@ -84,6 +84,8 @@ console.log(parsed.body); // { need: 'Translate 500 words EN→FR', ... }
 | System   | `info` |
 | Social   | `text` |
 
+`MESSAGE_TYPES` / `isMessageType(type)` cover all ten; any other type is rejected by `createMessage`, `parseMessage` and `validateBody`.
+
 ## API
 
 ### Identity
@@ -107,7 +109,7 @@ console.log(parsed.body); // { need: 'Translate 500 words EN→FR', ... }
 
 - `createMessage(options)` — Build an encrypted, signed ACE message
 - `parseMessage(options)` — Decrypt, verify, and parse an ACE message
-- `validateBody(type, body)` — Validate a message body against its type schema
+- `validateBody(type, body)` — Validate a message body against its type schema (throws on an unknown type)
 
 ### Discovery
 
@@ -119,11 +121,12 @@ console.log(parsed.body); // { need: 'Translate 500 words EN→FR', ... }
 
 - `checkTimestampFreshness(timestamp)` — Check if a timestamp is within acceptable bounds
 - `validateMessageId(id)` — Validate message ID format
-- `ReplayDetector` — Seen store with a replay horizon (required by `parseMessage`); persist it with `export()` / `ReplayDetector.fromExport()`
+- `ReplayDetector` — Seen store with a replay horizon (required by `parseMessage`); persist it with `export()` / `ReplayDetector.fromExport()` (`{ horizon, senderHorizons, entries }`, all required)
 
 ### State Machine
 
-- `ThreadStateMachine` — Enforces valid economic message flow transitions
+- `new ThreadStateMachine({ maxThreads?, maxHistoryPerThread? })` — Enforces valid economic message flow transitions. Limits default to 100,000 threads and 1,000 history entries per thread; reaching one rejects the transition (threads are never evicted, so a finished deal cannot be reopened). `remove()` frees a thread explicitly.
+- `export()` / `ThreadStateMachine.fromExport(snapshots, options?)` — Persist and restore; import replays every history against the transition table and applies the same limits
 
 ## License
 

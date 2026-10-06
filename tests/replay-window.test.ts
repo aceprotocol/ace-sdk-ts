@@ -9,7 +9,7 @@ async function setup() {
   const parse = (msg: ACEMessage, replayDetector: ReplayDetector, oldestTimestamp?: number) =>
     parseMessage(msg, bob, alice.getSigningPublicKey(), { stateMachine: new ThreadStateMachine(), replayDetector, oldestTimestamp });
   // A store that has been running since before the receiver went offline.
-  const runningStore = (capacity?: number) => ReplayDetector.fromExport({ horizon: now - 7200, entries: [] }, capacity);
+  const runningStore = (capacity?: number) => ReplayDetector.fromExport({ horizon: now - 7200, senderHorizons: {}, entries: [] }, capacity);
   return { bob, now, create, parse, runningStore };
 }
 

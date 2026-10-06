@@ -116,6 +116,7 @@ export const ECONOMIC_TYPES: ReadonlySet<MessageType> = new Set([
 
 export const SYSTEM_TYPES: ReadonlySet<MessageType> = new Set(['info']);
 export const SOCIAL_TYPES: ReadonlySet<MessageType> = new Set(['text']);
+export const MESSAGE_TYPES: ReadonlySet<MessageType> = new Set([...ECONOMIC_TYPES, ...SYSTEM_TYPES, ...SOCIAL_TYPES]);
 
 export interface EncryptionEnvelope {
   kemCiphertext: string; // Base64(X-Wing ciphertext, 1120 bytes)
@@ -173,7 +174,7 @@ export interface InvoiceBody {
 }
 
 export interface ReceiptBody {
-  invoiceId: string;
+  referenceId: string;
   amount: string;
   currency: string;
   settlementMethod: string;
@@ -202,6 +203,10 @@ export interface TextBody {
 }
 
 // === Type Guards ===
+
+export function isMessageType(type: unknown): type is MessageType {
+  return typeof type === 'string' && MESSAGE_TYPES.has(type as MessageType);
+}
 
 export function isEconomicType(type: MessageType): boolean {
   return ECONOMIC_TYPES.has(type);

@@ -5,6 +5,7 @@ import { MAX_PAYLOAD_SIZE } from '../src/encryption.js';
 import { encrypt } from '../src/encryption.js';
 import { buildSignData, encodePayload, encodeSignature } from '../src/signing.js';
 import { ThreadStateMachine } from '../src/state-machine.js';
+import { MESSAGE_TYPES, isMessageType, type ACEMessage, type MessageType } from '../src/index.js';
 import {
   createMessage,
   validateBody,
@@ -45,7 +46,7 @@ describe('Messages', () => {
 
     it('validates receipt body', () => {
       expect(() => validateBody('receipt', {
-        invoiceId: 'abc',
+        referenceId: 'abc',
         amount: '10',
         currency: 'USD',
         settlementMethod: 'crypto/instant',
@@ -433,7 +434,7 @@ describe('Messages', () => {
       const detector = new ReplayDetector();
       await expect(
         parseMessage(msg, receiver, sender.getSigningPublicKey(), { stateMachine: makeSM(), replayDetector: detector }),
-      ).rejects.toThrow(new RegExp(`X-Wing KEM ciphertext must be exactly 1120 bytes, got ${len}`));
+      ).rejects.toThrow(new RegExp(`X-Wing KEM ciphertext (must be exactly 1120 bytes, got|too large:) ${len}`));
       // Nothing enters the seen store before the signature verifies.
       expect(detector.accepts(msg.messageId, msg.from, msg.timestamp)).toBe(true);
     });
@@ -700,4 +701,90 @@ describe('Messages', () => {
       ).rejects.toThrow(/maximum nesting depth/);
     });
   });
+
+  describe('cross-SDK envelope and reference rules', () => {
+    async function pair() {
+      const buyer = await SoftwareIdentity.generate('ed25519');
+      const seller = await SoftwareIdentity.generate('ed25519');
+      const send = (from: SoftwareIdentity, to: SoftwareIdentity, sm: ThreadStateMachine, type: MessageType, body: Record<string, unknown>, threadId?: string) =>
+        createMessage({
+          sender: from,
+          recipientPubKey: to.getEncryptionPublicKey(),
+          recipientACEId: to.getACEId(),
+          type, body, stateMachine: sm, threadId,
+        });
+      return { buyer, seller, send };
+    }
+    const parse = (msg: ACEMessage, receiver: SoftwareIdentity, sender: SoftwareIdentity) =>
+      parseMessage(msg, receiver, sender.getSigningPublicKey(), { replayDetector: new ReplayDetector(), stateMachine: makeSM() });
+    const receiptBody = (referenceId: string) => ({
+      referenceId, amount: '10', currency: 'USD', settlementMethod: 'crypto/instant', proof: { txHash: '0x1' },
+    });
+
+    it('exports the full set of message types', () => {
+      expect([...MESSAGE_TYPES]).toEqual(['rfq', 'offer', 'accept', 'reject', 'invoice', 'receipt', 'deliver', 'confirm', 'info', 'text']);
+      expect(isMessageType('text')).toBe(true);
+      expect(isMessageType('bogus')).toBe(false);
+    });
+
+    it('rejects unknown message types in validateBody, createMessage and parseMessage', async () => {
+      expect(() => validateBody('bogus' as MessageType, {})).toThrow("Unknown message type: 'bogus'");
+      const { buyer, seller, send } = await pair();
+      await expect(send(buyer, seller, makeSM(), 'x'.repeat(100) as MessageType, {}))
+        .rejects.toThrow(`Unknown message type: '${'x'.repeat(32)}'`);
+      const msg = await send(buyer, seller, makeSM(), 'text', { message: 'hi' });
+      await expect(parse({ ...msg, type: 'bogus' as MessageType }, seller, buyer)).rejects.toThrow(/Unknown message type/);
+    });
+
+    it('validates threadId whenever it is present', async () => {
+      const { buyer, seller, send } = await pair();
+      await expect(send(buyer, seller, makeSM(), 'text', { message: 'hi' }, '')).rejects.toThrow(/must not be empty/);
+      const msg = await send(buyer, seller, makeSM(), 'text', { message: 'hi' }, 't');
+      await expect(parse({ ...msg, threadId: 'a\nb' }, seller, buyer)).rejects.toThrow(/control characters/);
+      await expect(parse({ ...msg, threadId: 'x'.repeat(257) }, seller, buyer)).rejects.toThrow(/exceeds max length/);
+    });
+
+    it('requires conversationId to be 64 lowercase hex characters', async () => {
+      const { buyer, seller, send } = await pair();
+      const msg = await send(buyer, seller, makeSM(), 'text', { message: 'hi' });
+      for (const conversationId of [msg.conversationId.toUpperCase(), msg.conversationId.slice(1), 'z'.repeat(64)]) {
+        await expect(parse({ ...msg, conversationId }, seller, buyer))
+          .rejects.toThrow('Invalid conversationId: expected 64 lowercase hex characters');
+      }
+    });
+
+    it('has no per-field string length caps', () => {
+      expect(() => validateBody('text', { message: 'x'.repeat(100_000) })).not.toThrow();
+      expect(() => validateBody('rfq', { need: 'x'.repeat(10_000) })).not.toThrow();
+    });
+
+    it('receipt references the accept on the pre-paid path and the invoice otherwise', async () => {
+      const { buyer, seller, send } = await pair();
+      const sm = makeSM();
+      await send(buyer, seller, sm, 'rfq', { need: 'gpu' }, 'pre');
+      const offer = await send(seller, buyer, sm, 'offer', { price: '10', currency: 'USD' }, 'pre');
+      const accept = await send(buyer, seller, sm, 'accept', { offerId: offer.messageId }, 'pre');
+      await expect(send(buyer, seller, sm, 'receipt', receiptBody(offer.messageId), 'pre'))
+        .rejects.toThrow('receipt.referenceId must reference the invoice (or, when pre-paid, the accept) in the same thread');
+      await send(buyer, seller, sm, 'receipt', receiptBody(accept.messageId), 'pre');
+      expect(sm.getState(accept.conversationId, 'pre')).toBe('paid');
+
+      await send(buyer, seller, sm, 'rfq', { need: 'gpu' }, 'std');
+      const offer2 = await send(seller, buyer, sm, 'offer', { price: '10', currency: 'USD' }, 'std');
+      const accept2 = await send(buyer, seller, sm, 'accept', { offerId: offer2.messageId }, 'std');
+      const invoice = await send(seller, buyer, sm, 'invoice', {
+        offerId: offer2.messageId, amount: '10', currency: 'USD', settlementMethod: 'crypto/instant',
+      }, 'std');
+      await expect(send(buyer, seller, sm, 'receipt', receiptBody(accept2.messageId), 'std')).rejects.toThrow(/must reference the invoice/);
+      await send(buyer, seller, sm, 'receipt', receiptBody(invoice.messageId), 'std');
+    });
+
+    it('stops sending once the thread limit is reached', async () => {
+      const { buyer, seller, send } = await pair();
+      const sm = new ThreadStateMachine({ maxThreads: 1 });
+      await send(buyer, seller, sm, 'rfq', { need: 'gpu' }, 't1');
+      await expect(send(buyer, seller, sm, 'rfq', { need: 'gpu' }, 't2')).rejects.toThrow('Thread limit reached (1)');
+    });
+  });
 });
+

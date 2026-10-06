@@ -749,7 +749,7 @@ describe('ThreadStateMachine', () => {
   });
 
   describe('fromExport thread count limit', () => {
-    it('rejects import exceeding MAX_IMPORT_THREADS', () => {
+    it('rejects import exceeding maxThreads', () => {
       const huge = Array.from({ length: 100_001 }, (_, i) => ({
         conversationId: `c${i}`,
         threadId: `t${i}`,
@@ -759,7 +759,7 @@ describe('ThreadStateMachine', () => {
       expect(() => ThreadStateMachine.fromExport(huge)).toThrow(/too many threads/);
     });
 
-    it('accepts import within MAX_IMPORT_THREADS', () => {
+    it('accepts import within maxThreads', () => {
       const small = Array.from({ length: 3 }, (_, i) => ({
         conversationId: `c${i}`,
         threadId: `t${i}`,
@@ -767,6 +767,90 @@ describe('ThreadStateMachine', () => {
         history: [{ type: 'rfq' as const, messageId: crypto.randomUUID(), timestamp: Math.floor(Date.now() / 1000) }],
       }));
       expect(() => ThreadStateMachine.fromExport(small)).not.toThrow();
+    });
+  });
+
+  describe('resource limits (reject, never evict)', () => {
+    const rfq = (sm: ThreadStateMachine, conv: string, t: string) => sm.transition(conv, t, 'rfq', uuid(), now);
+
+    it('validates the limits', () => {
+      expect(() => new ThreadStateMachine({ maxThreads: 0 })).toThrow(/maxThreads/);
+      expect(() => new ThreadStateMachine({ maxHistoryPerThread: 1.5 })).toThrow(/maxHistoryPerThread/);
+      expect(new ThreadStateMachine().maxThreads).toBe(100_000);
+      expect(new ThreadStateMachine().maxHistoryPerThread).toBe(1_000);
+    });
+
+    it('rejects a new thread at maxThreads and keeps the existing ones', () => {
+      const sm = new ThreadStateMachine({ maxThreads: 2 });
+      rfq(sm, CONV_A, 't1');
+      rfq(sm, CONV_A, 't2');
+      expect(sm.canTransition(CONV_A, 't3', 'rfq')).toBe(false);
+      expect(() => rfq(sm, CONV_A, 't3')).toThrow('Thread limit reached (2)');
+      expect(sm.getState(CONV_A, 't1')).toBe('rfq');
+      // Existing threads can still advance.
+      expect(sm.canTransition(CONV_A, 't1', 'offer')).toBe(true);
+      sm.remove(CONV_A, 't1');
+      expect(sm.canTransition(CONV_A, 't3', 'rfq')).toBe(true);
+    });
+
+    it('rejects appending beyond maxHistoryPerThread', () => {
+      const sm = new ThreadStateMachine({ maxHistoryPerThread: 2 });
+      rfq(sm, CONV_A, 't');
+      sm.transition(CONV_A, 't', 'offer', uuid(), now);
+      expect(sm.canTransition(CONV_A, 't', 'offer')).toBe(false);
+      expect(() => sm.transition(CONV_A, 't', 'offer', uuid(), now))
+        .toThrow('Thread history exceeds maximum of 2 entries');
+      expect(sm.getSnapshot(CONV_A, 't').history).toHaveLength(2);
+    });
+  });
+
+  describe('snapshot isolation', () => {
+    it('getSnapshot and export return copies of the history', () => {
+      const sm = new ThreadStateMachine();
+      sm.transition(CONV_A, 't', 'rfq', uuid(), now);
+      (sm.getSnapshot(CONV_A, 't').history as unknown[]).push('x');
+      (sm.export()[0].history as unknown[]).length = 0;
+      expect(sm.getSnapshot(CONV_A, 't').history).toHaveLength(1);
+    });
+  });
+
+  describe('fromExport validation', () => {
+    const entry = (type: MessageType, timestamp: number = now) => ({ type, messageId: uuid(), timestamp });
+    const snap = (over: Record<string, unknown> = {}) => ({
+      conversationId: CONV_A, threadId: 't', state: 'rfq' as const, history: [entry('rfq')], ...over,
+    });
+    const load = (...snaps: ReturnType<typeof snap>[]) => ThreadStateMachine.fromExport(snaps as never);
+
+    it('applies the same limits as the constructor', () => {
+      expect(() => ThreadStateMachine.fromExport([snap(), snap({ threadId: 'u' })] as never, { maxThreads: 1 }))
+        .toThrow(/too many threads/);
+      const history = [entry('rfq'), entry('offer'), entry('offer')];
+      expect(() => ThreadStateMachine.fromExport([snap({ state: 'offered', history })] as never, { maxHistoryPerThread: 2 }))
+        .toThrow(/history too large/);
+      const sm = ThreadStateMachine.fromExport([snap()] as never, { maxThreads: 1 });
+      expect(() => sm.transition(CONV_A, 'u', 'rfq', uuid(), now)).toThrow(/Thread limit reached/);
+    });
+
+    it('rejects empty history, bad threadId, conversationId and timestamps', () => {
+      expect(() => load(snap({ state: 'idle', history: [] }))).toThrow(/non-empty/);
+      expect(() => load(snap({ threadId: '' }))).toThrow(/threadId/);
+      expect(() => load(snap({ threadId: 'a\nb' }))).toThrow(/control characters/);
+      expect(() => load(snap({ conversationId: '' }))).toThrow(/conversationId/);
+      expect(() => load(snap({ conversationId: '\u{1F600}'.repeat(257) }))).toThrow(/conversationId/);
+      expect(() => load(snap({ conversationId: '\u{1F600}'.repeat(256) }))).not.toThrow();
+      expect(() => load(snap({ history: [entry('rfq', -1)] }))).toThrow(/timestamp/);
+      expect(() => load(snap({ history: [entry('rfq', 1.5)] }))).toThrow(/timestamp/);
+    });
+
+    it('rejects a duplicate thread', () => {
+      expect(() => load(snap(), snap())).toThrow('fromExport: duplicate thread');
+    });
+  });
+
+  describe('threadId length counts code points', () => {
+    it('accepts 256 astral characters and rejects 257', () => {
+      expect(() => validateThreadId('\u{1F600}'.repeat(256))).not.toThrow();
+      expect(() => validateThreadId('\u{1F600}'.repeat(257))).toThrow(/exceeds max length/);
     });
   });
 });

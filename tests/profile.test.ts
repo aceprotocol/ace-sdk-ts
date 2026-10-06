@@ -27,6 +27,14 @@ describe('validateProfile', () => {
     it('rejects a name longer than 64 characters', () => {
       expect(() => validateProfile({ name: 'A'.repeat(65) })).toThrow(/name/);
     });
+
+    it('counts Unicode code points, not UTF-16 units', () => {
+      expect(() => validateProfile({ name: '\u{1F600}'.repeat(64) })).not.toThrow();
+      expect(() => validateProfile({ name: '\u{1F600}'.repeat(65) })).toThrow(/name/);
+      expect(() => validateProfile({ description: '\u{1F600}'.repeat(256) })).not.toThrow();
+      // 32 code points pass the length rule and fail only the pattern.
+      expect(() => validateProfile({ tags: ['\u{1F600}'.repeat(32)] })).toThrow(/must match/);
+    });
   });
 
   // ─── description ──────────────────────────────────────────────────────────
@@ -187,6 +195,14 @@ describe('validateProfile', () => {
     it('rejects an empty chain string', () => {
       expect(() => validateProfile({ chains: [''] })).toThrow(/chains/);
     });
+
+    it('requires a full CAIP-2 match', () => {
+      for (const chain of ['EIP155:1', 'ab:1', 'eip155:', 'eip155:1\n', 'eip155:1:2', `eip155:${'a'.repeat(33)}`]) {
+        expect(() => validateProfile({ chains: [chain] }))
+          .toThrow('Invalid profile: each chain must be a CAIP-2 identifier (chains)');
+      }
+      expect(() => validateProfile({ chains: ['solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', 'eip155:a_B-1'] })).not.toThrow();
+    });
   });
 
   // ─── endpoint ─────────────────────────────────────────────────────────────
@@ -210,6 +226,12 @@ describe('validateProfile', () => {
 
     it('rejects a URL with an unsupported scheme', () => {
       expect(() => validateProfile({ endpoint: 'ftp://example.com/ace' })).toThrow(/https/i);
+    });
+
+    it('compares the scheme case-insensitively and requires a host', () => {
+      expect(() => validateProfile({ endpoint: 'HTTPS://example.com/ace' })).not.toThrow();
+      expect(() => validateProfile({ endpoint: 'https://' })).toThrow(/endpoint/);
+      expect(() => validateProfile({ image: 'HTTPS://example.com/a.png' })).not.toThrow();
     });
   });
 

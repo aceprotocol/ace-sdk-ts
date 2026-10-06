@@ -54,39 +54,18 @@ export function validateSeed(seed: Uint8Array): void {
 
 // === Base64 wire decoding ===
 
-/** Padded Base64 length of `byteLength` bytes. */
-function base64LengthFor(byteLength: number): number {
-  return Math.ceil(byteLength / 3) * 4;
-}
-
-/**
- * Decode a fixed-size X-Wing object from its Base64 wire form.
- * The string-length pre-check rejects oversized input before any decoding
- * (DoS guard); the byte-length check then enforces the exact size.
- */
-function decodeFixedSize(b64: string, expected: number, what: string): Uint8Array {
-  if (typeof b64 !== 'string') {
-    throw new Error(`${what} must be a Base64 string`);
-  }
-  const maxB64Length = base64LengthFor(expected);
-  if (b64.length > maxB64Length) {
-    throw new Error(
-      `${what} must be exactly ${expected} bytes; Base64 length ${b64.length} exceeds ${maxB64Length}`,
-    );
-  }
-  const bytes = fromBase64(b64);
-  assertExactLength(bytes, expected, what);
-  return bytes;
-}
-
 /** Decode a Base64 X-Wing public key, enforcing the exact 1216-byte length. */
 export function decodeKemPublicKey(b64: string): Uint8Array {
-  return decodeFixedSize(b64, KEM_PUBLIC_KEY_SIZE, 'X-Wing public key');
+  const bytes = fromBase64(b64, KEM_PUBLIC_KEY_SIZE, 'X-Wing public key');
+  validatePublicKey(bytes);
+  return bytes;
 }
 
 /** Decode a Base64 X-Wing KEM ciphertext, enforcing the exact 1120-byte length. */
 export function decodeKemCiphertext(b64: string): Uint8Array {
-  return decodeFixedSize(b64, KEM_CIPHERTEXT_SIZE, 'X-Wing KEM ciphertext');
+  const bytes = fromBase64(b64, KEM_CIPHERTEXT_SIZE, 'X-Wing KEM ciphertext');
+  validateKemCiphertext(bytes);
+  return bytes;
 }
 
 /**

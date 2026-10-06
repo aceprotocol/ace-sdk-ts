@@ -29,9 +29,11 @@ export {
   type InfoBody,
   type TextBody,
   // Type guards
+  isMessageType,
   isEconomicType,
   isSystemType,
   isSocialType,
+  MESSAGE_TYPES,
   ECONOMIC_TYPES,
   SYSTEM_TYPES,
   SOCIAL_TYPES,
@@ -48,6 +50,6 @@ export {
 } from './encryption.js';
 export { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
 export { createMessage, parseMessage, parseMessageFromRegistration, parseMessageFromPeer, validateBody, type CreateMessageOptions, type ParsedMessage, type ParseMessageOptions, type ParseMessageFromRegistrationOptions } from './messages.js';
-export { validateRegistrationFile, validateACEId, verifyRegistrationId, fetchRegistrationFile, getRegistrationSigningPublicKey, getRegistrationEncryptionPublicKey, validateProfile, verifyEncryptionKeyBinding, verifyPeerResponse, type FetchRegistrationFileOptions, type RelayPeerResponse, type VerifiedPeer } from './discovery.js';
+export { validateRegistrationFile, validateACEId, verifyRegistrationId, fetchRegistrationFile, getRegistrationSigningPublicKey, getRegistrationEncryptionPublicKey, validateProfile, verifyEncryptionKeyBinding, verifyPeerResponse, type RegistrationKeys, type FetchRegistrationFileOptions, type RelayPeerResponse, type VerifiedPeer } from './discovery.js';
 export { checkTimestampFreshness, validateMessageId, ReplayDetector, type ReplayDetectorExport } from './security.js';
-export { ThreadStateMachine, InvalidTransitionError, validateThreadId, type ThreadState, type ThreadSnapshot } from './state-machine.js';
+export { ThreadStateMachine, InvalidTransitionError, validateThreadId, type ThreadState, type ThreadSnapshot, type ThreadStateMachineOptions } from './state-machine.js';

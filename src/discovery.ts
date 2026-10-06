@@ -2,7 +2,7 @@ import bs58 from 'bs58';
 import type { AgentProfile, RegistrationFile, SigningScheme } from './types.js';
 import { computeACEId, fromBase64, secp256k1Address } from './identity.js';
 import { buildSignData, encodePayload, verifySignature, decodeSignature } from './signing.js';
-import { constantTimeEqual, CONTROL_CHAR_PATTERN } from './utils.js';
+import { constantTimeEqual, codePointLength, CONTROL_CHAR_PATTERN } from './utils.js';
 import { decodeKemPublicKey } from './encryption.js';
 
 const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
@@ -30,10 +30,17 @@ export function validateACEId(id: string): boolean {
   return /^ace:sha256:[a-f0-9]{64}$/.test(id);
 }
 
+/** Decoded public keys of a validated registration file. */
+export interface RegistrationKeys {
+  signingPublicKey: Uint8Array;
+  encryptionPublicKey: Uint8Array;
+}
+
 /**
  * Validate a registration file has all required fields and correct format.
+ * Returns the decoded keys so callers need not decode them a second time.
  */
-export function validateRegistrationFile(reg: RegistrationFile): void {
+export function validateRegistrationFile(reg: RegistrationFile): RegistrationKeys {
   if (reg.ace !== '1.0') {
     throw new Error(`Invalid ace version: expected '1.0', got '${reg.ace}'`);
   }
@@ -43,23 +50,11 @@ export function validateRegistrationFile(reg: RegistrationFile): void {
   if (!reg.name || typeof reg.name !== 'string') {
     throw new Error('Missing required field: name');
   }
-  if (reg.name.length > 64) {
-    throw new Error(`Registration name must be at most 64 characters, got ${reg.name.length}`);
-  }
-  if (CONTROL_CHAR_PATTERN.test(reg.name)) {
-    throw new Error('Registration name must not contain control characters');
-  }
   if (!reg.endpoint || typeof reg.endpoint !== 'string') {
     throw new Error('Missing required field: endpoint');
   }
-  try {
-    const endpointUrl = new URL(reg.endpoint);
-    if (endpointUrl.protocol !== 'https:') {
-      throw new Error(`Registration endpoint must use HTTPS: '${reg.endpoint.slice(0, 100)}'`);
-    }
-  } catch (e) {
-    if (e instanceof Error && e.message.startsWith('Registration endpoint')) throw e;
-    throw new Error(`Registration endpoint must be a valid URL: '${reg.endpoint.slice(0, 100)}'`);
+  if (!isHttpsURL(reg.endpoint)) {
+    throw new Error(`Registration endpoint must be an absolute HTTPS URL: '${reg.endpoint.slice(0, 100)}'`);
   }
   if (reg.tier === undefined || ![0, 1].includes(reg.tier)) {
     throw new Error(`Invalid tier: ${reg.tier}`);
@@ -70,33 +65,36 @@ export function validateRegistrationFile(reg: RegistrationFile): void {
   if (!reg.signing.scheme) {
     throw new Error('Missing required field: signing.scheme');
   }
+  if (!isSigningScheme(reg.signing.scheme)) {
+    throw new Error(`Unsupported signing.scheme: '${String(reg.signing.scheme).slice(0, 32)}'`);
+  }
   if (!reg.signing.address) {
     throw new Error('Missing required field: signing.address');
   }
   if (!reg.signing.encryptionPublicKey) {
     throw new Error('Missing required field: signing.encryptionPublicKey');
   }
-  decodeKemPublicKey(reg.signing.encryptionPublicKey);
-
-  if (reg.signing.scheme === 'ed25519') {
-    const addressPubKey = decodeEd25519Address(reg.signing.address);
-    if (reg.signing.signingPublicKey) {
-      const signingPubKeyBytes = fromBase64(reg.signing.signingPublicKey);
-      if (!constantTimeEqual(addressPubKey, signingPubKeyBytes)) {
-        throw new Error('ed25519 signing.signingPublicKey does not match signing.address');
-      }
-    }
-  } else if (reg.signing.scheme === 'secp256k1') {
-    // secp256k1 requires signingPublicKey (address is a hash, can't recover pubkey from it)
-    if (!reg.signing.signingPublicKey) {
-      throw new Error('secp256k1 scheme requires signing.signingPublicKey');
-    }
-    const signingPubKeyBytes = fromBase64(reg.signing.signingPublicKey!);
-    const derivedAddress = secp256k1Address(signingPubKeyBytes);
-    if (reg.signing.address !== derivedAddress) {
-      throw new Error('signing.address does not match signing.signingPublicKey');
-    }
+  const encryptionPublicKey = getRegistrationEncryptionPublicKey(reg);
+  const signingPublicKey = getRegistrationSigningPublicKey(reg);
+  if (reg.signing.scheme === 'secp256k1' && reg.signing.address !== secp256k1Address(signingPublicKey)) {
+    throw new Error('signing.address does not match signing.signingPublicKey');
   }
+  return { signingPublicKey, encryptionPublicKey };
+}
+
+/** Parsed absolute URL with scheme `https` (case-insensitive) and a non-empty host. */
+function isHttpsURL(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return url.protocol === 'https:' && url.hostname !== '';
+}
+
+function isSigningScheme(scheme: unknown): scheme is SigningScheme {
+  return scheme === 'ed25519' || scheme === 'secp256k1';
 }
 
 /**
@@ -132,7 +130,7 @@ export function getRegistrationSigningPublicKey(reg: RegistrationFile): Uint8Arr
   if (reg.signing.signingPublicKey) {
     return fromBase64(reg.signing.signingPublicKey);
   }
-  throw new Error('Cannot derive signing public key from registration file');
+  throw new Error(`${reg.signing.scheme} scheme requires signing.signingPublicKey`);
 }
 
 /**
@@ -191,21 +189,34 @@ export function verifyEncryptionKeyBinding(
   timestamp: number,
   signature: string,
 ): boolean {
-  if (scheme !== 'ed25519' && scheme !== 'secp256k1') return false;
-  if (!Number.isInteger(timestamp)) return false;
+  return verifyBinding(aceId, scheme, encryptionPublicKey, signingPublicKey, timestamp, signature) !== null;
+}
+
+/** {@link verifyEncryptionKeyBinding}, returning the decoded keys on success. */
+function verifyBinding(
+  aceId: string,
+  scheme: SigningScheme,
+  encryptionPublicKey: string,
+  signingPublicKey: string,
+  timestamp: number,
+  signature: string,
+): RegistrationKeys | null {
+  if (!isSigningScheme(scheme)) return null;
+  if (!Number.isInteger(timestamp)) return null;
   try {
     // The bound key must be a well-formed X-Wing public key.
-    decodeKemPublicKey(encryptionPublicKey);
+    const encryptionPubBytes = decodeKemPublicKey(encryptionPublicKey);
     const signingPubBytes = fromBase64(signingPublicKey);
     // The signing key must be the one that defines this identity.
-    if (computeACEId(signingPubBytes) !== aceId) return false;
+    if (computeACEId(signingPubBytes) !== aceId) return null;
     const payload = encodePayload(encryptionPublicKey, signingPublicKey);
     const signData = buildSignData('register', aceId, timestamp, payload);
     const sigBytes = decodeSignature(signature, scheme);
-    return verifySignature(signData, sigBytes, scheme, signingPubBytes);
+    if (!verifySignature(signData, sigBytes, scheme, signingPubBytes)) return null;
+    return { signingPublicKey: signingPubBytes, encryptionPublicKey: encryptionPubBytes };
   } catch {
     // Malformed key/signature bytes → treat as failed verification.
-    return false;
+    return null;
   }
 }
 
@@ -222,7 +233,7 @@ export function verifyPeerResponse(data: RelayPeerResponse): VerifiedPeer {
   if (typeof aceId !== 'string' || !validateACEId(aceId)) {
     throw new Error(`Invalid peer aceId: '${String(aceId).slice(0, 80)}'`);
   }
-  if (scheme !== 'ed25519' && scheme !== 'secp256k1') {
+  if (!isSigningScheme(scheme)) {
     throw new Error(`Unsupported peer signing scheme: '${String(scheme).slice(0, 32)}'`);
   }
   if (registrationSignature === undefined || registeredAt === undefined) {
@@ -232,29 +243,25 @@ export function verifyPeerResponse(data: RelayPeerResponse): VerifiedPeer {
       'its own X-Wing key and read messages meant to be end-to-end encrypted.',
     );
   }
-  if (!verifyEncryptionKeyBinding(aceId, scheme, encryptionPublicKey, signingPublicKey, registeredAt, registrationSignature)) {
+  const keys = verifyBinding(aceId, scheme, encryptionPublicKey, signingPublicKey, registeredAt, registrationSignature);
+  if (!keys) {
     throw new Error(
       'Peer encryption-key binding failed verification: the encryptionPublicKey is not signed by ' +
       "this identity's signing key (possible key substitution / relay MITM).",
     );
   }
-  // The binding passed, so both strings are well-formed; decode them once here.
-  return {
-    aceId,
-    scheme,
-    signingPublicKey: fromBase64(signingPublicKey),
-    encryptionPublicKey: decodeKemPublicKey(encryptionPublicKey),
-  };
+  return { aceId, scheme, ...keys };
 }
 
 const TAG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const CAIP2_PATTERN = /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/;
 
 function validateTagLikeArray(items: string[], fieldName: string, maxCount: number): void {
   if (items.length > maxCount) {
     throw new Error(`profile.${fieldName} must have at most ${maxCount} items, got ${items.length}`);
   }
   for (const item of items) {
-    if (item.length > 32) {
+    if (codePointLength(item) > 32) {
       throw new Error(`profile.${fieldName} item must be at most 32 characters: '${item}'`);
     }
     if (!TAG_PATTERN.test(item)) {
@@ -270,8 +277,9 @@ function validateTagLikeArray(items: string[], fieldName: string, maxCount: numb
  */
 export function validateProfile(profile: AgentProfile): void {
   if (profile.name !== undefined) {
-    if (profile.name.length < 1 || profile.name.length > 64) {
-      throw new Error(`profile.name must be 1-64 characters, got ${profile.name.length}`);
+    const nameLength = codePointLength(profile.name);
+    if (nameLength < 1 || nameLength > 64) {
+      throw new Error(`profile.name must be 1-64 characters, got ${nameLength}`);
     }
     if (CONTROL_CHAR_PATTERN.test(profile.name)) {
       throw new Error('profile.name must not contain control characters');
@@ -279,8 +287,9 @@ export function validateProfile(profile: AgentProfile): void {
   }
 
   if (profile.description !== undefined) {
-    if (profile.description.length > 256) {
-      throw new Error(`profile.description must be at most 256 characters, got ${profile.description.length}`);
+    const descriptionLength = codePointLength(profile.description);
+    if (descriptionLength > 256) {
+      throw new Error(`profile.description must be at most 256 characters, got ${descriptionLength}`);
     }
     // Reject control characters (U+0000–U+001F and U+007F)
     if (CONTROL_CHAR_PATTERN.test(profile.description)) {
@@ -289,17 +298,12 @@ export function validateProfile(profile: AgentProfile): void {
   }
 
   if (profile.image !== undefined) {
-    if (profile.image.length > 512) {
-      throw new Error(`profile.image must be at most 512 characters, got ${profile.image.length}`);
+    const imageLength = codePointLength(profile.image);
+    if (imageLength > 512) {
+      throw new Error(`profile.image must be at most 512 characters, got ${imageLength}`);
     }
-    let url: URL;
-    try {
-      url = new URL(profile.image);
-    } catch {
-      throw new Error(`profile.image must be a valid URL: '${profile.image}'`);
-    }
-    if (url.protocol !== 'https:') {
-      throw new Error(`profile.image must use HTTPS: '${profile.image}'`);
+    if (!isHttpsURL(profile.image)) {
+      throw new Error(`profile.image must be an absolute HTTPS URL: '${profile.image}'`);
     }
   }
 
@@ -316,26 +320,14 @@ export function validateProfile(profile: AgentProfile): void {
       throw new Error(`profile.chains must have at most 10 items, got ${profile.chains.length}`);
     }
     for (const chain of profile.chains) {
-      if (!chain.includes(':')) {
-        throw new Error(`profile.chains item must be in CAIP-2 format (must contain ':'): '${chain}'`);
-      }
-      const [namespace, reference] = chain.split(':', 2);
-      if (!namespace || !reference) {
-        throw new Error(`profile.chains item must have non-empty namespace and reference: '${chain}'`);
+      if (typeof chain !== 'string' || !CAIP2_PATTERN.test(chain)) {
+        throw new Error('Invalid profile: each chain must be a CAIP-2 identifier (chains)');
       }
     }
   }
 
-  if (profile.endpoint !== undefined) {
-    let url: URL;
-    try {
-      url = new URL(profile.endpoint);
-    } catch {
-      throw new Error(`profile.endpoint must be a valid URL: '${profile.endpoint}'`);
-    }
-    if (url.protocol !== 'https:') {
-      throw new Error(`profile.endpoint must use HTTPS: '${profile.endpoint}'`);
-    }
+  if (profile.endpoint !== undefined && !isHttpsURL(profile.endpoint)) {
+    throw new Error(`profile.endpoint must be an absolute HTTPS URL: '${profile.endpoint}'`);
   }
 
   if (profile.pricing !== undefined) {
@@ -545,8 +537,8 @@ export async function fetchRegistrationFile(
   } catch {
     throw new Error('Failed to parse registration file: invalid JSON response');
   }
-  validateRegistrationFile(reg);
-  if (!verifyRegistrationId(reg)) {
+  const { signingPublicKey } = validateRegistrationFile(reg);
+  if (computeACEId(signingPublicKey) !== reg.id) {
     throw new Error('Registration ACE ID does not match signing key');
   }
 

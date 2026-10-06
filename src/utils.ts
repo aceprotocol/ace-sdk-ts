@@ -13,6 +13,11 @@ export function sanitizeForError(s: string, maxLen: number = 32): string {
   return s.slice(0, maxLen).replace(/[^\x20-\x7E]/g, '?');
 }
 
+/** Length in Unicode code points (not UTF-16 code units). */
+export function codePointLength(s: string): number {
+  return [...s].length;
+}
+
 /** Pattern matching control characters (U+0000–U+001F and U+007F). */
 export const CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f]/;
 
@@ -25,13 +30,35 @@ export function toBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/** Portable Base64 decoding (no Buffer dependency). */
-export function fromBase64(str: string): Uint8Array {
-  let binary: string;
-  try {
-    binary = atob(str);
-  } catch {
+// Padded standard Base64, the only form any ACE SDK emits or accepts. A flat
+// character class (no repeated group) so V8 matches multi-MB payloads without
+// exhausting its backtracking stack; the length check completes the grammar.
+const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
+
+/**
+ * Strict, portable Base64 decoding (no Buffer dependency).
+ *
+ * Requires padded standard Base64 (atob alone would also accept unpadded input
+ * and embedded whitespace, which the Python and Swift SDKs reject). With
+ * `maxLen`, input longer than the padded encoding of `maxLen` bytes is refused
+ * before decoding (DoS guard).
+ */
+export function fromBase64(str: string, maxLen?: number, what: string = 'Base64 value'): Uint8Array {
+  if (typeof str !== 'string') {
+    throw new Error(`${what} must be a Base64 string`);
+  }
+  if (maxLen !== undefined) {
+    const maxEncoded = Math.ceil(maxLen / 3) * 4;
+    if (str.length > maxEncoded) {
+      throw new Error(`${what} too large: ${str.length} Base64 chars exceeds max ${maxEncoded}`);
+    }
+  }
+  if (str.length % 4 !== 0 || !BASE64_PATTERN.test(str)) {
     throw new Error('Invalid Base64 input');
+  }
+  const binary = atob(str);
+  if (maxLen !== undefined && binary.length > maxLen) {
+    throw new Error(`${what} too large: ${binary.length} bytes exceeds max ${maxLen}`);
   }
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {

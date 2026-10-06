@@ -45,7 +45,7 @@ export function computeACEId(signingPublicKeyBytes: Uint8Array): string {
   return `ace:sha256:${bytesToHex(hash)}`;
 }
 
-import { constantTimeEqual, toBase64, fromBase64 } from './utils.js';
+import { toBase64, fromBase64 } from './utils.js';
 export { toBase64, fromBase64 };
 
 export interface SoftwareIdentityExport {
@@ -72,7 +72,7 @@ export class SoftwareIdentity implements ACEIdentity {
   private readonly signingPublicKey: Uint8Array;
   /** 1216-byte X-Wing public key derived from the seed. */
   private readonly encryptionPublicKey: Uint8Array;
-  private readonly signingPubUncompressed: Uint8Array | null; // cached for secp256k1
+  private readonly address: string;
   private readonly aceId: string;
 
   private constructor(
@@ -80,6 +80,9 @@ export class SoftwareIdentity implements ACEIdentity {
     signingPrivateKey: Uint8Array,
     encryptionPrivateKey: Uint8Array,
   ) {
+    if (scheme !== 'ed25519' && scheme !== 'secp256k1') {
+      throw new Error(`Unsupported signing scheme: '${String(scheme).slice(0, 32)}'`);
+    }
     validateSeed(encryptionPrivateKey);
     this.scheme = scheme;
     this.signingPrivateKey = signingPrivateKey;
@@ -88,10 +91,10 @@ export class SoftwareIdentity implements ACEIdentity {
     // Derive public keys
     if (scheme === 'ed25519') {
       this.signingPublicKey = ed25519.getPublicKey(signingPrivateKey);
-      this.signingPubUncompressed = null;
+      this.address = bs58.encode(this.signingPublicKey);
     } else {
       this.signingPublicKey = secp256k1.getPublicKey(signingPrivateKey, true); // compressed
-      this.signingPubUncompressed = secp256k1.getPublicKey(signingPrivateKey, false);
+      this.address = secp256k1Address(secp256k1.getPublicKey(signingPrivateKey, false));
     }
     this.encryptionPublicKey = kemPublicKeyFromSeed(encryptionPrivateKey);
     this.aceId = computeACEId(this.signingPublicKey);
@@ -126,42 +129,20 @@ export class SoftwareIdentity implements ACEIdentity {
       const sig = ed25519.sign(data, this.signingPrivateKey);
       return { signature: sig, scheme: 'ed25519' };
     } else {
-      // @noble/curves v2: sign() returns 64-byte Uint8Array (r||s)
+      // 'recovered' format = recovery[1] || r[32] || s[32]; ACE wire order is r || s || v.
       // extraEntropy: RFC 6979 §3.6 — randomizes nonce to harden against fault-injection attacks
-      const compact = secp256k1.sign(data, this.signingPrivateKey, { prehash: false, lowS: true, extraEntropy: true });
-      const sigObj = secp256k1.Signature.fromBytes(compact);
-
-      // Determine recovery bit by trying both values
-      let recovery = 0;
-      let found = false;
-      for (const v of [0, 1]) {
-        try {
-          const recovered = sigObj.addRecoveryBit(v).recoverPublicKey(data);
-          const recoveredBytes = recovered.toBytes(false);
-          if (constantTimeEqual(recoveredBytes, this.signingPubUncompressed!)) {
-            recovery = v;
-            found = true;
-            break;
-          }
-        } catch { /* try next v */ }
-      }
-      if (!found) {
-        throw new Error('secp256k1: failed to determine recovery bit');
-      }
-
+      const recovered = secp256k1.sign(data, this.signingPrivateKey, {
+        prehash: false, lowS: true, extraEntropy: true, format: 'recovered',
+      });
       const sigBytes = new Uint8Array(65);
-      sigBytes.set(compact, 0); // r[32] || s[32]
-      sigBytes[64] = recovery;
+      sigBytes.set(recovered.subarray(1), 0);
+      sigBytes[64] = recovered[0];
       return { signature: sigBytes, scheme: 'secp256k1' };
     }
   }
 
   getAddress(): string {
-    if (this.scheme === 'ed25519') {
-      return bs58.encode(this.signingPublicKey);
-    } else {
-      return secp256k1Address(this.signingPubUncompressed!);
-    }
+    return this.address;
   }
 
   getSigningScheme(): SigningScheme {

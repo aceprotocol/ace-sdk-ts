@@ -212,5 +212,20 @@ describe('SoftwareIdentity', () => {
       const result = fromBase64('AQID');
       expect(result).toEqual(new Uint8Array([1, 2, 3]));
     });
+
+    // atob alone accepts these; the Python and Swift SDKs reject them.
+    it.each([['unpadded', 'AQI'], ['embedded whitespace', 'AQ ID'], ['newline', 'AQID\n']])(
+      'rejects %s input', (_name, input) => {
+        expect(() => fromBase64(input)).toThrow('Invalid Base64 input');
+      },
+    );
+  });
+
+  describe('scheme validation', () => {
+    it('fromExport rejects an unknown signing scheme instead of treating it as secp256k1', async () => {
+      const exported = (await SoftwareIdentity.generate('ed25519')).exportPrivateKey();
+      expect(() => SoftwareIdentity.fromExport({ ...exported, scheme: 'Ed25519' as never }))
+        .toThrow(/Unsupported signing scheme/);
+    });
   });
 });

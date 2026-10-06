@@ -69,7 +69,7 @@ describe('Security', () => {
 
     it('a fixed earlier floor keeps entries; only capacity removes them', () => {
       // A store that has been running since before the receiver went offline.
-      const d = ReplayDetector.fromExport({ horizon: T - 7200, entries: [] }, 2);
+      const d = ReplayDetector.fromExport({ horizon: T - 7200, senderHorizons: {}, entries: [] }, 2);
       d.commit(id(1), ALICE, T - 3000, T - 7200);
       d.commit(id(2), ALICE, T - 1000, T - 7200);
       expect(d.horizon).toBe(T - 7200); // nothing removed
@@ -133,24 +133,26 @@ describe('Security', () => {
 
     it('fromExport over capacity removes the smallest timestamps and raises their sender horizon', () => {
       const entries: [string, string, number][] = [[id(1), ALICE, T - 30], [id(2), ALICE, T - 10], [id(3), ALICE, T - 20]];
-      const restored = ReplayDetector.fromExport({ horizon: T - 300, entries }, 2);
+      const restored = ReplayDetector.fromExport({ horizon: T - 300, senderHorizons: {}, entries }, 2);
       expect(restored.horizon).toBe(T - 300);
       expect(restored.export().senderHorizons).toEqual({ [ALICE]: T - 30 });
       expect(restored.export().entries).toHaveLength(2);
     });
 
     it('fromExport rejects malformed state', () => {
-      expect(() => ReplayDetector.fromExport({ horizon: -1, entries: [] })).toThrow(/invalid replay state/);
+      expect(() => ReplayDetector.fromExport({ horizon: -1, senderHorizons: {}, entries: [] })).toThrow(/invalid replay state/);
       expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: { '': T }, entries: [] })).toThrow(/invalid replay state/);
       expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: { [ALICE]: 1.5 }, entries: [] })).toThrow(/invalid replay state/);
       expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: { [ALICE]: -1 }, entries: [] })).toThrow(/invalid replay state/);
       expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: [] as any, entries: [] })).toThrow(/invalid replay state/);
-      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [['msg-1', ALICE, T + 1]] })).toThrow(/invalid messageId/);
-      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), '', T + 1]] })).toThrow(/invalid entry/);
-      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), T + 1] as any] })).toThrow(/invalid entry/);
-      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), ALICE, T]] })).toThrow(/invalid entry/);
+      // senderHorizons is required (D10): no default for a missing field.
+      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [] } as any)).toThrow(/invalid replay state/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: {}, entries: [['msg-1', ALICE, T + 1]] })).toThrow(/invalid messageId/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: {}, entries: [[id(1), '', T + 1]] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: {}, entries: [[id(1), T + 1] as any] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: {}, entries: [[id(1), ALICE, T]] })).toThrow(/invalid entry/);
       expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: { [ALICE]: T + 5 }, entries: [[id(1), ALICE, T + 5]] })).toThrow(/invalid entry/);
-      expect(() => ReplayDetector.fromExport({ horizon: T, entries: [[id(1), ALICE, T + 1], [id(1), ALICE, T + 2]] })).toThrow(/invalid entry/);
+      expect(() => ReplayDetector.fromExport({ horizon: T, senderHorizons: {}, entries: [[id(1), ALICE, T + 1], [id(1), ALICE, T + 2]] })).toThrow(/invalid entry/);
     });
 
     it('rejects a non-positive capacity', () => {

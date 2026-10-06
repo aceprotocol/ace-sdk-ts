@@ -154,7 +154,7 @@ describe('Integration: Full ACE Protocol Flow', () => {
       recipientPubKey: seller.getEncryptionPublicKey(),
       recipientACEId: seller.getACEId(),
       type: 'receipt',
-      body: { invoiceId: invoice.messageId, amount: '5', currency: 'USD', settlementMethod: 'crypto/instant', proof: { txHash: '0xabc' } },
+      body: { referenceId: invoice.messageId, amount: '5', currency: 'USD', settlementMethod: 'crypto/instant', proof: { txHash: '0xabc' } },
       threadId,
       stateMachine: buyerSM,
     });

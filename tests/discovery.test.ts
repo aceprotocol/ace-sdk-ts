@@ -43,6 +43,18 @@ describe('Discovery', () => {
       expect(() => validateRegistrationFile(validReg)).not.toThrow();
     });
 
+    it('returns the decoded signing and X-Wing encryption keys', async () => {
+      const id = await SoftwareIdentity.generate('secp256k1');
+      const keys = validateRegistrationFile(id.toRegistrationFile({ name: 'A', endpoint: 'https://a.example.com' }));
+      expect(keys.signingPublicKey).toEqual(id.getSigningPublicKey());
+      expect(keys.encryptionPublicKey).toEqual(id.getEncryptionPublicKey());
+    });
+
+    it('rejects an unknown signing.scheme', () => {
+      const bad = { ...validReg, signing: { ...validReg.signing, scheme: 'rsa' as never } };
+      expect(() => validateRegistrationFile(bad)).toThrow(/Unsupported signing.scheme/);
+    });
+
     it('rejects ed25519 address that does not decode to 32 bytes', () => {
       const bad: RegistrationFile = {
         ...validReg,
@@ -72,12 +84,25 @@ describe('Discovery', () => {
       expect(() => validateRegistrationFile(bad)).toThrow(/endpoint/);
     });
 
+    it('requires only a non-empty name (no length or control-character rule)', () => {
+      expect(() => validateRegistrationFile({ ...validReg, name: 'A'.repeat(200) })).not.toThrow();
+      expect(() => validateRegistrationFile({ ...validReg, name: 'line1\nline2' })).not.toThrow();
+      expect(() => validateRegistrationFile({ ...validReg, name: '' })).toThrow(/name/);
+    });
+
+    it('requires an absolute https endpoint with a host (scheme case-insensitive)', () => {
+      expect(() => validateRegistrationFile({ ...validReg, endpoint: 'HTTPS://test.example.com/ace' })).not.toThrow();
+      for (const endpoint of ['http://test.example.com', 'https://', '/ace', 'not a url']) {
+        expect(() => validateRegistrationFile({ ...validReg, endpoint })).toThrow(/endpoint/);
+      }
+    });
+
     it.each([1215, 1217])('rejects encryptionPublicKey that decodes to %i bytes (not an X-Wing key)', (len) => {
       const bad: RegistrationFile = {
         ...validReg,
         signing: { ...validReg.signing, encryptionPublicKey: toBase64(new Uint8Array(len)) },
       };
-      expect(() => validateRegistrationFile(bad)).toThrow(new RegExp(`X-Wing public key must be exactly 1216 bytes, got ${len}`));
+      expect(() => validateRegistrationFile(bad)).toThrow(new RegExp(`X-Wing public key (must be exactly 1216 bytes, got|too large:) ${len}`));
     });
 
     it('rejects an oversized encryptionPublicKey by Base64 length before decoding', () => {
@@ -85,7 +110,7 @@ describe('Discovery', () => {
         ...validReg,
         signing: { ...validReg.signing, encryptionPublicKey: 'A'.repeat(1628) },
       };
-      expect(() => validateRegistrationFile(bad)).toThrow(/Base64 length 1628 exceeds 1624/);
+      expect(() => validateRegistrationFile(bad)).toThrow(/1628 Base64 chars exceeds max 1624/);
     });
 
     it('accepts a real SoftwareIdentity registration (1216-byte key)', async () => {

@@ -47,15 +47,18 @@ const TERMINAL_STATES: ReadonlySet<ThreadState> = new Set([
 
 // === Validation ===
 
-import { sanitizeForError, CONTROL_CHAR_PATTERN } from './utils.js';
+import { sanitizeForError, codePointLength, CONTROL_CHAR_PATTERN } from './utils.js';
 
 const MAX_THREAD_ID_LENGTH = 256;
 
 export function validateThreadId(threadId: string): void {
+  if (typeof threadId !== 'string') {
+    throw new Error('threadId must be a string');
+  }
   if (threadId.length === 0) {
     throw new Error('threadId must not be empty');
   }
-  if (threadId.length > MAX_THREAD_ID_LENGTH) {
+  if (codePointLength(threadId) > MAX_THREAD_ID_LENGTH) {
     throw new Error(`threadId exceeds max length of ${MAX_THREAD_ID_LENGTH} characters`);
   }
   if (CONTROL_CHAR_PATTERN.test(threadId)) {
@@ -94,10 +97,31 @@ export interface ThreadSnapshot {
   history: ReadonlyArray<{ type: MessageType; messageId: string; timestamp: number }>;
 }
 
+export interface ThreadStateMachineOptions {
+  /** Maximum number of tracked threads (default 100,000). */
+  maxThreads?: number;
+  /** Maximum history entries per thread (default 1,000). */
+  maxHistoryPerThread?: number;
+}
+
+/**
+ * Resource limits are enforced by rejecting, never by evicting: forgetting a
+ * thread would let a finished (terminal) deal be reopened from `idle`.
+ */
 export class ThreadStateMachine {
   private threads: Map<string, ThreadEntry>;
+  readonly maxThreads: number;
+  readonly maxHistoryPerThread: number;
 
-  constructor() {
+  constructor(opts: ThreadStateMachineOptions = {}) {
+    this.maxThreads = opts.maxThreads ?? 100_000;
+    this.maxHistoryPerThread = opts.maxHistoryPerThread ?? 1_000;
+    if (!Number.isSafeInteger(this.maxThreads) || this.maxThreads < 1) {
+      throw new Error('maxThreads must be a positive integer');
+    }
+    if (!Number.isSafeInteger(this.maxHistoryPerThread) || this.maxHistoryPerThread < 1) {
+      throw new Error('maxHistoryPerThread must be a positive integer');
+    }
     this.threads = new Map();
   }
 
@@ -113,7 +137,7 @@ export class ThreadStateMachine {
    * Returns the new state after transition.
    *
    * @throws InvalidTransitionError if the transition is not allowed
-   * @throws Error if threadId is invalid
+   * @throws Error if threadId is invalid or a resource limit is reached
    */
   transition(
     conversationId: string,
@@ -142,6 +166,7 @@ export class ThreadStateMachine {
     if (nextState === undefined) {
       throw new InvalidTransitionError(threadId, currentState, messageType);
     }
+    this.checkLimits(thread);
 
     if (!thread) {
       this.threads.set(key, {
@@ -172,14 +197,32 @@ export class ThreadStateMachine {
       return false;
     }
 
-    const currentState = this.getState(conversationId, threadId);
+    const thread = this.threads.get(this.compositeKey(conversationId, threadId));
+    const currentState: ThreadState = thread?.state ?? 'idle';
 
     if (TERMINAL_STATES.has(currentState)) {
       return false;
     }
 
     const key: TransitionKey = `${currentState}:${messageType}`;
-    return TRANSITIONS.has(key);
+    if (!TRANSITIONS.has(key)) {
+      return false;
+    }
+    try {
+      this.checkLimits(thread);
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  private checkLimits(thread: ThreadEntry | undefined): void {
+    if (!thread && this.threads.size >= this.maxThreads) {
+      throw new Error(`Thread limit reached (${this.maxThreads})`);
+    }
+    if (thread && thread.history.length >= this.maxHistoryPerThread) {
+      throw new Error(`Thread history exceeds maximum of ${this.maxHistoryPerThread} entries`);
+    }
   }
 
   getState(conversationId: string, threadId: string): ThreadState {
@@ -192,7 +235,7 @@ export class ThreadStateMachine {
       conversationId,
       threadId,
       state: thread?.state ?? 'idle',
-      history: thread?.history ?? [],
+      history: thread ? copyHistory(thread.history) : [],
     };
   }
 
@@ -230,7 +273,7 @@ export class ThreadStateMachine {
         conversationId: thread.conversationId,
         threadId: thread.threadId,
         state: thread.state,
-        history: thread.history,
+        history: copyHistory(thread.history),
       });
     }
     return snapshots;
@@ -243,48 +286,40 @@ export class ThreadStateMachine {
     ...Array.from(TRANSITIONS.values()),
   ]);
 
-  private static readonly MAX_IMPORT_HISTORY = 1000;
-  private static readonly MAX_IMPORT_THREADS = 100_000;
-
-  static fromExport(snapshots: ThreadSnapshot[]): ThreadStateMachine {
-    if (snapshots.length > ThreadStateMachine.MAX_IMPORT_THREADS) {
-      throw new Error(
-        `fromExport: too many threads (${snapshots.length}), max is ${ThreadStateMachine.MAX_IMPORT_THREADS}`,
-      );
+  static fromExport(snapshots: ThreadSnapshot[], opts: ThreadStateMachineOptions = {}): ThreadStateMachine {
+    const sm = new ThreadStateMachine(opts);
+    if (!Array.isArray(snapshots) || snapshots.length > sm.maxThreads) {
+      throw new Error(`fromExport: too many threads, max is ${sm.maxThreads}`);
     }
-    const sm = new ThreadStateMachine();
     for (const snap of snapshots) {
       if (!ThreadStateMachine.VALID_STATES.has(snap.state)) {
         throw new Error(`fromExport: invalid state '${String(snap.state).slice(0, 32)}'`);
       }
-      if (!Array.isArray(snap.history)) {
-        throw new Error('fromExport: history must be an array');
-      }
-      if (snap.history.length > ThreadStateMachine.MAX_IMPORT_HISTORY) {
-        throw new Error(`fromExport: history too large (${snap.history.length})`);
-      }
-
-      // Validate conversationId and threadId format
-      if (!snap.conversationId || snap.conversationId.length > 256) {
+      validateThreadId(snap.threadId);
+      if (typeof snap.conversationId !== 'string' || snap.conversationId === ''
+        || codePointLength(snap.conversationId) > 256) {
         throw new Error('fromExport: invalid conversationId');
       }
-      if (snap.history.length > 0) {
-        validateThreadId(snap.threadId);
+      if (!Array.isArray(snap.history) || snap.history.length === 0) {
+        throw new Error('fromExport: history must be a non-empty array');
+      }
+      if (snap.history.length > sm.maxHistoryPerThread) {
+        throw new Error(`fromExport: history too large (${snap.history.length})`);
       }
 
       // Replay the history to verify it represents a valid transition sequence
       let replayState: ThreadState = 'idle';
       for (const entry of snap.history) {
-        if (typeof entry.type !== 'string' || typeof entry.messageId !== 'string') {
+        if (typeof entry?.messageId !== 'string') {
           throw new Error('fromExport: invalid history entry');
         }
-        if (typeof entry.timestamp !== 'number' || !Number.isFinite(entry.timestamp)) {
+        if (!Number.isSafeInteger(entry.timestamp) || entry.timestamp < 0) {
           throw new Error('fromExport: invalid history entry timestamp');
         }
-        if (!ECONOMIC_TYPES.has(entry.type as MessageType)) {
+        if (!ECONOMIC_TYPES.has(entry.type)) {
           throw new Error(`fromExport: unknown message type '${String(entry.type).slice(0, 32)}' in thread history`);
         }
-        const transitionKey: TransitionKey = `${replayState}:${entry.type}` as TransitionKey;
+        const transitionKey = `${replayState}:${entry.type}` as TransitionKey;
         const nextState = TRANSITIONS.get(transitionKey);
         if (nextState === undefined) {
           throw new Error(`fromExport: invalid transition '${entry.type}' from state '${replayState}'`);
@@ -300,13 +335,20 @@ export class ThreadStateMachine {
       }
 
       const key = sm.compositeKey(snap.conversationId, snap.threadId);
+      if (sm.threads.has(key)) {
+        throw new Error('fromExport: duplicate thread');
+      }
       sm.threads.set(key, {
         conversationId: snap.conversationId,
         threadId: snap.threadId,
         state: snap.state,
-        history: [...snap.history],
+        history: copyHistory(snap.history),
       });
     }
     return sm;
   }
+}
+
+function copyHistory(history: ThreadSnapshot['history']): ThreadEntry['history'] {
+  return history.map(({ type, messageId, timestamp }) => ({ type, messageId, timestamp }));
 }

@@ -33,7 +33,7 @@ export interface ReplayDetectorExport {
   /** Messages with `timestamp <= horizon` are rejected. */
   horizon: number;
   /** Messages from `sender` with `timestamp <= senderHorizons[sender]` are rejected. */
-  senderHorizons?: Record<string, number>;
+  senderHorizons: Record<string, number>;
   /** `[messageId, sender ACE ID, signed envelope timestamp]` triples. */
   entries: [string, string, number][];
 }
@@ -100,7 +100,7 @@ export class ReplayDetector {
 
   static fromExport(data: ReplayDetectorExport, capacity: number = 100_000): ReplayDetector {
     const detector = new ReplayDetector(capacity);
-    const senderHorizons: unknown = data?.senderHorizons ?? {};
+    const senderHorizons: unknown = data?.senderHorizons;
     if (!Number.isSafeInteger(data?.horizon) || data.horizon < 0 || !Array.isArray(data.entries)
       || typeof senderHorizons !== 'object' || senderHorizons === null || Array.isArray(senderHorizons)) {
       throw new Error('fromExport: invalid replay state');

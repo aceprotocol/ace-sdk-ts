@@ -1,19 +1,14 @@
 import type {
   ACEIdentity, ACEMessage, MessageType, SigningScheme, RegistrationFile,
 } from './types.js';
-import { isEconomicType } from './types.js';
+import { isEconomicType, isMessageType } from './types.js';
 import { toBase64, fromBase64, computeACEId } from './identity.js';
 import { computeConversationId, encrypt, decodeKemCiphertext, MAX_PAYLOAD_SIZE } from './encryption.js';
 import { buildSignData, encodePayload, verifySignature, encodeSignature, decodeSignature } from './signing.js';
 import { checkTimestampFreshness, validateMessageId, ReplayDetector } from './security.js';
-import {
-  validateRegistrationFile,
-  verifyRegistrationId,
-  getRegistrationSigningPublicKey,
-  getRegistrationEncryptionPublicKey,
-  type VerifiedPeer,
-} from './discovery.js';
-import { ThreadStateMachine } from './state-machine.js';
+import { validateRegistrationFile, type VerifiedPeer } from './discovery.js';
+import { ThreadStateMachine, validateThreadId } from './state-machine.js';
+import { sanitizeForError } from './utils.js';
 
 const _encoder = new TextEncoder();
 const _decoder = new TextDecoder();
@@ -39,23 +34,19 @@ function assertMaxDepth(value: unknown, maxDepth: number): void {
   }
 }
 
+const CONVERSATION_ID_PATTERN = /^[0-9a-f]{64}$/;
+
+function assertMessageType(type: unknown): void {
+  if (!isMessageType(type)) {
+    throw new Error(`Unknown message type: '${sanitizeForError(String(type), 32)}'`);
+  }
+}
+
 /** Shared pre-check: economic messages must carry a threadId. */
 function requireThreadIdForEconomic(type: MessageType, threadId: string | undefined): void {
   if (isEconomicType(type) && !threadId) {
     throw new Error(`Economic message type '${type}' requires a threadId`);
   }
-}
-
-function estimateBase64DecodedLength(encoded: string): number {
-  const length = encoded.length;
-  const fullBlocks = Math.floor(length / 4);
-  let decodedLength = fullBlocks * 3;
-  if (encoded.endsWith('==')) {
-    decodedLength -= 2;
-  } else if (encoded.endsWith('=')) {
-    decodedLength -= 1;
-  }
-  return decodedLength;
 }
 
 function normalizeThreadId(threadId: string | undefined): string {
@@ -85,10 +76,7 @@ function buildSignedMessagePayload(
 
 type BodyType = Record<string, unknown>;
 
-const MAX_SHORT_STRING = 4096;
-const MAX_LONG_STRING = 65536;
-
-function requireString(body: BodyType, field: string, typeName: string, maxLen: number = MAX_SHORT_STRING): string {
+function requireString(body: BodyType, field: string, typeName: string): string {
   if (!Object.hasOwn(body, field)) {
     throw new Error(`${typeName} body requires '${field}' field`);
   }
@@ -98,9 +86,6 @@ function requireString(body: BodyType, field: string, typeName: string, maxLen: 
   }
   if (typeof value !== 'string') {
     throw new Error(`${typeName}.${field} must be a string`);
-  }
-  if (value.length > maxLen) {
-    throw new Error(`${typeName}.${field} exceeds max length of ${maxLen} characters`);
   }
   return value;
 }
@@ -116,14 +101,11 @@ function requireObject(body: BodyType, field: string, typeName: string): void {
   validateObject(value, field, typeName);
 }
 
-function validateOptionalString(body: BodyType, field: string, typeName: string, maxLen: number = MAX_SHORT_STRING): void {
+function validateOptionalString(body: BodyType, field: string, typeName: string): void {
   const value = body[field];
   if (value === undefined || value === null) return;
   if (typeof value !== 'string') {
     throw new Error(`${typeName}.${field} must be a string`);
-  }
-  if (value.length > maxLen) {
-    throw new Error(`${typeName}.${field} exceeds max length of ${maxLen} characters`);
   }
 }
 
@@ -179,7 +161,7 @@ export function validateBody(type: MessageType, body: BodyType): void {
       validateOptionalObject(body, 'settlementDetails', 'invoice');
       break;
     case 'receipt':
-      requireString(body, 'invoiceId', 'receipt');
+      requireString(body, 'referenceId', 'receipt');
       requireString(body, 'amount', 'receipt');
       requireString(body, 'currency', 'receipt');
       requireString(body, 'settlementMethod', 'receipt');
@@ -187,12 +169,12 @@ export function validateBody(type: MessageType, body: BodyType): void {
       break;
     case 'deliver': {
       const deliverType = requireString(body, 'type', 'deliver');
-      validateOptionalString(body, 'content', 'deliver', MAX_LONG_STRING);
+      validateOptionalString(body, 'content', 'deliver');
       validateOptionalString(body, 'contentType', 'deliver');
       validateOptionalString(body, 'uri', 'deliver');
       validateOptionalObject(body, 'metadata', 'deliver');
       if (deliverType === 'inline') {
-        requireString(body, 'content', 'deliver (inline)', MAX_LONG_STRING);
+        requireString(body, 'content', 'deliver (inline)');
       } else if (deliverType === 'reference') {
         requireString(body, 'uri', 'deliver (reference)');
       } else {
@@ -203,16 +185,16 @@ export function validateBody(type: MessageType, body: BodyType): void {
     }
     case 'confirm':
       requireString(body, 'deliverId', 'confirm');
-      validateOptionalString(body, 'message', 'confirm', MAX_LONG_STRING);
+      validateOptionalString(body, 'message', 'confirm');
       break;
     case 'info':
-      requireString(body, 'message', 'info', MAX_LONG_STRING);
+      requireString(body, 'message', 'info');
       break;
     case 'text':
-      requireString(body, 'message', 'text', MAX_LONG_STRING);
+      requireString(body, 'message', 'text');
       break;
     default:
-      // Unknown types: no validation (forward compatibility)
+      assertMessageType(type);
       break;
   }
 }
@@ -250,11 +232,16 @@ function validateThreadReferences(
         throw new Error('invoice.offerId must reference an offer in the same thread');
       }
       break;
-    case 'receipt':
-      if (!threadContainsMessage(stateMachine, conversationId, threadId, 'invoice', requireString(body, 'invoiceId', 'receipt'))) {
-        throw new Error('receipt.invoiceId must reference an invoice in the same thread');
+    case 'receipt': {
+      // Pre-paid path (accepted → paid): the receipt references the accept.
+      const referenced = stateMachine.getState(conversationId, threadId) === 'accepted' ? 'accept' : 'invoice';
+      if (!threadContainsMessage(stateMachine, conversationId, threadId, referenced, requireString(body, 'referenceId', 'receipt'))) {
+        throw new Error(
+          'receipt.referenceId must reference the invoice (or, when pre-paid, the accept) in the same thread',
+        );
       }
       break;
+    }
     case 'confirm':
       if (!threadContainsMessage(stateMachine, conversationId, threadId, 'deliver', requireString(body, 'deliverId', 'confirm'))) {
         throw new Error('confirm.deliverId must reference a deliver message in the same thread');
@@ -281,6 +268,10 @@ export interface CreateMessageOptions {
 export async function createMessage(
   opts: CreateMessageOptions,
 ): Promise<ACEMessage> {
+  assertMessageType(opts.type);
+  if (opts.threadId !== undefined) {
+    validateThreadId(opts.threadId);
+  }
   requireThreadIdForEconomic(opts.type, opts.threadId);
 
   // 1. Validate body schema
@@ -401,17 +392,18 @@ export async function parseMessage(
   if (!msg.messageId || !msg.from || !msg.conversationId || !msg.type) {
     throw new Error('Missing required envelope fields');
   }
-  if (msg.conversationId.length > 256) {
-    throw new Error('conversationId exceeds max length of 256 characters');
+  assertMessageType(msg.type);
+  if (typeof msg.conversationId !== 'string' || !CONVERSATION_ID_PATTERN.test(msg.conversationId)) {
+    throw new Error('Invalid conversationId: expected 64 lowercase hex characters');
   }
   validateMessageId(msg.messageId);
+  if (msg.threadId !== undefined) {
+    validateThreadId(msg.threadId);
+  }
 
   // Validate encryption and signature envelopes exist
   if (!msg.encryption?.payload || !msg.encryption?.kemCiphertext) {
     throw new Error('Missing required encryption fields');
-  }
-  if (typeof msg.encryption.payload !== 'string') {
-    throw new Error('encryption.payload must be a Base64 string');
   }
   if (!msg.signature?.scheme || !msg.signature?.value) {
     throw new Error('Missing required signature fields');
@@ -449,13 +441,7 @@ export async function parseMessage(
   }
 
   // 4. Verify signature BEFORE decryption (pipeline step 4).
-  const estimatedPayloadBytes = estimateBase64DecodedLength(msg.encryption.payload);
-  if (estimatedPayloadBytes > MAX_PAYLOAD_SIZE) {
-    throw new Error(
-      `Payload too large: estimated decoded size ${estimatedPayloadBytes} bytes exceeds max ${MAX_PAYLOAD_SIZE}`,
-    );
-  }
-  const payloadBytes = fromBase64(msg.encryption.payload);
+  const payloadBytes = fromBase64(msg.encryption.payload, MAX_PAYLOAD_SIZE, 'Payload');
   // Schema check: the X-Wing ciphertext has a fixed size. Rejected before any
   // signature verification or decapsulation runs.
   const kemCiphertext = decodeKemCiphertext(msg.encryption.kemCiphertext);
@@ -538,23 +524,20 @@ export async function parseMessageFromRegistration(
   senderRegistration: RegistrationFile,
   opts: ParseMessageFromRegistrationOptions,
 ): Promise<ParsedMessage> {
-  validateRegistrationFile(senderRegistration);
-  if (!verifyRegistrationId(senderRegistration)) {
+  // validateRegistrationFile already checks the secp256k1 address against the
+  // signing key, so the only remaining verifyRegistrationId check is the id.
+  const keys = validateRegistrationFile(senderRegistration);
+  if (computeACEId(keys.signingPublicKey) !== senderRegistration.id) {
     throw new Error('Sender registration file failed cryptographic verification');
   }
 
-  return parseMessage(
-    msg,
-    receiver,
-    getRegistrationSigningPublicKey(senderRegistration),
-    {
-      oldestTimestamp: opts.oldestTimestamp,
-      stateMachine: opts.stateMachine,
-      expectedScheme: senderRegistration.signing.scheme,
-      replayDetector: opts.replayDetector,
-      senderEncryptionPubKey: getRegistrationEncryptionPublicKey(senderRegistration),
-    },
-  );
+  return parseMessage(msg, receiver, keys.signingPublicKey, {
+    oldestTimestamp: opts.oldestTimestamp,
+    stateMachine: opts.stateMachine,
+    expectedScheme: senderRegistration.signing.scheme,
+    replayDetector: opts.replayDetector,
+    senderEncryptionPubKey: keys.encryptionPublicKey,
+  });
 }
 
 /**
