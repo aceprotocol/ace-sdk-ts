@@ -53,3 +53,4 @@ export { createMessage, parseMessage, parseMessageFromRegistration, parseMessage
 export { validateRegistrationFile, validateACEId, verifyRegistrationId, fetchRegistrationFile, getRegistrationSigningPublicKey, getRegistrationEncryptionPublicKey, validateProfile, verifyEncryptionKeyBinding, verifyPeerResponse, type RegistrationKeys, type FetchRegistrationFileOptions, type RelayPeerResponse, type VerifiedPeer } from './discovery.js';
 export { checkTimestampFreshness, validateMessageId, ReplayDetector, type ReplayDetectorExport } from './security.js';
 export { ThreadStateMachine, InvalidTransitionError, validateThreadId, type ThreadState, type ThreadSnapshot, type ThreadStateMachineOptions } from './state-machine.js';
+export { createRegistrationRequest, buildRegistrationPayload, type RegistrationRequest } from './registration.js';

@@ -42,6 +42,24 @@ describe('Security', () => {
     beforeEach(() => { vi.useFakeTimers({ now: T * 1000 }); });
     afterEach(() => { vi.useRealTimers(); });
 
+    it('isolates duplicate IDs by authenticated sender, including after restart', () => {
+      const d = new ReplayDetector();
+      expect(d.commit(id(1), MALLORY, T)).toBe(true);
+      expect(d.commit(id(1), ALICE, T)).toBe(true);
+      const restored = ReplayDetector.fromExport(d.export());
+      expect(restored.commit(id(1), ALICE, T)).toBe(false);
+      expect(restored.commit(id(1), MALLORY, T)).toBe(false);
+    });
+
+    it('survives restart after same-second capacity eviction', () => {
+      const d = new ReplayDetector(2);
+      for (let n = 1; n <= 3; n++) expect(d.commit(id(n), ALICE, T)).toBe(true);
+      const restored = ReplayDetector.fromExport(d.export(), 2);
+      for (let n = 1; n <= 3; n++) expect(restored.accepts(id(n), ALICE, T)).toBe(false);
+      expect(restored.commit(id(1), MALLORY, T)).toBe(true);
+      expect(ReplayDetector.fromExport(restored.export(), 2).export()).toEqual(restored.export());
+    });
+
     it('starts with horizon = now - 5 min', () => {
       expect(new ReplayDetector().horizon).toBe(T - 300);
     });

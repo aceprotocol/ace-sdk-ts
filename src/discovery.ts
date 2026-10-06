@@ -165,6 +165,7 @@ export interface RelayPeerResponse {
 
 /** A peer's public keys AFTER the identity + encryption-key binding are verified. */
 export interface VerifiedPeer {
+  registeredAt: number;
   aceId: string;
   scheme: SigningScheme;
   signingPublicKey: Uint8Array;
@@ -253,7 +254,7 @@ export function verifyPeerResponse(data: RelayPeerResponse): VerifiedPeer {
       "this identity's signing key (possible key substitution / relay MITM).",
     );
   }
-  return { aceId, scheme, ...keys };
+  return { aceId, scheme, registeredAt, ...keys };
 }
 
 const TAG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;

@@ -30,7 +30,7 @@ function encodeLengthPrefixed(field: string): Uint8Array[] {
 
 /** Validate and encode a timestamp as 8-byte big-endian */
 function encodeTimestamp(ts: number): Uint8Array {
-  if (ts < 0 || ts > Number.MAX_SAFE_INTEGER || !Number.isFinite(ts)) {
+  if (ts < 0 || ts > Number.MAX_SAFE_INTEGER || !Number.isSafeInteger(ts)) {
     throw new Error(
       `Invalid timestamp: must be a finite number in [0, ${Number.MAX_SAFE_INTEGER}], got ${ts}`,
     );

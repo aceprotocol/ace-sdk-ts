@@ -1,3 +1,5 @@
+const replayKey = (id: string, sender: string): string => JSON.stringify([sender, id]);
+
 const MAX_DRIFT_SECONDS = 300; // 5 minutes
 const MESSAGE_ID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -74,7 +76,7 @@ export class ReplayDetector {
   accepts(messageId: string, sender: string, timestamp: number): boolean {
     return timestamp > this._horizon
       && timestamp > (this.senderHorizons.get(sender) ?? this._horizon)
-      && !this.ids.has(messageId);
+      && !this.ids.has(replayKey(messageId, sender));
   }
 
   /**
@@ -84,13 +86,22 @@ export class ReplayDetector {
    */
   commit(messageId: string, sender: string, timestamp: number, floor: number = Math.floor(Date.now() / 1000) - MAX_DRIFT_SECONDS): boolean {
     if (!this.accepts(messageId, sender, timestamp)) return false;
-    this.ids.add(messageId);
+    this.ids.add(replayKey(messageId, sender));
     this.push([timestamp, messageId, sender]);
     this.evict(floor);
     return true;
   }
 
   export(): ReplayDetectorExport {
+    // Horizon-covered heap entries may remain until serialization. Remove them
+    // here (already O(n)) so every exported entry is valid on restoration.
+    const live = this.heap.filter(([ts, , sender]) => ts > this._horizon && ts > (this.senderHorizons.get(sender) ?? this._horizon));
+    this.heap.length = 0;
+    this.ids.clear();
+    for (const entry of live) {
+      this.push(entry);
+      this.ids.add(replayKey(entry[1], entry[2]));
+    }
     return {
       horizon: this._horizon,
       senderHorizons: Object.fromEntries(this.senderHorizons),
@@ -121,7 +132,7 @@ export class ReplayDetector {
         || !detector.accepts(id, sender, ts)) {
         throw new Error('fromExport: invalid entry');
       }
-      detector.ids.add(id);
+      detector.ids.add(replayKey(id, sender));
       detector.push([ts, id, sender]);
     }
     detector.evict(0);
@@ -134,13 +145,13 @@ export class ReplayDetector {
    */
   private evict(floor: number): void {
     while (this.heap.length > 0 && this.heap[0][0] < floor) {
-      const [ts, id] = this.pop();
-      this.ids.delete(id);
+      const [ts, id, sender] = this.pop();
+      this.ids.delete(replayKey(id, sender));
       this._horizon = Math.max(this._horizon, ts);
     }
     while (this.heap.length > this.capacity) {
       const [ts, id, sender] = this.pop();
-      this.ids.delete(id);
+      this.ids.delete(replayKey(id, sender));
       this.senderHorizons.set(sender, Math.max(this.senderHorizons.get(sender) ?? ts, ts));
     }
     this.compactSenderHorizons();
