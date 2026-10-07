@@ -25,15 +25,19 @@ export interface WebhookNotificationInput {
 
 /** `sha256=<hex HMAC-SHA256(secret, decimal(timestamp) || "." || body)>`. */
 export function signWebhookNotification(secret: string, timestamp: number, body: Uint8Array | string): string {
+  if (typeof secret !== 'string') throw new ACEError('invalid_argument', 'secret must be a string');
   if (wireInt(timestamp) === null) throw new ACEError('invalid_argument', 'timestamp must be a wire integer');
   const raw = typeof body === 'string' ? utf8(body) : body;
   return 'sha256=' + createHmac('sha256', secret).update(`${decimal(timestamp)}.`).update(raw).digest('hex');
 }
 
 /**
- * Check order: malformed timestamp → `invalid_argument`; malformed signature →
- * `invalid_signature`; freshness → `stale_timestamp`; HMAC (constant time) →
- * `invalid_signature`; body shape → `invalid_argument`.
+ * Check order: `secret`/`timestamp`/`signature` not strings → `invalid_argument`; malformed
+ * timestamp (not canonical decimal, or above 2^53−1) → `invalid_argument`; malformed signature
+ * (not `sha256=` + 64 lowercase hex) → `invalid_signature`; `windowSeconds` not a non-negative
+ * safe integer → `invalid_argument`; freshness (`|now − ts| > windowSeconds`) →
+ * `stale_timestamp`; HMAC (constant time) → `invalid_signature`; body not UTF-8 JSON of shape
+ * `{event: "message", aceId, streamId}` → `invalid_argument`.
  */
 export function verifyWebhookNotification(o: WebhookNotificationInput): WebhookNotification {
   if (typeof o !== 'object' || o === null || typeof o.secret !== 'string' || typeof o.timestamp !== 'string' || typeof o.signature !== 'string') {

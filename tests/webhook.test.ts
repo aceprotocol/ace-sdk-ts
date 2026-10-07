@@ -61,6 +61,39 @@ describe('verifyWebhookNotification', () => {
   });
 });
 
+describe('verifyWebhookNotification edge cases', () => {
+  const ok = { secret: SECRET, timestamp: String(TS), signature: sig(), body: BODY, clock: () => TS };
+  it.each([NaN, -1, 2 ** 53, 1.5, Infinity])('rejects windowSeconds %s', (w) => {
+    expectCode(() => verifyWebhookNotification({ ...ok, windowSeconds: w }), 'invalid_argument');
+  });
+  it.each([0, 2 ** 53 - 1])('accepts windowSeconds %s', (w) => {
+    expect(verifyWebhookNotification({ ...ok, windowSeconds: w }).aceId).toBe(ACE);
+  });
+  it('freshness boundary, both sides', () => {
+    const w = 300;
+    expect(verifyWebhookNotification({ ...ok, windowSeconds: w, clock: () => TS + w }).aceId).toBe(ACE);
+    expectCode(() => verifyWebhookNotification({ ...ok, windowSeconds: w, clock: () => TS + w + 1 }), 'stale_timestamp');
+    expect(verifyWebhookNotification({ ...ok, windowSeconds: w, clock: () => TS - w }).aceId).toBe(ACE);
+    expectCode(() => verifyWebhookNotification({ ...ok, windowSeconds: w, clock: () => TS - w - 1 }), 'stale_timestamp');
+  });
+  it('invalid UTF-8 body that is correctly signed → invalid_argument', () => {
+    const body = new Uint8Array([0xff, 0xfe]);
+    const signature = signWebhookNotification(SECRET, TS, body);
+    expectCode(() => verifyWebhookNotification({ ...ok, body, signature }), 'invalid_argument');
+  });
+  it('signWebhookNotification rejects a non-string secret', () => {
+    for (const s of [undefined, null, 5, new Uint8Array(16)]) {
+      expectCode(() => signWebhookNotification(s as never, TS, BODY), 'invalid_argument');
+    }
+  });
+  it('combined check order', () => {
+    const badSig = sig({ secret: 'wrong-secret-wrong-secret' });
+    expectCode(() => verifyWebhookNotification({ ...ok, timestamp: 'nope', signature: badSig }), 'invalid_argument');
+    expectCode(() => verifyWebhookNotification({ ...ok, signature: 'nope', clock: () => TS + 10_000 }), 'invalid_signature');
+    expectCode(() => verifyWebhookNotification({ ...ok, signature: badSig, clock: () => TS + 10_000 }), 'stale_timestamp');
+  });
+});
+
 describe('RelayAuthRequest webhook over headers', () => {
   it('a PUT signature does not verify as GET', async () => {
     const id = await SoftwareIdentity.generate('ed25519');

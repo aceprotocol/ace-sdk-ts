@@ -169,8 +169,9 @@ export class FakeRelay {
         }
         case 'GET /v1/intents': return this.#reply(res, 200, { intents: this.intents, cursor: null });
         case 'PUT /v1/webhook': {
-          const url = String(body?.url ?? '');
-          const secret = String(body?.secret ?? '');
+          if (typeof body?.url !== 'string' || typeof body?.secret !== 'string') return this.#error(res, 400, 'invalid_argument');
+          const url = body.url;
+          const secret = body.secret;
           const id = this.#auth(req, { action: 'webhook', method: 'PUT', url, secret });
           this.webhooks.set(id, { url, secret, failures: 0, updatedAt: this.clock() });
           return this.#reply(res, 200, { ok: true });

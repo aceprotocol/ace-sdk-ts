@@ -165,6 +165,14 @@ describe('RelayClient', () => {
     expect(e.relayCode).toBe('invalid_webhook');
   });
 
+  it('fake relay PUT /v1/webhook rejects non-string url/secret with 400 invalid_argument', async () => {
+    for (const body of [{ url: 5, secret: '0123456789abcdef0123456789abcdef' }, { url: 'https://agent.example.com/wake', secret: null }, {}]) {
+      const r = await fetch(relay.url + '/v1/webhook', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      expect(r.status).toBe(400);
+      expect(await r.json()).toMatchObject({ error: 'invalid_argument' });
+    }
+  });
+
   it('getWebhook: optional fields are accepted when well-formed or null, and a present malformed one is relay_protocol_error', async () => {
     const a = await registered('alice');
     await a.relay!.setWebhook(a.identity, { url: 'https://agent.example.com/wake', secret: '0123456789abcdef0123456789abcdef' });
