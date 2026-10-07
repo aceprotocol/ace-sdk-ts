@@ -21,6 +21,7 @@ export class FakeRelay {
   stored = new Map<string, string>();
   seenAuth = new Set<string>();
   intents: Record<string, unknown>[] = [];
+  webhooks = new Map<string, { url: string; secret: string; failures: number; updatedAt: number }>();
   extraAgents: unknown[] = [];
   inject: Array<{ path: string; status: number; code: string; headers?: Record<string, string> }> = [];
   drainAfter: number | null = null;
@@ -165,6 +166,23 @@ export class FakeRelay {
           return this.#reply(res, 201, { intentId: intent.intentId, expiresAt: intent.expiresAt });
         }
         case 'GET /v1/intents': return this.#reply(res, 200, { intents: this.intents, cursor: null });
+        case 'PUT /v1/webhook': {
+          const url = String(body?.url ?? '');
+          const secret = String(body?.secret ?? '');
+          const id = this.#auth(req, { action: 'webhook', method: 'PUT', url, secret });
+          this.webhooks.set(id, { url, secret, failures: 0, updatedAt: this.clock() });
+          return this.#reply(res, 200, { ok: true });
+        }
+        case 'GET /v1/webhook': {
+          const id = this.#auth(req, { action: 'webhook', method: 'GET', url: '', secret: '' });
+          const w = this.webhooks.get(id);
+          return this.#reply(res, 200, { webhook: w ? { url: w.url, status: 'active', failures: w.failures, updatedAt: w.updatedAt } : null });
+        }
+        case 'DELETE /v1/webhook': {
+          const id = this.#auth(req, { action: 'webhook', method: 'DELETE', url: '', secret: '' });
+          this.webhooks.delete(id);
+          return this.#reply(res, 200, { ok: true });
+        }
         default: throw new HTTPError(404, 'not_found');
       }
     } catch (e) {

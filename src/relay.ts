@@ -57,6 +57,15 @@ export interface InboxPage {
   cursor: string | null;
 }
 
+export interface Webhook {
+  url: string;
+  status: 'active' | 'disabled';
+  failures: number;
+  updatedAt: number;
+  lastDeliveredAt?: number;
+  lastError?: string;
+}
+
 export interface ListenEvent {
   streamId: string;
   message: unknown;
@@ -423,6 +432,34 @@ export class RelayClient {
       return out;
     });
     return { intents, cursor: typeof res.cursor === 'string' ? res.cursor : null };
+  }
+
+  /** `PUT /v1/webhook`: set or replace this identity's webhook. */
+  async setWebhook(identity: ACEIdentity, w: { url: string; secret: string }): Promise<void> {
+    await this.#authed(identity, { action: 'webhook', method: 'PUT', url: w.url, secret: w.secret }, 'PUT', this.#url('/v1/webhook'), { url: w.url, secret: w.secret });
+  }
+
+  /** `GET /v1/webhook`; null when none is set. */
+  async getWebhook(identity: ACEIdentity): Promise<Webhook | null> {
+    const res = await this.#authed(identity, { action: 'webhook', method: 'GET', url: '', secret: '' }, 'GET', this.#url('/v1/webhook'));
+    if (!isObj(res) || !('webhook' in res)) throw protocolError('webhook response must have webhook');
+    const w = res.webhook;
+    if (w === null) return null;
+    if (
+      !isObj(w) || typeof w.url !== 'string' || (w.status !== 'active' && w.status !== 'disabled')
+      || wireInt(w.failures) === null || wireInt(w.updatedAt) === null
+    ) {
+      throw protocolError('invalid webhook');
+    }
+    const out: Webhook = { url: w.url, status: w.status, failures: w.failures as number, updatedAt: w.updatedAt as number };
+    if (wireInt(w.lastDeliveredAt) !== null) out.lastDeliveredAt = w.lastDeliveredAt as number;
+    if (typeof w.lastError === 'string') out.lastError = w.lastError;
+    return out;
+  }
+
+  /** `DELETE /v1/webhook` (idempotent). */
+  async clearWebhook(identity: ACEIdentity): Promise<void> {
+    await this.#authed(identity, { action: 'webhook', method: 'DELETE', url: '', secret: '' }, 'DELETE', this.#url('/v1/webhook'));
   }
 }
 

@@ -8,7 +8,9 @@ export type {
   RegistrationRequest, Intent,
 } from './types.js';
 export type { ThreadState, ThreadSnapshot, ThreadHistoryEntry, ThreadEvent } from './state-machine.js';
-export type { RelayAuthRequest } from './auth.js';
+export type { RelayAuthRequest, WebhookMethod } from './auth.js';
+export type { Webhook } from './relay.js';
+export type { WebhookNotification, WebhookNotificationInput } from './webhook.js';
 export type { ReceiveSource, ReceiveOutcome } from './inbox.js';
 export type { PendingSend } from './outbox.js';
 export type { ACEStore } from './store.js';
@@ -23,7 +25,7 @@ export {
   KEM_SEED_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_CIPHERTEXT_SIZE, DEFAULT_REPLAY_CAPACITY,
 } from './limits.js';
 export { SoftwareIdentity, computeACEId } from './identity.js';
-export { toBase64, fromBase64, isACEId, isMessageId, isThreadId, isConversationId } from './encoding.js';
+export { toBase64, fromBase64, isACEId, isMessageId, isThreadId, isConversationId, isHttpsUrl } from './encoding.js';
 export { computeConversationId, decryptWithSeed, kemPublicKeyFromSeed, generateKemSeed } from './encryption.js';
 export { decodeEnvelope, verifyEnvelopeSignature, envelopeFingerprint } from './envelope.js';
 export { createMessage, parseMessage, validateBody } from './messages.js';
@@ -31,7 +33,8 @@ export {
   VerifiedPeer, verifyPeerRecord, verifyRegistrationFile, fetchRegistrationFile, validateProfile, isBlockedAddress,
 } from './discovery.js';
 export { createRegistrationFile, createRegistrationRequest, verifyRegistrationRequest } from './registration.js';
-export { createAuthHeaders, parseAuthHeaders, verifyAuthHeaders } from './auth.js';
+export { createAuthHeaders, parseAuthHeaders, verifyAuthHeaders, isWebhookSecret } from './auth.js';
+export { signWebhookNotification, verifyWebhookNotification } from './webhook.js';
 export { ReplayDetector } from './replay.js';
 export { ThreadStateMachine } from './state-machine.js';
 export { ThreadStore } from './thread-store.js';

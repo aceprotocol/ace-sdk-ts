@@ -153,6 +153,18 @@ describe('RelayClient', () => {
     await expectCode(a.relay!.postIntent(a.identity, { need: 'x', tags: ['a,b'], ttl: 1 }), 'invalid_argument');
   });
 
+  it('sets, reads and clears a webhook', async () => {
+    const a = await registered('alice');
+    await a.relay!.setWebhook(a.identity, { url: 'https://agent.example.com/wake', secret: '0123456789abcdef0123456789abcdef' });
+    expect(await a.relay!.getWebhook(a.identity)).toMatchObject({ url: 'https://agent.example.com/wake', status: 'active', failures: 0 });
+    await a.relay!.clearWebhook(a.identity);
+    expect(await a.relay!.getWebhook(a.identity)).toBeNull();
+    await expectCode(a.relay!.setWebhook(a.identity, { url: 'http://x.example', secret: '0123456789abcdef0123456789abcdef' }), 'invalid_argument');
+    relay.inject.push({ path: '/v1/webhook', status: 400, code: 'invalid_webhook' });
+    const e = await expectCode(a.relay!.setWebhook(a.identity, { url: 'https://10.0.0.1/wake', secret: '0123456789abcdef0123456789abcdef' }), 'relay_rejected');
+    expect(e.relayCode).toBe('invalid_webhook');
+  });
+
   it('listen: catchup then live, reconnect after drain and dropped streams, resume point, abort', async () => {
     const a = await registered('a');
     for (let i = 0; i < 3; i++) relay.enqueueRaw(a.id, { n: i });

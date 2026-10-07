@@ -17,7 +17,8 @@ import { createHash } from 'node:crypto';
 
 describe('vectors', () => {
   it('version and sections', () => {
-    expect(VECTORS.version).toBe('2');
+    expect(VECTORS.version).toBe('3');
+    expect(V.auth).toHaveLength(18);
     for (const k of ['envelopes', 'bodies', 'transitions', 'replay', 'signatures', 'auth', 'registrations',
       'registrationErrors', 'urls', 'base64', 'peerBinding']) expect(V).toHaveProperty(k);
   });
@@ -200,6 +201,7 @@ function authRequest(r: any): RelayAuthRequest {
   if (r.action === 'listen') return { action: 'listen', since: r.since };
   if (r.action === 'inbox') return { action: 'inbox', since: r.since, limit: r.limit };
   if (r.action === 'unregister') return { action: 'unregister' };
+  if (r.action === 'webhook') return { action: 'webhook', method: r.method, url: r.url, secret: r.secret };
   return { action: 'intent', need: r.need, tags: r.tags, maxPrice: r.maxPrice, currency: r.currency, ttl: r.ttl };
 }
 

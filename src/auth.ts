@@ -1,17 +1,30 @@
 /** Relay request authentication headers (08-relay § Authentication). */
 
 import { ACEError } from './errors.js';
-import { decimal, decodeSignature, encodeSignature, isACEId, MAX_SAFE_INTEGER, wireInt } from './encoding.js';
+import { codePointLength, CONTROL_CHAR_RE, decimal, decodeSignature, encodeSignature, isACEId, isHttpsUrl, MAX_SAFE_INTEGER, wireInt } from './encoding.js';
 import { MAX_INBOX_PAGE, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { buildSignData, encodePayload, verifySignature } from './signing.js';
 import type { ACEIdentity, SigningScheme } from './types.js';
 import { isSigningScheme } from './types.js';
 
+export type WebhookMethod = 'PUT' | 'GET' | 'DELETE';
+
 export type RelayAuthRequest =
   | { action: 'listen'; since: string }
   | { action: 'inbox'; since: string; limit: number }
   | { action: 'unregister' }
-  | { action: 'intent'; need: string; tags: string[]; maxPrice: string | null; currency: string | null; ttl: number };
+  | { action: 'intent'; need: string; tags: string[]; maxPrice: string | null; currency: string | null; ttl: number }
+  | { action: 'webhook'; method: WebhookMethod; url: string; secret: string };
+
+export const WEBHOOK_SECRET_MIN = 16;
+export const WEBHOOK_SECRET_MAX = 128;
+
+/** A webhook secret: 16..128 code points, no control characters (08-relay § Webhooks). */
+export function isWebhookSecret(v: unknown): v is string {
+  if (typeof v !== 'string' || CONTROL_CHAR_RE.test(v)) return false;
+  const n = codePointLength(v);
+  return n >= WEBHOOK_SECRET_MIN && n <= WEBHOOK_SECRET_MAX;
+}
 
 export interface AuthHeaders {
   'X-ACE-Id': string;
@@ -57,6 +70,17 @@ export function authPayload(req: RelayAuthRequest): Uint8Array {
       }
       if (wireInt(req.ttl) === null) throw bad('ttl must be an integer in [0, 2^53-1]');
       return encodePayload(req.need, req.tags.join(','), req.maxPrice ?? '', req.currency ?? '', decimal(req.ttl));
+    }
+    case 'webhook': {
+      if (req.method !== 'PUT' && req.method !== 'GET' && req.method !== 'DELETE') throw bad('method must be PUT, GET or DELETE');
+      if (typeof req.url !== 'string' || typeof req.secret !== 'string') throw bad('url and secret must be strings');
+      if (req.method === 'PUT') {
+        if (!isHttpsUrl(req.url)) throw bad('url must match the ACE HTTPS URL grammar');
+        if (!isWebhookSecret(req.secret)) throw bad(`secret must be ${WEBHOOK_SECRET_MIN}..${WEBHOOK_SECRET_MAX} characters without control characters`);
+      } else if (req.url !== '' || req.secret !== '') {
+        throw bad(`${req.method} takes no url or secret`);
+      }
+      return encodePayload(req.method, req.url, req.secret);
     }
     default:
       throw bad('unknown action');

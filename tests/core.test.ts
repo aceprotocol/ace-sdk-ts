@@ -22,6 +22,7 @@ const VALUE_EXPORTS = [
   'isACEId', 'isMessageId', 'isThreadId', 'isConversationId', 'createMessage', 'parseMessage', 'validateBody',
   'VerifiedPeer', 'verifyPeerRecord', 'verifyRegistrationFile', 'fetchRegistrationFile', 'validateProfile', 'isBlockedAddress',
   'createRegistrationRequest', 'verifyRegistrationRequest', 'createAuthHeaders', 'parseAuthHeaders', 'verifyAuthHeaders',
+  'isHttpsUrl', 'isWebhookSecret', 'signWebhookNotification', 'verifyWebhookNotification',
   'ReplayDetector', 'ThreadStateMachine', 'ThreadStore', 'PeerStore', 'Inbox', 'Outbox', 'RelayClient', 'MemoryStore',
 ];
 
