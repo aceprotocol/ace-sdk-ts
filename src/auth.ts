@@ -1,7 +1,7 @@
 /** Relay request authentication headers (08-relay § Authentication). */
 
 import { ACEError } from './errors.js';
-import { codePointLength, CONTROL_CHAR_RE, decimal, decodeSignature, encodeSignature, isACEId, isHttpsUrl, MAX_SAFE_INTEGER, wireInt } from './encoding.js';
+import { codePointLength, CONTROL_CHAR_RE, decimal, decodeSignature, encodeSignature, isACEId, isHttpsUrl, isStreamId, MAX_SAFE_INTEGER, wireInt } from './encoding.js';
 import { MAX_INBOX_PAGE, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { buildSignData, encodePayload, verifySignature } from './signing.js';
 import type { ACEIdentity, SigningScheme } from './types.js';
@@ -38,11 +38,30 @@ export interface RelayAuth {
   signature: string;
 }
 
-const SINCE_RE = /^(-|[0-9]+-[0-9]+)$/;
 const TS_RE = /^(0|[1-9][0-9]{0,15})$/;
 
 function bad(msg: string): ACEError {
   return new ACEError('invalid_argument', msg);
+}
+
+/** A canonical decimal timestamp header in [0, 2^53−1], or null. */
+export function parseTimestamp(s: string): number | null {
+  if (!TS_RE.test(s)) return null;
+  const n = Number(s);
+  return n <= MAX_SAFE_INTEGER ? n : null;
+}
+
+/** `windowSeconds ?? TIMESTAMP_WINDOW_SECONDS`, checked to be a non-negative safe integer. */
+export function freshnessWindow(windowSeconds: number | undefined): number {
+  const w = windowSeconds ?? TIMESTAMP_WINDOW_SECONDS;
+  if (!Number.isSafeInteger(w) || w < 0) throw bad('windowSeconds must be a non-negative integer');
+  return w;
+}
+
+/** `stale_timestamp` when `|now − ts| > window`; `now` is `clock()` or wall-clock seconds. */
+export function assertFresh(ts: number, window: number, clock: (() => number) | undefined, header: string): void {
+  const now = Math.floor(clock ? clock() : Date.now() / 1000);
+  if (Math.abs(now - ts) > window) throw new ACEError('stale_timestamp', `${header} is outside the freshness window`);
 }
 
 /** Validate a RelayAuthRequest and return its signed payload. */
@@ -50,10 +69,10 @@ export function authPayload(req: RelayAuthRequest): Uint8Array {
   if (typeof req !== 'object' || req === null) throw bad('expected a RelayAuthRequest');
   switch (req.action) {
     case 'listen':
-      if (typeof req.since !== 'string' || !SINCE_RE.test(req.since)) throw bad("since must be '-' or '<ms>-<seq>'");
+      if (req.since !== '-' && !isStreamId(req.since)) throw bad("since must be '-' or '<ms>-<seq>'");
       return encodePayload(req.since);
     case 'inbox':
-      if (typeof req.since !== 'string' || !SINCE_RE.test(req.since)) throw bad("since must be '-' or '<ms>-<seq>'");
+      if (req.since !== '-' && !isStreamId(req.since)) throw bad("since must be '-' or '<ms>-<seq>'");
       if (!Number.isSafeInteger(req.limit) || req.limit < 1 || req.limit > MAX_INBOX_PAGE) {
         throw bad(`limit must be an integer in 1..${MAX_INBOX_PAGE}`);
       }
@@ -73,7 +92,6 @@ export function authPayload(req: RelayAuthRequest): Uint8Array {
     }
     case 'webhook': {
       if (req.method !== 'PUT' && req.method !== 'GET' && req.method !== 'DELETE') throw bad('method must be PUT, GET or DELETE');
-      if (typeof req.url !== 'string' || typeof req.secret !== 'string') throw bad('url and secret must be strings');
       if (req.method === 'PUT') {
         if (!isHttpsUrl(req.url)) throw bad('url must match the ACE HTTPS URL grammar');
         if (!isWebhookSecret(req.secret)) throw bad(`secret must be ${WEBHOOK_SECRET_MIN}..${WEBHOOK_SECRET_MAX} characters without control characters`);
@@ -114,9 +132,10 @@ export function parseAuthHeaders(headers: Record<string, string | string[] | und
   const ts = found['x-ace-timestamp'];
   const sig = found['x-ace-signature'];
   if (!isACEId(aceId)) throw bad('X-ACE-Id is missing or not an ACE ID');
-  if (ts === undefined || !TS_RE.test(ts) || Number(ts) > MAX_SAFE_INTEGER) throw bad('X-ACE-Timestamp is missing or malformed');
+  const timestamp = ts === undefined ? null : parseTimestamp(ts);
+  if (timestamp === null) throw bad('X-ACE-Timestamp is missing or malformed');
   if (!sig || sig.length > 512) throw bad('X-ACE-Signature is missing');
-  return { aceId, timestamp: Number(ts), signature: sig };
+  return { aceId, timestamp, signature: sig };
 }
 
 /**
@@ -137,13 +156,9 @@ export function verifyAuthHeaders(
     throw bad('expected RelayAuth, RelayAuthRequest and a signer');
   }
   const payload = authPayload(req);
-  const windowSeconds = opts.windowSeconds ?? TIMESTAMP_WINDOW_SECONDS;
-  if (!Number.isSafeInteger(windowSeconds) || windowSeconds < 0) throw bad('windowSeconds must be a non-negative integer');
+  const windowSeconds = freshnessWindow(opts.windowSeconds);
   if (auth.aceId !== signer.aceId) throw bad('X-ACE-Id does not match the signer');
-  const now = Math.floor(opts.clock ? opts.clock() : Date.now() / 1000);
-  if (Math.abs(now - auth.timestamp) > windowSeconds) {
-    throw new ACEError('stale_timestamp', 'X-ACE-Timestamp is outside the freshness window');
-  }
+  assertFresh(auth.timestamp, windowSeconds, opts.clock, 'X-ACE-Timestamp');
   const sig = decodeSignature(auth.signature, signer.scheme, 'invalid_signature');
   if (!verifySignature(buildSignData(req.action, auth.aceId, auth.timestamp, payload), sig, signer.scheme, signer.signingPublicKey)) {
     throw new ACEError('invalid_signature', 'X-ACE-Signature does not verify');

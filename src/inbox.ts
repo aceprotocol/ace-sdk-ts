@@ -2,7 +2,7 @@
 
 import { ACEError } from './errors.js';
 import {
-  canonicalStateBytes, codePointLength, isACEId, isConversationId, isMessageId, isThreadId, pairKey,
+  canonicalStateBytes, codePointLength, isACEId, isConversationId, isMessageId, isStreamId, isThreadId, pairKey,
   parseStateBytes, wireInt,
 } from './encoding.js';
 import { computeConversationId } from './encryption.js';
@@ -10,7 +10,7 @@ import { decodeEnvelope, envelopeFingerprint, envelopeKnownFields } from './enve
 import { MAX_INBOX_PAGE, OFFLINE_WINDOW_SECONDS, DEFAULT_REPLAY_CAPACITY } from './limits.js';
 import { eventOf, parseMessage } from './messages.js';
 import type { PeerStore } from './peer-store.js';
-import { compareStreamIds, isStreamId, normalizeRelayUrl, type RelayClient } from './relay.js';
+import { compareStreamIds, normalizeRelayUrl, type RelayClient } from './relay.js';
 import { ReplayDetector } from './replay.js';
 import { ThreadStateMachine, type ThreadSnapshot } from './state-machine.js';
 import { SerialQueue, type ACEStore } from './store.js';

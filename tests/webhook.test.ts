@@ -1,21 +1,20 @@
 import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { ACEError, SoftwareIdentity, verifyWebhookNotification, signWebhookNotification } from '../src/index.js';
+import {
+  createAuthHeaders, parseAuthHeaders, SoftwareIdentity, verifyAuthHeaders, verifyWebhookNotification, signWebhookNotification,
+} from '../src/index.js';
 import { authPayload } from '../src/auth.js';
 import { encodePayload } from '../src/signing.js';
+import { codeOf, hex } from './helpers.js';
 
 const SECRET = '0123456789abcdef0123456789abcdef';
 const TS = 1741000000;
 const ACE = 'ace:sha256:' + 'a'.repeat(64);
 const BODY = JSON.stringify({ event: 'message', aceId: ACE, streamId: '1741000000000-0' });
-const hex = (b: Uint8Array) => Buffer.from(b).toString('hex');
 const sig = (o: { secret?: string; ts?: number; body?: string; prefix?: string } = {}) =>
   (o.prefix ?? 'sha256=') + createHmac('sha256', o.secret ?? SECRET).update(`${o.ts ?? TS}.`).update(o.body ?? BODY).digest('hex');
 
-function expectCode(fn: () => unknown, code: string) {
-  try { fn(); } catch (e) { expect((e as ACEError).code).toBe(code); return; }
-  throw new Error(`expected ${code}`);
-}
+const expectCode = (fn: () => unknown, code: string) => expect(codeOf(fn)).toBe(code);
 
 describe('webhook auth payload', () => {
   it('binds method, url and secret', () => {
@@ -56,6 +55,7 @@ describe('verifyWebhookNotification', () => {
     [{ timestamp: '9007199254740993' }, 'invalid_argument'], // 16 digits, > 2^53
     [{ timestamp: '9999999999999999' }, 'invalid_argument'],
     [{ body: '{"event":"message","aceId":"' + ACE + '"}', signature: sig({ body: '{"event":"message","aceId":"' + ACE + '"}' }) }, 'invalid_argument'],
+    [{ body: BODY.replace('1741000000000-0', '1'.repeat(21) + '-0'), signature: sig({ body: BODY.replace('1741000000000-0', '1'.repeat(21) + '-0') }) }, 'invalid_argument'],
   ])('rejects %o → %s', (patch, code) => {
     expectCode(() => verifyWebhookNotification({ ...ok, ...patch } as never), code);
   });
@@ -97,7 +97,6 @@ describe('verifyWebhookNotification edge cases', () => {
 describe('RelayAuthRequest webhook over headers', () => {
   it('a PUT signature does not verify as GET', async () => {
     const id = await SoftwareIdentity.generate('ed25519');
-    const { createAuthHeaders, parseAuthHeaders, verifyAuthHeaders } = await import('../src/auth.js');
     const h = await createAuthHeaders(id, { action: 'webhook', method: 'PUT', url: 'https://example.com/h', secret: SECRET }, TS);
     const signer = { aceId: id.getACEId(), scheme: id.getSigningScheme(), signingPublicKey: id.getSigningPublicKey() };
     verifyAuthHeaders(parseAuthHeaders(h), { action: 'webhook', method: 'PUT', url: 'https://example.com/h', secret: SECRET }, signer, { clock: () => TS });

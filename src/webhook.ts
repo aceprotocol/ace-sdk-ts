@@ -2,12 +2,11 @@
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { ACEError } from './errors.js';
-import { decimal, isACEId, MAX_SAFE_INTEGER, utf8, wireInt } from './encoding.js';
-import { TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import { assertFresh, freshnessWindow, parseTimestamp } from './auth.js';
+import { decimal, isACEId, isStreamId, wireInt } from './encoding.js';
 
-const TS_RE = /^(0|[1-9][0-9]{0,15})$/;
 const SIG_RE = /^sha256=[0-9a-f]{64}$/;
-const STREAM_RE = /^[0-9]{1,20}-[0-9]{1,20}$/;
+const bodyDecoder = new TextDecoder('utf-8', { fatal: true });
 
 export interface WebhookNotification { aceId: string; streamId: string }
 
@@ -27,8 +26,11 @@ export interface WebhookNotificationInput {
 export function signWebhookNotification(secret: string, timestamp: number, body: Uint8Array | string): string {
   if (typeof secret !== 'string') throw new ACEError('invalid_argument', 'secret must be a string');
   if (wireInt(timestamp) === null) throw new ACEError('invalid_argument', 'timestamp must be a wire integer');
-  const raw = typeof body === 'string' ? utf8(body) : body;
-  return 'sha256=' + createHmac('sha256', secret).update(`${decimal(timestamp)}.`).update(raw).digest('hex');
+  return 'sha256=' + webhookMac(secret, timestamp, body).toString('hex');
+}
+
+function webhookMac(secret: string, timestamp: number, body: Uint8Array | string): Buffer {
+  return createHmac('sha256', secret).update(`${decimal(timestamp)}.`).update(body).digest();
 }
 
 /**
@@ -43,25 +45,21 @@ export function verifyWebhookNotification(o: WebhookNotificationInput): WebhookN
   if (typeof o !== 'object' || o === null || typeof o.secret !== 'string' || typeof o.timestamp !== 'string' || typeof o.signature !== 'string') {
     throw new ACEError('invalid_argument', 'secret, timestamp and signature must be strings');
   }
-  if (!TS_RE.test(o.timestamp) || Number(o.timestamp) > MAX_SAFE_INTEGER) throw new ACEError('invalid_argument', 'X-ACE-Webhook-Timestamp is malformed');
+  const ts = parseTimestamp(o.timestamp);
+  if (ts === null) throw new ACEError('invalid_argument', 'X-ACE-Webhook-Timestamp is malformed');
   if (!SIG_RE.test(o.signature)) throw new ACEError('invalid_signature', 'X-ACE-Webhook-Signature is malformed');
-  const ts = Number(o.timestamp);
-  const window = o.windowSeconds ?? TIMESTAMP_WINDOW_SECONDS;
-  if (!Number.isSafeInteger(window) || window < 0) throw new ACEError('invalid_argument', 'windowSeconds must be a non-negative integer');
-  const now = Math.floor(o.clock ? o.clock() : Date.now() / 1000);
-  if (Math.abs(now - ts) > window) throw new ACEError('stale_timestamp', 'X-ACE-Webhook-Timestamp is outside the freshness window');
-  const expected = signWebhookNotification(o.secret, ts, o.body);
-  if (!timingSafeEqual(Buffer.from(expected), Buffer.from(o.signature))) {
+  assertFresh(ts, freshnessWindow(o.windowSeconds), o.clock, 'X-ACE-Webhook-Timestamp');
+  if (!timingSafeEqual(webhookMac(o.secret, ts, o.body), Buffer.from(o.signature.slice('sha256='.length), 'hex'))) {
     throw new ACEError('invalid_signature', 'X-ACE-Webhook-Signature does not verify');
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(typeof o.body === 'string' ? o.body : new TextDecoder('utf-8', { fatal: true }).decode(o.body));
+    parsed = JSON.parse(typeof o.body === 'string' ? o.body : bodyDecoder.decode(o.body));
   } catch {
     throw new ACEError('invalid_argument', 'notification body is not JSON');
   }
   const n = parsed as { event?: unknown; aceId?: unknown; streamId?: unknown };
-  if (typeof n !== 'object' || n === null || n.event !== 'message' || !isACEId(n.aceId) || typeof n.streamId !== 'string' || !STREAM_RE.test(n.streamId)) {
+  if (typeof n !== 'object' || n === null || n.event !== 'message' || !isACEId(n.aceId) || !isStreamId(n.streamId)) {
     throw new ACEError('invalid_argument', 'notification body must be {event: "message", aceId, streamId}');
   }
   return { aceId: n.aceId, streamId: n.streamId };

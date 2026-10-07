@@ -9,6 +9,7 @@ import type { JSONObject } from './types.js';
 export const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
 const ACE_ID_RE = /^ace:sha256:[0-9a-f]{64}$/;
+const STREAM_ID_RE = /^[0-9]{1,20}-[0-9]{1,20}$/;
 const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CONVERSATION_ID_RE = /^[0-9a-f]{64}$/;
 export const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
@@ -40,6 +41,11 @@ export function pairKey(a: string, b: string): string {
 }
 
 // --- predicates --------------------------------------------------------------
+
+/** Relay stream ID `<ms>-<seq>`, each a u64 in decimal (08-relay). */
+export function isStreamId(value: unknown): value is string {
+  return typeof value === 'string' && STREAM_ID_RE.test(value);
+}
 
 /** `ace:sha256:<64 lowercase hex>`. */
 export function isACEId(value: unknown): value is string {

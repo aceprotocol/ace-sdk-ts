@@ -1,14 +1,13 @@
 /** Relay HTTP client (08-relay), including an SSE parser over `fetch`. */
 
 import { ACEError, type ACEErrorCode } from './errors.js';
-import { isACEId, wireInt } from './encoding.js';
+import { isACEId, isStreamId, wireInt } from './encoding.js';
 import { createAuthHeaders, type RelayAuthRequest } from './auth.js';
 import { readLimited, verifyPeerRecord, type VerifiedPeer } from './discovery.js';
 import { MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE } from './limits.js';
 import { createRegistrationRequest } from './registration.js';
 import type { ACEIdentity, ACEMessage, AgentProfile, DiscoverQuery, Intent } from './types.js';
 
-const STREAM_ID_RE = /^[0-9]+-[0-9]+$/;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const SSE_FRAME_LIMIT = MAX_ENVELOPE_BYTES + 512;
@@ -17,10 +16,6 @@ const MAX_BACKOFF_MS = 30_000;
 /** Yielded by #listenOnce once a connection is established (listen runs onOpen). */
 const CONNECTED = Symbol('connected');
 const LISTEN_IDLE_MS = 90_000;
-
-export function isStreamId(v: unknown): v is string {
-  return typeof v === 'string' && v.length <= 64 && STREAM_ID_RE.test(v);
-}
 
 /** Compare two stream IDs as integer pairs (ms, seq). */
 export function compareStreamIds(a: string, b: string): number {
@@ -435,8 +430,8 @@ export class RelayClient {
   }
 
   /** `PUT /v1/webhook`: set or replace this identity's webhook. */
-  async setWebhook(identity: ACEIdentity, w: { url: string; secret: string }): Promise<void> {
-    await this.#authed(identity, { action: 'webhook', method: 'PUT', url: w.url, secret: w.secret }, 'PUT', this.#url('/v1/webhook'), { url: w.url, secret: w.secret });
+  async setWebhook(identity: ACEIdentity, { url, secret }: { url: string; secret: string }): Promise<void> {
+    await this.#authed(identity, { action: 'webhook', method: 'PUT', url, secret }, 'PUT', this.#url('/v1/webhook'), { url, secret });
   }
 
   /** `GET /v1/webhook`; null when none is set. */
@@ -452,12 +447,12 @@ export class RelayClient {
       throw protocolError('invalid webhook');
     }
     const out: Webhook = { url: w.url, status: w.status, failures: w.failures as number, updatedAt: w.updatedAt as number };
-    // Optional fields: absent (or null) is fine; present but malformed is a protocol error.
-    if (w.lastDeliveredAt !== undefined && w.lastDeliveredAt !== null) {
+    // Optional fields: absent is fine; present but malformed is a protocol error.
+    if (w.lastDeliveredAt !== undefined) {
       if (wireInt(w.lastDeliveredAt) === null) throw protocolError('invalid webhook lastDeliveredAt');
       out.lastDeliveredAt = w.lastDeliveredAt as number;
     }
-    if (w.lastError !== undefined && w.lastError !== null) {
+    if (w.lastError !== undefined) {
       if (typeof w.lastError !== 'string') throw protocolError('invalid webhook lastError');
       out.lastError = w.lastError;
     }

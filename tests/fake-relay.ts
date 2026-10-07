@@ -21,11 +21,10 @@ export class FakeRelay {
   stored = new Map<string, string>();
   seenAuth = new Set<string>();
   intents: Record<string, unknown>[] = [];
-  webhooks = new Map<string, { url: string; secret: string; failures: number; updatedAt: number }>();
+  webhooks = new Map<string, { url: string; secret: string; updatedAt: number }>();
   extraAgents: unknown[] = [];
-  /** Extra fields merged into every `GET /v1/webhook` record (to inject malformed values). */
-  webhookExtra: Record<string, unknown> = {};
-  inject: Array<{ path: string; status: number; code: string; headers?: Record<string, string> }> = [];
+  /** One-shot responses for the next request to `path`: an error `code`, or a raw `body`. */
+  inject: Array<{ path: string; status: number; headers?: Record<string, string> } & ({ code: string } | { body: unknown })> = [];
   drainAfter: number | null = null;
   /** Close the next N listen connections right after `connected` (no events). */
   dropListens = 0;
@@ -120,7 +119,7 @@ export class FakeRelay {
     const i = this.inject.findIndex((x) => x.path === path);
     if (i >= 0) {
       const [inj] = this.inject.splice(i, 1);
-      return this.#error(res, inj.status, inj.code, inj.headers);
+      return 'body' in inj ? this.#reply(res, inj.status, inj.body, inj.headers) : this.#error(res, inj.status, inj.code, inj.headers);
     }
     const chunks: Buffer[] = [];
     for await (const c of req) chunks.push(c as Buffer);
@@ -170,16 +169,15 @@ export class FakeRelay {
         case 'GET /v1/intents': return this.#reply(res, 200, { intents: this.intents, cursor: null });
         case 'PUT /v1/webhook': {
           if (typeof body?.url !== 'string' || typeof body?.secret !== 'string') return this.#error(res, 400, 'invalid_argument');
-          const url = body.url;
-          const secret = body.secret;
+          const { url, secret } = body;
           const id = this.#auth(req, { action: 'webhook', method: 'PUT', url, secret });
-          this.webhooks.set(id, { url, secret, failures: 0, updatedAt: this.clock() });
+          this.webhooks.set(id, { url, secret, updatedAt: this.clock() });
           return this.#reply(res, 200, { ok: true });
         }
         case 'GET /v1/webhook': {
           const id = this.#auth(req, { action: 'webhook', method: 'GET', url: '', secret: '' });
           const w = this.webhooks.get(id);
-          return this.#reply(res, 200, { webhook: w ? { url: w.url, status: 'active', failures: w.failures, updatedAt: w.updatedAt, ...this.webhookExtra } : null });
+          return this.#reply(res, 200, { webhook: w ? { url: w.url, status: 'active', failures: 0, updatedAt: w.updatedAt } : null });
         }
         case 'DELETE /v1/webhook': {
           const id = this.#auth(req, { action: 'webhook', method: 'DELETE', url: '', secret: '' });
