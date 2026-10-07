@@ -23,6 +23,8 @@ export class FakeRelay {
   intents: Record<string, unknown>[] = [];
   webhooks = new Map<string, { url: string; secret: string; failures: number; updatedAt: number }>();
   extraAgents: unknown[] = [];
+  /** Extra fields merged into every `GET /v1/webhook` record (to inject malformed values). */
+  webhookExtra: Record<string, unknown> = {};
   inject: Array<{ path: string; status: number; code: string; headers?: Record<string, string> }> = [];
   drainAfter: number | null = null;
   /** Close the next N listen connections right after `connected` (no events). */
@@ -176,7 +178,7 @@ export class FakeRelay {
         case 'GET /v1/webhook': {
           const id = this.#auth(req, { action: 'webhook', method: 'GET', url: '', secret: '' });
           const w = this.webhooks.get(id);
-          return this.#reply(res, 200, { webhook: w ? { url: w.url, status: 'active', failures: w.failures, updatedAt: w.updatedAt } : null });
+          return this.#reply(res, 200, { webhook: w ? { url: w.url, status: 'active', failures: w.failures, updatedAt: w.updatedAt, ...this.webhookExtra } : null });
         }
         case 'DELETE /v1/webhook': {
           const id = this.#auth(req, { action: 'webhook', method: 'DELETE', url: '', secret: '' });

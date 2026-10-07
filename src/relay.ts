@@ -452,8 +452,15 @@ export class RelayClient {
       throw protocolError('invalid webhook');
     }
     const out: Webhook = { url: w.url, status: w.status, failures: w.failures as number, updatedAt: w.updatedAt as number };
-    if (wireInt(w.lastDeliveredAt) !== null) out.lastDeliveredAt = w.lastDeliveredAt as number;
-    if (typeof w.lastError === 'string') out.lastError = w.lastError;
+    // Optional fields: absent (or null) is fine; present but malformed is a protocol error.
+    if (w.lastDeliveredAt !== undefined && w.lastDeliveredAt !== null) {
+      if (wireInt(w.lastDeliveredAt) === null) throw protocolError('invalid webhook lastDeliveredAt');
+      out.lastDeliveredAt = w.lastDeliveredAt as number;
+    }
+    if (w.lastError !== undefined && w.lastError !== null) {
+      if (typeof w.lastError !== 'string') throw protocolError('invalid webhook lastError');
+      out.lastError = w.lastError;
+    }
     return out;
   }
 

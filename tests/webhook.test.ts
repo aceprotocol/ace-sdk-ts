@@ -53,6 +53,8 @@ describe('verifyWebhookNotification', () => {
     [{ body: BODY.replace('-0"', '-1"') }, 'invalid_signature'],
     [{ clock: () => TS + 301 }, 'stale_timestamp'],
     [{ timestamp: 'nope' }, 'invalid_argument'],
+    [{ timestamp: '9007199254740993' }, 'invalid_argument'], // 16 digits, > 2^53
+    [{ timestamp: '9999999999999999' }, 'invalid_argument'],
     [{ body: '{"event":"message","aceId":"' + ACE + '"}', signature: sig({ body: '{"event":"message","aceId":"' + ACE + '"}' }) }, 'invalid_argument'],
   ])('rejects %o → %s', (patch, code) => {
     expectCode(() => verifyWebhookNotification({ ...ok, ...patch } as never), code);

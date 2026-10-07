@@ -2,7 +2,7 @@
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { ACEError } from './errors.js';
-import { decimal, isACEId, utf8, wireInt } from './encoding.js';
+import { decimal, isACEId, MAX_SAFE_INTEGER, utf8, wireInt } from './encoding.js';
 import { TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 
 const TS_RE = /^(0|[1-9][0-9]{0,15})$/;
@@ -39,7 +39,7 @@ export function verifyWebhookNotification(o: WebhookNotificationInput): WebhookN
   if (typeof o !== 'object' || o === null || typeof o.secret !== 'string' || typeof o.timestamp !== 'string' || typeof o.signature !== 'string') {
     throw new ACEError('invalid_argument', 'secret, timestamp and signature must be strings');
   }
-  if (!TS_RE.test(o.timestamp)) throw new ACEError('invalid_argument', 'X-ACE-Webhook-Timestamp is malformed');
+  if (!TS_RE.test(o.timestamp) || Number(o.timestamp) > MAX_SAFE_INTEGER) throw new ACEError('invalid_argument', 'X-ACE-Webhook-Timestamp is malformed');
   if (!SIG_RE.test(o.signature)) throw new ACEError('invalid_signature', 'X-ACE-Webhook-Signature is malformed');
   const ts = Number(o.timestamp);
   const window = o.windowSeconds ?? TIMESTAMP_WINDOW_SECONDS;

@@ -165,6 +165,22 @@ describe('RelayClient', () => {
     expect(e.relayCode).toBe('invalid_webhook');
   });
 
+  it('getWebhook: optional fields are accepted when well-formed or null, and a present malformed one is relay_protocol_error', async () => {
+    const a = await registered('alice');
+    await a.relay!.setWebhook(a.identity, { url: 'https://agent.example.com/wake', secret: '0123456789abcdef0123456789abcdef' });
+    relay.webhookExtra = { lastDeliveredAt: 1741000000, lastError: 'http_500' };
+    expect(await a.relay!.getWebhook(a.identity)).toMatchObject({ lastDeliveredAt: 1741000000, lastError: 'http_500' });
+    relay.webhookExtra = { lastDeliveredAt: null, lastError: null };
+    const w = await a.relay!.getWebhook(a.identity);
+    expect(w).not.toHaveProperty('lastDeliveredAt');
+    expect(w).not.toHaveProperty('lastError');
+    for (const extra of [{ lastDeliveredAt: 'yesterday' }, { lastDeliveredAt: 1.5 }, { lastDeliveredAt: -1 }, { lastError: 42 }]) {
+      relay.webhookExtra = extra;
+      await expectCode(a.relay!.getWebhook(a.identity), 'relay_protocol_error');
+    }
+    relay.webhookExtra = {};
+  });
+
   it('listen: catchup then live, reconnect after drain and dropped streams, resume point, abort', async () => {
     const a = await registered('a');
     for (let i = 0; i < 3; i++) relay.enqueueRaw(a.id, { n: i });
