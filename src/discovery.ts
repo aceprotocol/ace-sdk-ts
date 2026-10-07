@@ -409,7 +409,10 @@ const V4_BLOCKED: Array<[number, number]> = ([
 ] as Array<[string, number]>).map(([a, p]) => [parseV4(a)!, p]);
 
 const V6_BLOCKED: Array<[Uint8Array, number]> = ([
-  ['::', 128], ['::1', 128], ['100::', 64], ['2001:db8::', 32], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
+  // Transition ranges that embed an IPv4 address are blocked whole (fail closed): IPv4-compatible
+  // ::/96 (includes :: and ::1), SIIT ::ffff:0:0:0/96, local-use NAT64 64:ff9b:1::/48, Teredo 2001::/32, 6to4 2002::/16.
+  ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b:1::', 48], ['100::', 64], ['2001::', 32], ['2001:db8::', 32],
+  ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
 ] as Array<[string, number]>).map(([a, p]) => [parseV6(a)!, p]);
 
 function parseV4(ip: string): number | null {
@@ -464,7 +467,8 @@ function v4Blocked(n: number): boolean {
 
 /**
  * SSRF blocklist (08-relay § Client Rules, Blocked Addresses): true for any blocked address, or an input that is not an IP literal.
- * IPv4-mapped and 64:ff9b::/96 are judged by the embedded IPv4. Exported so callers that open
+ * IPv4-mapped and 64:ff9b::/96 are judged by the embedded IPv4; other IPv4-embedding transition
+ * ranges (::/96, ::ffff:0:0:0/96, 64:ff9b:1::/48, 2001::/32, 2002::/16) are blocked whole. Exported so callers that open
  * their own connections (e.g. direct delivery) apply the same policy.
  */
 export function isBlockedAddress(ip: string): boolean {
