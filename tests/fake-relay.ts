@@ -14,6 +14,11 @@ class HTTPError extends Error {
 
 type Entry = [string, unknown];
 
+/** An SSE frame whose `data` is sent verbatim (not JSON-encoded). */
+export class RawFrame {
+  constructor(readonly data: string) {}
+}
+
 export class FakeRelay {
   clock: () => number;
   identities = new Map<string, PeerRecord>();
@@ -31,6 +36,9 @@ export class FakeRelay {
   /** Live-phase heartbeat interval for listen streams. */
   heartbeatMs = 200;
   requests: Array<[string, string]> = [];
+  /** Request query strings and JSON bodies, by path. */
+  queries: Array<[string, Record<string, string>]> = [];
+  bodies: Array<[string, unknown]> = [];
   authTimestamps: number[] = [];
   url = '';
   #server: Server;
@@ -116,6 +124,7 @@ export class FakeRelay {
     const path = u.pathname;
     const query = Object.fromEntries(u.searchParams);
     this.requests.push([req.method ?? '', path]);
+    this.queries.push([path, query]);
     const i = this.inject.findIndex((x) => x.path === path);
     if (i >= 0) {
       const [inj] = this.inject.splice(i, 1);
@@ -126,6 +135,7 @@ export class FakeRelay {
     const raw = Buffer.concat(chunks).toString('utf8');
     try {
       const body = raw ? JSON.parse(raw) : undefined;
+      if (body !== undefined) this.bodies.push([path, body]);
       const route = `${req.method} ${path}`;
       switch (route) {
         case 'POST /v1/register': return this.#register(res, body);
@@ -280,7 +290,8 @@ export class FakeRelay {
           res.end('event: drain\ndata: {}\n\n');
           return;
         }
-        res.write(`id: ${sid}\nevent: ${catchup ? 'catchup' : 'message'}\ndata: ${JSON.stringify(msg)}\n\n`);
+        const data = msg instanceof RawFrame ? msg.data : JSON.stringify(msg);
+        res.write(`id: ${sid}\nevent: ${catchup ? 'catchup' : 'message'}\ndata: ${data}\n\n`);
         sent++;
         last = sid;
       }

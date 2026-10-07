@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { expect } from 'vitest';
-import { ACEError, SoftwareIdentity, verifyRegistrationFile, type VerifiedPeer } from '../src/index.js';
+import { ACEError, SoftwareIdentity, createRegistrationFile, verifyRegistrationFile, type VerifiedPeer } from '../src/index.js';
 
 export const VECTORS = JSON.parse(readFileSync(new URL('./fixtures/test-vectors.json', import.meta.url), 'utf8'));
 export const V = VECTORS.vectors;
@@ -11,7 +11,12 @@ export function agent(name: 'alice' | 'bob'): SoftwareIdentity {
 }
 
 export function peerOf(identity: SoftwareIdentity, pinnedAt = 0): VerifiedPeer {
-  return verifyRegistrationFile(identity.toRegistrationFile({ name: 'Peer', endpoint: 'https://peer.example/ace' }), { pinnedAt });
+  return verifyRegistrationFile(createRegistrationFile(identity, { name: 'Peer', endpoint: 'https://peer.example/ace' }), { pinnedAt });
+}
+
+/** The wire bytes of a JSON value (what `Inbox.receive` takes). */
+export function wire(v: unknown): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify(v));
 }
 
 export function hex(b: Uint8Array): string {

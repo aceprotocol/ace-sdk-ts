@@ -1,5 +1,5 @@
 import {
-  ACEError, Inbox, MemoryStore, Outbox, PeerStore, SoftwareIdentity, type ACEStore, type ParsedMessage,
+  ACEError, Inbox, MemoryStore, Outbox, PeerStore, SoftwareIdentity, createRegistrationFile, type ACEStore, type ParsedMessage,
   type RelayClient, type SigningScheme, type VerifiedPeer,
 } from '../src/index.js';
 
@@ -67,16 +67,16 @@ export class Agent {
     return a;
   }
 
-  open(o: { store?: ACEStore; offlineWindowSeconds?: number; onMessage?: Host['fn'] } = {}): Promise<Inbox> {
+  open(o: { store?: ACEStore; offlineWindowSeconds?: number; capacity?: number; onMessage?: Host['fn'] } = {}): Promise<Inbox> {
     const store = o.store ?? this.store;
     return Inbox.open({
       identity: this.identity, store, peers: new PeerStore({ store, relay: this.relay, clock: this.clock.fn }),
-      onMessage: o.onMessage ?? this.host.fn, clock: this.clock.fn, offlineWindowSeconds: o.offlineWindowSeconds,
+      onMessage: o.onMessage ?? this.host.fn, clock: this.clock.fn, offlineWindowSeconds: o.offlineWindowSeconds, capacity: o.capacity,
     });
   }
 
   registration() {
-    return this.identity.toRegistrationFile({ name: this.name, endpoint: `https://${this.name}.example/ace` });
+    return createRegistrationFile(this.identity, { name: this.name, endpoint: `https://${this.name}.example/ace` });
   }
 
   pin(other: Agent): Promise<VerifiedPeer> {

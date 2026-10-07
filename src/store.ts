@@ -1,15 +1,17 @@
-/** Key-value persistence for the pipeline (design §2.9). */
+/** Key-value persistence for the pipeline (06-security § Appendix A). */
 
 import { ACEError } from './errors.js';
 
 /**
  * A durable key-value store. Keys match `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$` (≤ 200 chars).
- * All I/O errors are `ACEError('storage_failed')`. Lock timeout is `receiver_busy` for the
- * `receive` lock and `storage_failed` otherwise.
+ * Values are at most 64 MiB (`invalid_argument` on write). All I/O errors are
+ * `ACEError('storage_failed')`. Lock names match `^[a-z0-9][a-z0-9_-]{0,63}$`; the default lock
+ * timeout is 10 s. A lock not acquired in time is `receiver_busy` for the `receive` lock and
+ * `lock_busy` otherwise.
  */
 export interface ACEStore {
   read(key: string): Promise<Uint8Array | null>;
-  /** Atomic replace, durable when the promise resolves. */
+  /** Atomic replace, durable when the promise resolves. A value over 64 MiB is `invalid_argument`. */
   write(key: string, value: Uint8Array): Promise<void>;
   /** A missing key is not an error. */
   delete(key: string): Promise<void>;
@@ -20,8 +22,10 @@ export interface ACEStore {
 }
 
 const KEY_RE = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)*$/;
-const LOCK_RE = /^[a-z0-9][a-z0-9._-]*$/;
-export const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
+const LOCK_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
+/** Internal: the largest value a store accepts (and reads back). */
+export const MAX_VALUE_BYTES = 64 * 1024 * 1024;
 
 export function checkKey(key: unknown): string {
   if (typeof key !== 'string' || key.length > 200 || !KEY_RE.test(key)) {
@@ -31,14 +35,21 @@ export function checkKey(key: unknown): string {
 }
 
 export function checkLockName(name: unknown): string {
-  if (typeof name !== 'string' || name.length > 64 || !LOCK_RE.test(name)) {
+  if (typeof name !== 'string' || !LOCK_RE.test(name)) {
     throw new ACEError('invalid_argument', 'invalid lock name');
   }
   return name;
 }
 
 export function lockTimeoutError(name: string): ACEError {
-  return new ACEError(name === 'receive' ? 'receiver_busy' : 'storage_failed', `lock '${name}' is held`);
+  return new ACEError(name === 'receive' ? 'receiver_busy' : 'lock_busy', `lock '${name}' is held`);
+}
+
+/** Internal: a write value must be bytes of at most MAX_VALUE_BYTES. */
+export function checkValue(value: unknown): Uint8Array {
+  if (!(value instanceof Uint8Array)) throw new ACEError('invalid_argument', 'value must be bytes');
+  if (value.length > MAX_VALUE_BYTES) throw new ACEError('invalid_argument', 'value exceeds 64 MiB');
+  return value;
 }
 
 export function checkTimeout(timeoutMs: unknown): number {
@@ -107,8 +118,7 @@ export class MemoryStore implements ACEStore {
 
   async write(key: string, value: Uint8Array): Promise<void> {
     checkKey(key);
-    if (!(value instanceof Uint8Array)) throw new ACEError('invalid_argument', 'value must be bytes');
-    this.#data.set(key, value.slice());
+    this.#data.set(key, checkValue(value).slice());
   }
 
   async delete(key: string): Promise<void> {

@@ -1,4 +1,4 @@
-/** Strict wire encodings shared by every module (design §0). Internal except the re-exported predicates. */
+/** Strict wire encodings shared by every module (04-messages). Internal except the re-exported predicates. */
 
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
@@ -201,6 +201,11 @@ export function compareUtf8(a: string, b: string): number {
 
 // --- JSON values -------------------------------------------------------------------
 
+/** Internal: a non-null, non-array object (a parsed JSON object). */
+export function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
 function isPlainObject(v: object): boolean {
   const proto = Object.getPrototypeOf(v);
   return proto === Object.prototype || proto === null;
@@ -268,8 +273,8 @@ export function loadsBody(raw: Uint8Array): JSONObject {
 export function canonicalJson(value: unknown): string {
   if (typeof value === 'string') return jcsString(value);
   if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
-  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
-    const obj = value as Record<string, unknown>;
+  if (isObj(value)) {
+    const obj = value;
     const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort(compareUtf16);
     return '{' + keys.map((k) => jcsString(k) + ':' + canonicalJson(obj[k])).join(',') + '}';
   }

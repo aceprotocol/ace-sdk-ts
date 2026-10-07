@@ -51,12 +51,21 @@ describe.each(backends)('%s store', (_name, make) => {
     }
   });
 
-  it('locks are exclusive; timeout is receiver_busy for receive, storage_failed otherwise', async () => {
+  it('rejects values over 64 MiB and lock names outside ^[a-z0-9][a-z0-9_-]{0,63}$', async () => {
+    const s = make();
+    await expectCode(s.write('big.json', new Uint8Array(64 * 1024 * 1024 + 1)), 'invalid_argument');
+    expect(await s.read('big.json')).toBeNull();
+    for (const name of ['', 'a.b', 'a/b', 'A', '-a', '_a', 'a'.repeat(65), 'a b']) await expectCode(s.lock(name), 'invalid_argument');
+    for (const name of ['a', 'a-b_c', '0', 'a'.repeat(64)]) await (await s.lock(name, { timeoutMs: 0 }))();
+  });
+
+  it('locks are exclusive; timeout is receiver_busy for receive, lock_busy otherwise', async () => {
     const s = make();
     const release = await s.lock('receive', { timeoutMs: 0 });
     await expectCode(s.lock('receive', { timeoutMs: 0 }), 'receiver_busy');
     const r2 = await s.lock('threads');
-    await expectCode(s.lock('threads', { timeoutMs: 60 }), 'storage_failed');
+    const busy = await expectCode(s.lock('threads', { timeoutMs: 60 }), 'lock_busy');
+    expect(busy.category).toBe('local');
     const waiting = s.lock('threads', { timeoutMs: 2000 });
     setTimeout(() => { void r2(); }, 30);
     const r3 = await waiting;
@@ -93,7 +102,7 @@ describe('FileStore', () => {
     const info = JSON.parse(readFileSync(join(root, 'locks/peers.lock'), 'utf8'));
     expect(Object.keys(info).sort()).toEqual(['createdAt', 'host', 'pid']);
     expect(info.pid).toBe(process.pid);
-    await expectCode(b.lock('peers', { timeoutMs: 80 }), 'storage_failed');
+    await expectCode(b.lock('peers', { timeoutMs: 80 }), 'lock_busy');
     await release();
     expect(() => statSync(join(root, 'locks/peers.lock'))).toThrow();
     // a lock left by a dead process on this host is taken over

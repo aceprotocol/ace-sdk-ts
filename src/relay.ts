@@ -1,7 +1,7 @@
 /** Relay HTTP client (08-relay), including an SSE parser over `fetch`. */
 
-import { ACEError, type ACEErrorCode } from './errors.js';
-import { isACEId, isStreamId, wireInt } from './encoding.js';
+import { ACEError, categoryOf, type ACEErrorCode } from './errors.js';
+import { isACEId, isObj, isStreamId, wireInt } from './encoding.js';
 import { createAuthHeaders, type RelayAuthRequest } from './auth.js';
 import { readLimited, verifyPeerRecord, type VerifiedPeer } from './discovery.js';
 import { MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE } from './limits.js';
@@ -15,6 +15,8 @@ const MAX_FAILED_CONNECTS = 10;
 const MAX_BACKOFF_MS = 30_000;
 /** Yielded by #listenOnce once a connection is established (listen runs onOpen). */
 const CONNECTED = Symbol('connected');
+/** Yielded by #listenOnce for an SSE comment (heartbeat): liveness only, not an event. */
+const HEARTBEAT = Symbol('heartbeat');
 const LISTEN_IDLE_MS = 90_000;
 
 /** Compare two stream IDs as integer pairs (ms, seq). */
@@ -24,18 +26,53 @@ export function compareStreamIds(a: string, b: string): number {
   return am !== bm ? (am < bm ? -1 : 1) : as !== bs ? (as < bs ? -1 : 1) : 0;
 }
 
-/** Normalize a relay base URL: lowercase scheme and host, no trailing '/'; no query or fragment. */
+/**
+ * Normalize a relay base URL (08-relay § Client Rules, Relay URL): scheme `http`/`https`
+ * written lowercase; no `?`, `#`, userinfo, or character <= U+0020 or U+007F (nothing is
+ * trimmed); host ASCII `[A-Za-z0-9.-]+` or a bracketed IPv6 literal, written lowercase; port
+ * 1..65535 without leading zeros, the scheme's default port removed; path kept verbatim
+ * except that all trailing `/` are removed. Anything else is `invalid_argument`.
+ */
 export function normalizeRelayUrl(url: string): string {
-  let u: URL;
-  try {
-    u = new URL(url);
-  } catch {
-    throw new ACEError('invalid_argument', 'relay URL is not a valid URL');
+  const bad = (why: string) => new ACEError('invalid_argument', `relay URL ${why}`);
+  if (typeof url !== 'string') throw bad('must be a string');
+  if (/[\u0000-\u0020\u007f?#]/.test(url)) throw bad('must not contain whitespace, control characters, "?" or "#"');
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/]*)(.*)$/s.exec(url);
+  if (m === null) throw bad('must be an absolute http(s) URL');
+  const scheme = m[1].toLowerCase();
+  if (scheme !== 'http' && scheme !== 'https') throw bad('scheme must be http or https');
+  const authority = m[2];
+  if (authority.includes('@')) throw bad('must not contain userinfo');
+  let host: string;
+  let port: string | undefined;
+  if (authority.startsWith('[')) {
+    const end = authority.indexOf(']');
+    if (end < 0) throw bad('has an invalid IPv6 host');
+    host = authority.slice(0, end + 1);
+    const rest = authority.slice(end + 1);
+    if (rest !== '') {
+      if (!rest.startsWith(':')) throw bad('has an invalid authority');
+      port = rest.slice(1);
+    }
+    // an IPv6 literal (the WHATWG parser rejects anything else, including a zone)
+    if (!/^\[[0-9A-Fa-f:.]+\]$/.test(host)) throw bad('has an invalid IPv6 host');
+    try {
+      new URL(`http://${host}/`);
+    } catch {
+      throw bad('has an invalid IPv6 host');
+    }
+  } else {
+    const colon = authority.indexOf(':');
+    host = colon < 0 ? authority : authority.slice(0, colon);
+    if (colon >= 0) port = authority.slice(colon + 1);
+    if (!/^[A-Za-z0-9.-]+$/.test(host)) throw bad('host must be ASCII [A-Za-z0-9.-]');
   }
-  if ((u.protocol !== 'https:' && u.protocol !== 'http:') || u.username || u.password || u.search || u.hash) {
-    throw new ACEError('invalid_argument', 'relay URL must be http(s) without credentials, query or fragment');
+  host = host.toLowerCase();
+  if (port !== undefined) {
+    if (!/^[1-9][0-9]{0,4}$/.test(port) || Number(port) > 65535) throw bad('has an invalid port');
+    if ((scheme === 'https' && port === '443') || (scheme === 'http' && port === '80')) port = undefined;
   }
-  return `${u.protocol}//${u.host}${u.pathname.replace(/\/+$/, '')}`;
+  return `${scheme}://${host}${port !== undefined ? `:${port}` : ''}${m[3].replace(/\/+$/, '')}`;
 }
 
 export interface RelayClientOptions {
@@ -45,6 +82,15 @@ export interface RelayClientOptions {
   clock?: () => number;
   /** First listen reconnect delay; doubles up to 30 s (default 1000). */
   reconnectBaseMs?: number;
+}
+
+/** Internal: SDK-side tags parameter (string array) to the comma-separated query value. */
+function tagsParam(tags: unknown): string | undefined {
+  if (tags === undefined) return undefined;
+  if (!Array.isArray(tags) || !tags.every((t) => typeof t === 'string' && t.length > 0 && !t.includes(','))) {
+    throw new ACEError('invalid_argument', 'tags must be an array of non-empty strings without ","');
+  }
+  return tags.length === 0 ? undefined : tags.join(',');
 }
 
 export interface InboxPage {
@@ -61,17 +107,14 @@ export interface Webhook {
   lastError?: string;
 }
 
+/**
+ * One SSE `catchup` / `message` frame. `data` is the raw frame data; the relay client does
+ * not parse it (the Inbox decides: a frame that is not an envelope is quarantined).
+ */
 export interface ListenEvent {
   streamId: string;
-  message: unknown;
+  data: string;
   catchup: boolean;
-}
-
-function retryAfter(res: Response): number | undefined {
-  const v = res.headers.get('retry-after');
-  if (v === null) return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? Math.ceil(n) : undefined;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -89,35 +132,64 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/** Map an HTTP error response to an ACEError (design §2.14). */
-async function errorFor(res: Response): Promise<ACEError> {
+/**
+ * Internal: map a relay response other than the call's expected success to an ACEError
+ * (08-relay § Client Rules, Responses; `test-vectors.json` → `relayErrors`). `retryAfter` is
+ * the raw `Retry-After` header, attached only when the mapped code is transient.
+ */
+export function relayErrorFor(status: number, retryAfter: string | null, body: string): ACEError {
   let relayCode: string | undefined;
   let message = '';
   try {
-    const body = JSON.parse(new TextDecoder().decode(await readLimited(res, 64 * 1024)));
-    if (typeof body?.error === 'string') relayCode = body.error.slice(0, 64);
-    if (typeof body?.message === 'string') message = body.message.slice(0, 200);
+    const parsed: unknown = JSON.parse(body);
+    if (isObj(parsed)) {
+      if (typeof parsed.error === 'string') relayCode = parsed.error;
+      if (typeof parsed.message === 'string') message = parsed.message.slice(0, 200);
+    }
   } catch {
-    // body is informational only
+    // no relay error code
   }
-  const s = res.status;
-  const opts = { status: s, relayCode, retryAfterSeconds: retryAfter(res) };
-  const text = `HTTP ${s}${relayCode ? ` ${relayCode}` : ''}${message ? `: ${message}` : ''}`;
-  if (s >= 500 || s === 408 || s === 429) return new ACEError('relay_unavailable', text, opts);
-  let code: ACEErrorCode = 'relay_rejected';
-  if (s === 400 && relayCode === 'envelope_expired') code = 'envelope_expired';
-  else if (s === 404 && relayCode === 'unknown_peer') code = 'unknown_peer';
+  const s = status;
+  let code: ACEErrorCode;
+  if (s < 400 || s >= 600) code = 'relay_protocol_error'; // 1xx, an unexpected 2xx, 3xx, out of range
+  else if (s === 408 || s >= 500) code = 'relay_unavailable';
+  else if (s === 429) code = relayCode === undefined || relayCode === 'rate_limited' ? 'relay_unavailable' : 'relay_rejected';
+  else if (s === 400 && relayCode === 'envelope_expired') code = 'envelope_expired';
   else if (s === 403 && relayCode === 'not_registered') code = 'not_registered';
-  else if (s < 400) return new ACEError('relay_protocol_error', `unexpected ${text}`, opts);
+  else if (s === 404 && relayCode === 'unknown_peer') code = 'unknown_peer';
+  else code = 'relay_rejected';
+  const opts: { status: number; relayCode?: string; retryAfterSeconds?: number } = { status: s };
+  if (relayCode !== undefined) opts.relayCode = relayCode;
+  if (categoryOf(code) === 'transient' && retryAfter !== null && /^[0-9]+$/.test(retryAfter)) {
+    const n = Number(retryAfter);
+    if (Number.isSafeInteger(n)) opts.retryAfterSeconds = n;
+  }
+  const text = `HTTP ${s}${relayCode ? ` ${relayCode.slice(0, 64)}` : ''}${message ? `: ${message}` : ''}`;
   return new ACEError(code, text, opts);
+}
+
+async function errorFor(res: Response): Promise<ACEError> {
+  // fetch with redirect: 'manual' in a browser yields an opaque redirect (status 0)
+  if (res.type === 'opaqueredirect' || res.status === 0) {
+    return new ACEError('relay_protocol_error', 'the relay answered with a redirect');
+  }
+  let body = '';
+  try {
+    body = new TextDecoder().decode(await readLimited(res, 64 * 1024));
+  } catch {
+    // the body is informational only
+  }
+  return relayErrorFor(res.status, res.headers.get('retry-after'), body);
 }
 
 function protocolError(msg: string): ACEError {
   return new ACEError('relay_protocol_error', msg);
 }
 
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
+/** A page's required `cursor`: a string or null. */
+function pageCursor(res: Record<string, unknown>): string | null {
+  if (!('cursor' in res) || (res.cursor !== null && typeof res.cursor !== 'string')) throw protocolError('cursor must be a string or null');
+  return res.cursor;
 }
 
 /** HTTP client for one relay. Every authenticated call uses a strictly increasing timestamp. */
@@ -168,7 +240,7 @@ export class RelayClient {
           headers: { Accept: 'application/json', ...(init.body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...init.headers },
           body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
           signal: controller.signal,
-          redirect: 'error',
+          redirect: 'manual', // never followed: a 3xx is relay_protocol_error
         });
       } catch (e) {
         throw new ACEError('relay_unavailable', `request failed: ${e instanceof Error ? e.message : String(e)}`.slice(0, 300), { cause: e });
@@ -230,7 +302,7 @@ export class RelayClient {
   /** `GET /v1/discover`; unverifiable entries are dropped and counted in `rejected`. */
   async discover(q: DiscoverQuery = {}): Promise<{ agents: VerifiedPeer[]; rejected: number; cursor: string | null }> {
     const res = await this.#request('GET', this.#url('/v1/discover', {
-      q: q.q, tags: q.tags, chain: q.chain, scheme: q.scheme,
+      q: q.q, tags: tagsParam(q.tags), chain: q.chain, scheme: q.scheme,
       online: q.online === undefined ? undefined : String(q.online),
       limit: q.limit === undefined ? undefined : String(q.limit), cursor: q.cursor,
     }));
@@ -244,7 +316,7 @@ export class RelayClient {
         rejected++;
       }
     }
-    return { agents, rejected, cursor: typeof res.cursor === 'string' ? res.cursor : null };
+    return { agents, rejected, cursor: pageCursor(res) };
   }
 
   /** `POST /v1/send`. A valid `Outbox.deliver` transport. */
@@ -266,13 +338,17 @@ export class RelayClient {
       return { streamId: m.streamId, message: m.message };
     });
     if (entries.length > limit) throw protocolError('inbox page exceeds the limit');
-    return { entries, cursor: isStreamId(res.cursor) ? res.cursor : null };
+    if (!('cursor' in res) || (res.cursor !== null && !isStreamId(res.cursor))) throw protocolError('inbox cursor must be a stream ID or null');
+    return { entries, cursor: res.cursor };
   }
 
   /**
    * `GET /v1/listen` as an async iterable (catchup, then live). Reconnects internally: at once
-   * after a clean end or `drain`; after a failed connect or broken stream with backoff
-   * min(30 s, max(1, 2, 4 … s, Retry-After)). Any received frame resets the failure count;
+   * after a clean end or `drain` once that connection carried a `catchup`, `message` or `drain`
+   * frame; after a failed connect, a broken stream, or a stream that ended without one (only
+   * `connected`, heartbeats or nothing) with backoff min(30 s, max(1, 2, 4 … s, Retry-After)).
+   * A `catchup`, `message` or `drain` frame resets the failure count (`connected`, other event
+   * types and comments do not);
    * 10 consecutive failures → `relay_unavailable`; a non-retryable status → its mapped error;
    * a connection idle for 90 s counts as broken. Resumes after the last yielded stream ID.
    * Aborting `signal` ends the iteration promptly — during a stream (even one carrying only
@@ -291,15 +367,28 @@ export class RelayClient {
       // Only reading the stream is inside the try: an error from onOpen, or one thrown in at
       // the yield (`.throw()`), is the caller's and propagates as is — never a reconnect.
       const stream = this.#listenOnce(identity, since, signal);
+      let gotEvent = false; // a catchup / message / drain frame arrived on this connection
       try {
         while (true) {
-          let next: IteratorResult<ListenEvent | null | typeof CONNECTED, void>;
+          let next: IteratorResult<ListenEvent | null | typeof CONNECTED | typeof HEARTBEAT, void> | undefined;
+          let failure: ACEError | undefined;
           try {
             next = await stream.next();
           } catch (e) {
             if (signal?.aborted) return;
-            const err = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'listen failed', { cause: e });
-            if (err.code !== 'relay_unavailable') throw err;
+            failure = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'listen failed', { cause: e });
+            if (failure.code !== 'relay_unavailable') throw failure;
+          }
+          if (signal?.aborted) return; // checked on every frame, heartbeats included
+          if (next?.done === true) {
+            if (gotEvent) { // clean end or drain after progress: reconnect at once
+              failures = 0;
+              break;
+            }
+            failure = new ACEError('relay_unavailable', 'listen stream ended without progress');
+          }
+          if (failure !== undefined || next === undefined || next.done === true) {
+            const err = failure ?? new ACEError('relay_unavailable', 'listen failed');
             failures++;
             if (failures >= MAX_FAILED_CONNECTS) throw err;
             let delay = Math.min(this.#reconnectBaseMs * 2 ** (failures - 1), MAX_BACKOFF_MS);
@@ -307,17 +396,14 @@ export class RelayClient {
             await sleep(delay, signal);
             break;
           }
-          if (signal?.aborted) return; // checked on every frame, heartbeats included
-          if (next.done) { // clean end or drain: reconnect at once
-            failures = 0;
-            break;
-          }
           const ev = next.value;
           if (ev === CONNECTED) {
             o.onOpen?.();
             continue;
           }
+          if (ev === HEARTBEAT) continue;
           failures = 0;
+          gotEvent = true;
           if (ev === null) continue;
           yield ev;
           since = ev.streamId;
@@ -328,11 +414,11 @@ export class RelayClient {
     }
   }
 
-  /** One listen connection: yields CONNECTED once established, then events, or null for
-   * frames that carry no message. */
+  /** One listen connection: yields CONNECTED once established, then events, HEARTBEAT for
+   * comments, or null for events that carry no message. */
   async *#listenOnce(
     identity: ACEIdentity, since: string, signal?: AbortSignal,
-  ): AsyncGenerator<ListenEvent | null | typeof CONNECTED, void, undefined> {
+  ): AsyncGenerator<ListenEvent | null | typeof CONNECTED | typeof HEARTBEAT, void, undefined> {
     // Linked controller: aborts the fetch (and its body) on caller abort, connect timeout, or
     // generator exit. parseSSE also watches it and cancels the body reader itself, because
     // undici does not always cancel a body that is already streaming.
@@ -347,7 +433,7 @@ export class RelayClient {
         const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
         try {
           res = await this.#fetch(this.#url('/v1/listen', { since: since === '-' ? undefined : since }), {
-            headers: { Accept: 'text/event-stream', ...headers }, signal: controller.signal, redirect: 'error',
+            headers: { Accept: 'text/event-stream', ...headers }, signal: controller.signal, redirect: 'manual',
           });
         } catch (e) {
           throw new ACEError('relay_unavailable', `listen connect failed: ${e instanceof Error ? e.message : ''}`, { cause: e });
@@ -365,19 +451,18 @@ export class RelayClient {
       try {
         for await (const ev of parseSSE(res!.body, LISTEN_IDLE_MS, controller.signal)) {
           if (controller.signal.aborted) return;
-          if (ev.event === 'drain') return;
-          if (ev.event !== 'catchup' && ev.event !== 'message') {
-            yield null;
+          if (ev.event === ':') {
+            yield HEARTBEAT;
             continue;
           }
-          if (!isStreamId(ev.id)) throw protocolError('SSE message without a valid id');
-          let message: unknown;
-          try {
-            message = JSON.parse(ev.data);
-          } catch {
-            throw protocolError('SSE data is not JSON');
+          if (ev.event === 'drain') {
+            yield null; // progress: the relay asked for a reconnect, which is immediate
+            return;
           }
-          yield { streamId: ev.id, message, catchup: ev.event === 'catchup' };
+          // connected and unknown types are not progress (08 § Client Rules, Listen)
+          if (ev.event !== 'catchup' && ev.event !== 'message') continue;
+          if (!isStreamId(ev.id)) throw protocolError('SSE message without a valid id');
+          yield { streamId: ev.id, data: ev.data, catchup: ev.event === 'catchup' };
         }
       } catch (e) {
         if (signal?.aborted) return;
@@ -393,11 +478,12 @@ export class RelayClient {
   async postIntent(
     identity: ACEIdentity, i: { need: string; tags?: string[]; maxPrice?: string; currency?: string; ttl: number },
   ): Promise<{ intentId: string; expiresAt: number }> {
+    const tags = i.tags ?? [];
     const req: RelayAuthRequest = {
-      action: 'intent', need: i.need, tags: i.tags ?? [], maxPrice: i.maxPrice ?? null, currency: i.currency ?? null, ttl: i.ttl,
+      action: 'intent', need: i.need, tags, maxPrice: i.maxPrice ?? null, currency: i.currency ?? null, ttl: i.ttl,
     };
-    const body: Record<string, unknown> = { need: i.need, ttl: i.ttl };
-    if (i.tags !== undefined) body.tags = i.tags;
+    // the body mirrors the signed payload: tags is always sent (possibly empty)
+    const body: Record<string, unknown> = { need: i.need, tags, ttl: i.ttl };
     if (i.maxPrice !== undefined) body.maxPrice = i.maxPrice;
     if (i.currency !== undefined) body.currency = i.currency;
     const res = await this.#authed(identity, req, 'POST', this.#url('/v1/intents'), body);
@@ -405,14 +491,14 @@ export class RelayClient {
     return { intentId: res.intentId, expiresAt: res.expiresAt as number };
   }
 
-  async listIntents(q: { q?: string; tags?: string; limit?: number; cursor?: string } = {}): Promise<{ intents: Intent[]; cursor: string | null }> {
+  async listIntents(q: { q?: string; tags?: string[]; limit?: number; cursor?: string } = {}): Promise<{ intents: Intent[]; cursor: string | null }> {
     const res = await this.#request('GET', this.#url('/v1/intents', {
-      q: q.q, tags: q.tags, limit: q.limit === undefined ? undefined : String(q.limit), cursor: q.cursor,
+      q: q.q, tags: tagsParam(q.tags), limit: q.limit === undefined ? undefined : String(q.limit), cursor: q.cursor,
     }));
     if (!isObj(res) || !Array.isArray(res.intents)) throw protocolError('intents response must have intents');
     const intents = res.intents.map((x): Intent => {
       if (
-        !isObj(x) || typeof x.intentId !== 'string' || typeof x.from !== 'string' || typeof x.need !== 'string'
+        !isObj(x) || typeof x.intentId !== 'string' || !isACEId(x.from) || typeof x.need !== 'string'
         || !Array.isArray(x.tags) || !x.tags.every((t) => typeof t === 'string') || wireInt(x.ttl) === null
         || wireInt(x.createdAt) === null || wireInt(x.expiresAt) === null
       ) {
@@ -422,11 +508,18 @@ export class RelayClient {
         intentId: x.intentId, from: x.from, need: x.need, tags: x.tags as string[], ttl: x.ttl as number,
         createdAt: x.createdAt as number, expiresAt: x.expiresAt as number,
       };
-      if (typeof x.maxPrice === 'string') out.maxPrice = x.maxPrice;
-      if (typeof x.currency === 'string') out.currency = x.currency;
+      // optional fields: absent is fine; present but malformed is a protocol error
+      if (x.maxPrice !== undefined) {
+        if (typeof x.maxPrice !== 'string') throw protocolError('invalid intent maxPrice');
+        out.maxPrice = x.maxPrice;
+      }
+      if (x.currency !== undefined) {
+        if (typeof x.currency !== 'string') throw protocolError('invalid intent currency');
+        out.currency = x.currency;
+      }
       return out;
     });
-    return { intents, cursor: typeof res.cursor === 'string' ? res.cursor : null };
+    return { intents, cursor: pageCursor(res) };
   }
 
   /** `PUT /v1/webhook`: set or replace this identity's webhook. */
@@ -475,7 +568,9 @@ interface SSEEvent {
 
 /**
  * Internal: a minimal Server-Sent Events parser (HTML Living Standard § 9.2.6) over a byte
- * stream. Lines end in LF, CRLF or CR; `:` lines are comments; an empty line dispatches.
+ * stream. Lines end in LF, CRLF or CR; `:` lines are comments; an empty line dispatches the
+ * event if it has a `data` field (08-relay § Client Rules, Listen); `id` and `event` apply only
+ * to the event they appear in.
  * A line or event larger than MAX_ENVELOPE_BYTES + 512 is `relay_protocol_error`.
  * Aborting `signal` ends the iteration at once (pending reads included) and cancels the body;
  * so does closing the generator early.
@@ -514,14 +609,16 @@ export async function* parseSSE(
         buf = buf.slice(m.index + m[0].length);
         if (line.length > SSE_FRAME_LIMIT) throw protocolError('SSE line exceeds the frame limit');
         if (line === '') {
-          if (data.length > 0 || event !== '') yield { id, event: event || 'message', data: data.join('\n') };
+          // dispatch only an event with a data field; id and event are per event
+          if (data.length > 0) yield { id, event: event || 'message', data: data.join('\n') };
+          id = '';
           event = '';
           data = [];
           dataSize = 0;
           continue;
         }
         if (line.startsWith(':')) {
-          yield { id, event: ':', data: '' }; // heartbeat: liveness only
+          yield { id: '', event: ':', data: '' }; // heartbeat: liveness only
           continue;
         }
         const colon = line.indexOf(':');

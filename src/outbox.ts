@@ -1,4 +1,4 @@
-/** Sender durability: stage, deliver, re-sign, abandon (design §2.13, 06 § Durable Delivery, Sender). */
+/** Sender durability: stage, deliver, re-sign, abandon (06-security § Durable Delivery, Sender). */
 
 import { ACEError } from './errors.js';
 import {
@@ -12,7 +12,7 @@ import { repairThreadsFromDeliveries } from './inbox.js';
 import { ThreadStateMachine } from './state-machine.js';
 import type { ACEStore } from './store.js';
 import {
-  decodePendingSend, encodePendingSend, isRequestId, restoreMachine, snapshotWithHistory, ThreadStore,
+  decodePendingSend, encodePendingSend, isRequestId, restoreMachine, snapshotWithHistory, ThreadRecords,
   type PendingSend, type ThreadRecord,
 } from './thread-store.js';
 import type { ACEIdentity, ACEMessage, JSONObject, MessageType } from './types.js';
@@ -36,7 +36,7 @@ type Located =
 export class Outbox {
   readonly #identity: ACEIdentity;
   readonly #store: ACEStore;
-  readonly #threads: ThreadStore;
+  readonly #threads: ThreadRecords;
   readonly #clock?: () => number;
 
   private constructor(o: { identity: ACEIdentity; store: ACEStore; clock?: () => number }) {
@@ -48,7 +48,7 @@ export class Outbox {
     this.#clock = o.clock;
     const local = o.identity.getACEId();
     if (!isACEId(local)) throw new ACEError('invalid_argument', 'identity has an invalid ACE ID');
-    this.#threads = new ThreadStore({ store: o.store, localAceId: local, clock: o.clock });
+    this.#threads = new ThreadRecords({ store: o.store, localAceId: local, clock: o.clock });
   }
 
   /**
@@ -113,22 +113,26 @@ export class Outbox {
   }
 
   /**
-   * Hand the pending envelope to `transport`. On success the send is acknowledged
-   * (economic: the thread's pending is cleared; otherwise the outbox file is deleted).
-   * `envelope_expired` marks it `expired` (then `resign`); any other error leaves it unchanged.
+   * Hand the pending envelope to `transport` and return what it returns. On success the send
+   * is acknowledged (economic: the thread's pending is cleared; otherwise the outbox file is
+   * deleted). An `expired` send is refused with `envelope_expired` before any transport call;
+   * `envelope_expired` from the transport marks it `expired` (then `resign`); any other error
+   * leaves it unchanged.
    */
-  async deliver(requestId: string, transport: (env: ACEMessage) => Promise<void>): Promise<void> {
+  async deliver<T>(requestId: string, transport: (env: ACEMessage) => Promise<T>): Promise<T> {
     if (typeof transport !== 'function') throw new ACEError('invalid_argument', 'transport must be a function');
     const found = await this.#require(requestId);
     if (found.pending.status === 'expired') throw new ACEError('envelope_expired', 'the pending send expired; resign it first');
     const message = found.pending.message;
+    let result: T;
     try {
-      await transport(message);
+      result = await transport(message);
     } catch (e) {
       if (e instanceof ACEError && e.code === 'envelope_expired') await this.#markExpired(requestId, message.messageId);
       throw e;
     }
     await this.#acknowledge(requestId, message.messageId);
+    return result;
   }
 
   /**

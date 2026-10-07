@@ -1,4 +1,4 @@
-// ACE Protocol SDK — public API (design §2.15). Everything not exported here is internal.
+// ACE Protocol SDK — public API. Everything not exported here (or from ./node) is internal.
 
 export type {
   ACEIdentity, SigningScheme, IdentityTier, HardwareBacking, RegistrationFile, SigningConfig, Capability,
@@ -9,18 +9,18 @@ export type {
 } from './types.js';
 export type { ThreadState, ThreadSnapshot, ThreadHistoryEntry, ThreadEvent } from './state-machine.js';
 export type { RelayAuthRequest, WebhookMethod } from './auth.js';
-export type { Webhook } from './relay.js';
+export type { Webhook, ListenEvent, InboxPage } from './relay.js';
 export type { WebhookNotification, WebhookNotificationInput } from './webhook.js';
-export type { ReceiveSource, ReceiveOutcome } from './inbox.js';
+export type { ReceiveSource, ReceiveOutcome, DirectReply } from './inbox.js';
 export type { PendingSend } from './outbox.js';
 export type { ACEStore } from './store.js';
 export type { ACEErrorCode, ACEErrorCategory } from './errors.js';
 export type { SoftwareIdentityExport } from './identity.js';
 
 export { ACEError } from './errors.js';
-export { MESSAGE_TYPES, ECONOMIC_TYPES, isMessageType, isEconomicType } from './types.js';
+export { MESSAGE_TYPES, ECONOMIC_TYPES, isMessageType, isEconomicType, SIGNING_SCHEMES, isSigningScheme } from './types.js';
 export {
-  MAX_PLAINTEXT_BYTES, MAX_PAYLOAD_BYTES, MAX_ENVELOPE_BYTES, MAX_JSON_DEPTH, MAX_THREAD_ID_LENGTH,
+  MAX_PLAINTEXT_BYTES, MAX_PAYLOAD_BYTES, MAX_ENVELOPE_BYTES, MAX_DIRECT_BODY_BYTES, MAX_JSON_DEPTH, MAX_THREAD_ID_LENGTH,
   MAX_OPEN_THREADS_PER_PEER, TIMESTAMP_WINDOW_SECONDS, OFFLINE_WINDOW_SECONDS, MAX_REGISTRATION_FILE_BYTES, MAX_INBOX_PAGE,
   KEM_SEED_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_CIPHERTEXT_SIZE, DEFAULT_REPLAY_CAPACITY,
 } from './limits.js';

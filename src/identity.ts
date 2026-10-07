@@ -7,8 +7,7 @@ import { decodeB64, toBase64 } from './encoding.js';
 import { decryptWithSeed, generateKemSeed, kemPublicKeyFromSeed } from './encryption.js';
 import { KEM_SEED_SIZE } from './limits.js';
 import { computeACEId, signingAddress } from './signing.js';
-import { createRegistrationFile } from './registration.js';
-import type { ACEIdentity, RegistrationFile, SigningScheme } from './types.js';
+import type { ACEIdentity, SigningScheme } from './types.js';
 import { isSigningScheme } from './types.js';
 
 export interface SoftwareIdentityExport {
@@ -113,16 +112,6 @@ export class SoftwareIdentity implements ACEIdentity {
       signingPrivateKey: toBase64(this.#signingPrivateKey),
       encryptionPrivateKey: toBase64(this.#seed),
     };
-  }
-
-  /** Public information only. */
-  toJSON(): { aceId: string; scheme: SigningScheme; address: string } {
-    return { aceId: this.#aceId, scheme: this.#scheme, address: this.getAddress() };
-  }
-
-  /** Build this identity's registration file (`createRegistrationFile(this, opts)`). */
-  toRegistrationFile(opts: Parameters<typeof createRegistrationFile>[1]): RegistrationFile {
-    return createRegistrationFile(this, opts);
   }
 }
 

@@ -1,20 +1,22 @@
-/** The receive engine: verify, commit durably, hand over exactly once (design §2.12, 06 § Durable Delivery). */
+/** The receive engine: verify, commit durably, hand over exactly once (06-security § Durable Delivery). */
 
-import { ACEError } from './errors.js';
+import { ACEError, errorDetail } from './errors.js';
 import {
-  canonicalStateBytes, codePointLength, isACEId, isConversationId, isMessageId, isStreamId, isThreadId, pairKey,
-  parseStateBytes, wireInt,
+  canonicalStateBytes, codePointLength, isACEId, isConversationId, isMessageId, isObj, isStreamId, isThreadId, pairKey,
+  parseStateBytes, utf8, wireInt,
 } from './encoding.js';
 import { computeConversationId } from './encryption.js';
 import { decodeEnvelope, envelopeFingerprint, envelopeKnownFields } from './envelope.js';
-import { MAX_INBOX_PAGE, OFFLINE_WINDOW_SECONDS, DEFAULT_REPLAY_CAPACITY } from './limits.js';
+import {
+  DEFAULT_REPLAY_CAPACITY, MAX_DIRECT_BODY_BYTES, MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE, OFFLINE_WINDOW_SECONDS, TIMESTAMP_WINDOW_SECONDS,
+} from './limits.js';
 import { eventOf, parseMessage } from './messages.js';
 import type { PeerStore } from './peer-store.js';
 import { compareStreamIds, normalizeRelayUrl, type RelayClient } from './relay.js';
-import { ReplayDetector } from './replay.js';
+import { ReplayDetector, replayCovers } from './replay.js';
 import { ThreadStateMachine, type ThreadSnapshot } from './state-machine.js';
 import { SerialQueue, type ACEStore } from './store.js';
-import { compareHistories, restoreMachine, ThreadStore, type ThreadRecord } from './thread-store.js';
+import { compareHistories, restoreMachine, ThreadRecords, type ThreadRecord } from './thread-store.js';
 import type { ACEIdentity, ACEMessage, JSONObject, ParsedMessage, ReplayState } from './types.js';
 import { isEconomicType, isMessageType } from './types.js';
 
@@ -25,6 +27,16 @@ export type ReceiveOutcome =
   | { kind: 'duplicate'; from: string; messageId: string }
   | { kind: 'quarantined'; error: ACEError; fingerprint: string | null }
   | { kind: 'retryable'; error: ACEError };
+
+/**
+ * The HTTP answer to a direct-delivery request (08-relay § Direct Delivery). `outcome` is set
+ * when the `message` member reached the pipeline.
+ */
+export interface DirectReply {
+  status: 200 | 400 | 413 | 503;
+  body: { ok: true; messageId: string } | { ok: false; error: string };
+  outcome?: ReceiveOutcome;
+}
 
 /**
  * The result of `Inbox.pull`: every non-retryable outcome in relay order, the error that
@@ -93,7 +105,7 @@ const CURSORS_KEY = 'cursors.json';
 const QUARANTINE_CAP = 1000;
 const QUARANTINE_FLOOR = 900;
 const SWEEP_EVERY = 1024;
-const DIRECT_WINDOW_SECONDS = 300;
+const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
 
 function deliveryKey(from: string, messageId: string): string {
   return `deliveries/${pairKey(from, messageId)}.json`;
@@ -124,7 +136,7 @@ export class Inbox {
   readonly #identity: ACEIdentity;
   readonly #store: ACEStore;
   readonly #peers: PeerStore;
-  readonly #threads: ThreadStore;
+  readonly #threads: ThreadRecords;
   readonly #onMessage: (m: ParsedMessage) => void | Promise<void>;
   readonly #offline: number;
   readonly #clock?: () => number;
@@ -149,7 +161,7 @@ export class Inbox {
     this.#releaseReceive = release;
     this.#replay = replay;
     this.#cursors = cursors;
-    this.#threads = new ThreadStore({ store: o.store, localAceId: o.identity.getACEId(), clock: o.clock });
+    this.#threads = new ThreadRecords({ store: o.store, localAceId: o.identity.getACEId(), clock: o.clock });
   }
 
   /** Acquire the `receive` lock, load state and run recovery. */
@@ -163,10 +175,11 @@ export class Inbox {
     const offline = o.offlineWindowSeconds ?? OFFLINE_WINDOW_SECONDS;
     if (wireInt(offline) === null || offline < 300) throw new ACEError('invalid_argument', 'offlineWindowSeconds must be an integer >= 300');
     const capacity = o.capacity ?? DEFAULT_REPLAY_CAPACITY;
+    if (wireInt(capacity) === null || capacity < 1) throw new ACEError('invalid_argument', 'capacity must be an integer >= 1');
     const release = await o.store.lock('receive', { timeoutMs: 0 });
     try {
       const now = Math.floor(o.clock ? o.clock() : Date.now() / 1000);
-      const threads = new ThreadStore({ store: o.store, localAceId: local, clock: o.clock });
+      const threads = new ThreadRecords({ store: o.store, localAceId: local, clock: o.clock });
       const replay = await Inbox.#loadReplay(o.store, threads, capacity, now, offline, o.clock);
       const cursors = await Inbox.#loadCursors(o.store);
       const inbox = new Inbox(o, release, replay, cursors);
@@ -179,7 +192,7 @@ export class Inbox {
   }
 
   static async #loadReplay(
-    store: ACEStore, threads: ThreadStore, capacity: number, now: number, offline: number, clock?: () => number,
+    store: ACEStore, threads: ThreadRecords, capacity: number, now: number, offline: number, clock?: () => number,
   ): Promise<ReplayDetector> {
     const raw = await store.read(REPLAY_KEY);
     if (raw !== null) {
@@ -233,9 +246,66 @@ export class Inbox {
     return this.#cursors[relay.baseUrl] ?? null;
   }
 
-  /** Verify and commit one envelope. Calls are serialized. */
-  receive(envelope: unknown, source: ReceiveSource): Promise<ReceiveOutcome> {
-    return this.#queue.run(() => this.#receive(envelope, source));
+  /**
+   * Verify and commit one message given as its raw bytes (UTF-8 JSON of an envelope). Bytes
+   * that are oversize, not JSON or not an envelope are a `quarantined` outcome
+   * (`invalid_envelope`). Calls are serialized. A closed inbox, non-bytes `message` or an
+   * invalid `source` throws `invalid_argument`.
+   */
+  async receive(message: Uint8Array, source: ReceiveSource): Promise<ReceiveOutcome> {
+    this.#checkOpen();
+    if (!(message instanceof Uint8Array)) throw new ACEError('invalid_argument', 'message must be bytes');
+    const relayUrl = checkSource(source);
+    return this.#queue.run(() => this.#receive(message, source, relayUrl));
+  }
+
+  /**
+   * Answer one direct-delivery request body (`POST <endpoint>` with `{"message": Envelope}`),
+   * exactly as 08-relay § Direct Delivery specifies: 413 when larger than
+   * `MAX_DIRECT_BODY_BYTES`, 400 `invalid_argument` unless it is UTF-8 JSON whose top level is
+   * an object with a `message` member, otherwise the outcome of receiving `message` as a
+   * direct-sourced message. HTTP serving, routing and rate limiting stay with the application.
+   * A closed inbox answers 503 `internal_error`: not a fault of the request, so the sender
+   * falls back to the relay.
+   */
+  async receiveDirect(body: Uint8Array): Promise<DirectReply> {
+    if (!(body instanceof Uint8Array)) throw new ACEError('invalid_argument', 'body must be bytes');
+    const fail = (status: 400 | 413 | 503, error: string, outcome?: ReceiveOutcome): DirectReply =>
+      outcome === undefined ? { status, body: { ok: false, error } } : { status, body: { ok: false, error }, outcome };
+    if (this.#closed) return fail(503, 'internal_error');
+    if (body.length > MAX_DIRECT_BODY_BYTES) return fail(413, 'payload_too_large');
+    let request: unknown;
+    try {
+      request = JSON.parse(strictUtf8.decode(body));
+    } catch {
+      return fail(400, 'invalid_argument');
+    }
+    if (!isObj(request) || !Object.hasOwn(request, 'message')) {
+      return fail(400, 'invalid_argument');
+    }
+    let outcome: ReceiveOutcome;
+    try {
+      const message = request.message;
+      outcome = await this.receive(utf8(JSON.stringify(message)), { kind: 'direct' });
+    } catch (e) {
+      if (this.#closed) return fail(503, 'internal_error'); // closed meanwhile
+      if (e instanceof ACEError) return fail(e.isTransient ? 503 : 400, e.code);
+      return fail(503, 'internal_error');
+    }
+    switch (outcome.kind) {
+      case 'delivered':
+        return { status: 200, body: { ok: true, messageId: outcome.message.messageId }, outcome };
+      case 'duplicate':
+        return { status: 200, body: { ok: true, messageId: outcome.messageId }, outcome };
+      case 'quarantined':
+        return fail(400, outcome.error.code, outcome);
+      case 'retryable':
+        return fail(503, outcome.error.code, outcome);
+    }
+  }
+
+  #checkOpen(): void {
+    if (this.#closed) throw new ACEError('invalid_argument', 'inbox is closed');
   }
 
   /**
@@ -281,7 +351,8 @@ export class Inbox {
       for (const entry of page.entries) {
         // an aborted caller stops before the next entry; the cursor marks the spot
         if (signal?.aborted) return 'stopped';
-        const out = await this.receive(entry.message, { kind: 'relay', relayUrl: relay.baseUrl, streamId: entry.streamId });
+        // the page carries parsed JSON; the pipeline takes the message's bytes
+        const out = await this.receive(utf8(JSON.stringify(entry.message)), { kind: 'relay', relayUrl: relay.baseUrl, streamId: entry.streamId });
         yield out;
         if (out.kind === 'retryable') return out.error;
         since = entry.streamId;
@@ -312,7 +383,7 @@ export class Inbox {
     }
     const since = this.cursor(relay) ?? undefined;
     for await (const ev of relay.listen(this.#identity, { since, signal: o.signal, onOpen: o.onLive })) {
-      const out = await this.receive(ev.message, { kind: 'relay', relayUrl: relay.baseUrl, streamId: ev.streamId });
+      const out = await this.receive(utf8(ev.data), { kind: 'relay', relayUrl: relay.baseUrl, streamId: ev.streamId });
       yield out;
       if (out.kind === 'retryable') throw out.error;
     }
@@ -334,18 +405,10 @@ export class Inbox {
 
   // --- receive ---
 
-  async #receive(envelope: unknown, source: ReceiveSource): Promise<ReceiveOutcome> {
-    if (this.#closed) return { kind: 'retryable', error: new ACEError('storage_failed', 'inbox is closed') };
+  async #receive(raw: Uint8Array, source: ReceiveSource, relayUrl: string | null): Promise<ReceiveOutcome> {
+    this.#checkOpen();
     if (this.#failed) return { kind: 'retryable', error: new ACEError('storage_failed', 'inbox is in a failed state; close and reopen to recover') };
-    let relayUrl: string | null = null;
-    if (typeof source !== 'object' || source === null || (source.kind !== 'relay' && source.kind !== 'direct')) {
-      throw new ACEError('invalid_argument', 'source must be {kind: "relay" | "direct"}');
-    }
-    if (source.kind === 'relay') {
-      relayUrl = normalizeRelayUrl(source.relayUrl);
-      if (source.streamId !== undefined && !isStreamId(source.streamId)) throw new ACEError('invalid_argument', 'invalid streamId');
-    }
-    const outcome = await this.#process(envelope, source);
+    const outcome = await this.#process(raw, source);
     if (relayUrl !== null && source.kind === 'relay' && source.streamId !== undefined && outcome.kind !== 'retryable') {
       const cur = this.#cursors[relayUrl];
       if (cur === undefined || compareStreamIds(source.streamId, cur) > 0) {
@@ -358,7 +421,7 @@ export class Inbox {
         }
       }
     }
-    if (outcome.kind !== 'retryable' && ++this.#sinceSweep >= SWEEP_EVERY) {
+    if (outcome.kind === 'delivered' && ++this.#sinceSweep >= SWEEP_EVERY) {
       this.#sinceSweep = 0;
       try {
         await this.#sweep();
@@ -374,17 +437,24 @@ export class Inbox {
     return { kind: 'retryable', error: this.#failed };
   }
 
-  async #process(envelope: unknown, source: ReceiveSource): Promise<ReceiveOutcome> {
+  async #process(raw: Uint8Array, source: ReceiveSource): Promise<ReceiveOutcome> {
     const relaySourced = source.kind === 'relay';
     // 1. decode
     let env: ACEMessage;
     try {
-      env = decodeEnvelope(envelope);
+      if (raw.length > MAX_ENVELOPE_BYTES) throw new ACEError('invalid_envelope', `message exceeds ${MAX_ENVELOPE_BYTES} bytes`);
+      let json: unknown;
+      try {
+        json = JSON.parse(strictUtf8.decode(raw));
+      } catch {
+        throw new ACEError('invalid_envelope', 'message is not UTF-8 JSON');
+      }
+      env = decodeEnvelope(json);
     } catch (e) {
       return { kind: 'quarantined', error: e as ACEError, fingerprint: null };
     }
     // 2. direct freshness
-    if (!relaySourced && Math.abs(this.#now() - env.timestamp) > DIRECT_WINDOW_SECONDS) {
+    if (!relaySourced && Math.abs(this.#now() - env.timestamp) > TIMESTAMP_WINDOW_SECONDS) {
       return { kind: 'quarantined', error: new ACEError('stale_timestamp', 'direct message outside the freshness window'), fingerprint: envelopeFingerprint(env) };
     }
     const quarantine = async (error: ACEError): Promise<ReceiveOutcome> => {
@@ -543,7 +613,7 @@ export class Inbox {
   }
 
   #covered(from: string, ts: number): boolean {
-    return ts <= Math.max(this.#replay.horizon, this.#replay.senderHorizon(from) ?? this.#replay.horizon);
+    return replayCovers(this.#replay, from, ts);
   }
 
   async #ack(key: string, d: DeliveryRecord): Promise<void> {
@@ -553,7 +623,7 @@ export class Inbox {
 
   async #writeQuarantine(env: ACEMessage, error: ACEError): Promise<string> {
     const fingerprint = envelopeFingerprint(env);
-    let reason = error.message;
+    let reason = errorDetail(error);
     if (codePointLength(reason) > 1000) reason = [...reason].slice(0, 1000).join('');
     const key = `quarantine/${fingerprint}.json`;
     await this.#store.write(key, canonicalStateBytes({
@@ -599,7 +669,12 @@ export class Inbox {
   // --- recovery ---
 
   async #recover(): Promise<void> {
-    const records = await readDeliveries(this.#store, this.#identity.getACEId());
+    // acked records covered by a horizon are only deleted: their threads may have been pruned
+    const records: Array<[string, DeliveryRecord]> = [];
+    for (const [key, d] of await readDeliveries(this.#store, this.#identity.getACEId())) {
+      if (d.status === 'acked' && this.#covered(d.message.from, d.message.timestamp)) await this.#store.delete(key);
+      else records.push([key, d]);
+    }
     await this.#threads.withLock(() => repairThreads(this.#threads, records));
     let replayChanged = false;
     const floor = this.#floor();
@@ -677,7 +752,7 @@ async function readDeliveries(store: ACEStore, localAceId: string): Promise<Arra
 }
 
 /** Write every delivery snapshot that strictly extends its stored thread (caller holds `threads`). */
-async function repairThreads(threads: ThreadStore, records: Array<[string, DeliveryRecord]>): Promise<void> {
+async function repairThreads(threads: ThreadRecords, records: Array<[string, DeliveryRecord]>): Promise<void> {
   for (const [, d] of records) {
     const snap = d.thread;
     if (snap === null) continue;
@@ -689,11 +764,37 @@ async function repairThreads(threads: ThreadStore, records: Array<[string, Deliv
 }
 
 /**
- * Internal (Outbox.open): under lock `threads`, repair thread records from `deliveries/`.
- * Never hands messages over and never touches replay state.
+ * Internal (Outbox.open): under lock `threads`, repair thread records from `deliveries/`,
+ * skipping acked records covered by the persisted replay horizons (their threads may have
+ * been pruned). Never hands messages over and never writes replay state.
  */
-export async function repairThreadsFromDeliveries(store: ACEStore, threads: ThreadStore): Promise<void> {
-  await threads.withLock(async () => repairThreads(threads, await readDeliveries(store, threads.localAceId)));
+export async function repairThreadsFromDeliveries(store: ACEStore, threads: ThreadRecords): Promise<void> {
+  await threads.withLock(async () => {
+    const records = await readDeliveries(store, threads.localAceId);
+    if (records.length === 0) return;
+    // the persisted horizons, read as stored (no replay state: nothing is covered)
+    const raw = await store.read(REPLAY_KEY);
+    let covers = (_from: string, _ts: number): boolean => false;
+    if (raw !== null) {
+      const doc = parseStateBytes(raw, REPLAY_KEY) as Partial<ReplayState>;
+      const h = wireInt(doc?.horizon);
+      const sh = doc?.senderHorizons;
+      if (h === null || typeof sh !== 'object' || sh === null) throw new ACEError('storage_failed', 'replay.json is invalid');
+      covers = (from, ts) => ts <= Math.max(h, wireInt((sh as Record<string, unknown>)[from]) ?? h);
+    }
+    const live = records.filter(([, d]) => !(d.status === 'acked' && covers(d.message.from, d.message.timestamp)));
+    await repairThreads(threads, live);
+  });
+}
+
+/** Validate a receive source; returns the normalized relay URL (null for direct). */
+function checkSource(source: ReceiveSource): string | null {
+  if (typeof source !== 'object' || source === null || (source.kind !== 'relay' && source.kind !== 'direct')) {
+    throw new ACEError('invalid_argument', 'source must be {kind: "relay" | "direct"}');
+  }
+  if (source.kind === 'direct') return null;
+  if (source.streamId !== undefined && !isStreamId(source.streamId)) throw new ACEError('invalid_argument', 'invalid streamId');
+  return normalizeRelayUrl(source.relayUrl);
 }
 
 /** Keep the stored pending send unless an inbound entry now follows it (delivery proven). */

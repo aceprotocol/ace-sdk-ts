@@ -3,12 +3,13 @@
 import bs58 from 'bs58';
 import { ACEError, type ACEErrorCode } from './errors.js';
 import {
-  bytesEqual, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, wireInt,
+  bytesEqual, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, isObj, wireInt,
 } from './encoding.js';
 import { KEM_PUBLIC_KEY_SIZE, MAX_REGISTRATION_FILE_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import {
   buildSignData, computeACEId, encodePayload, isValidSigningPublicKey, signingAddress, verifySignature,
 } from './signing.js';
+import { loadHttps, loadLookup, pinnedRequest, type LookupFn } from './pinned-https.js';
 import type {
   AgentProfile, Capability, ChainInfo, PeerRecord, ProfilePricing, RegistrationFile, SigningScheme,
 } from './types.js';
@@ -111,10 +112,6 @@ export function isVerifiedPeer(x: unknown): x is VerifiedPeer {
 // --- strict readers ---------------------------------------------------------------------
 
 type Kind = 'string' | 'object' | 'array';
-
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 function opt(d: Record<string, unknown>, key: string, kind: Kind, code: ACEErrorCode, what: string): any {
   const v = d[key];
@@ -427,7 +424,8 @@ function parseV4(ip: string): number | null {
 }
 
 function parseV6(ip: string): Uint8Array | null {
-  let s = ip.split('%')[0].toLowerCase();
+  if (!ip.includes(':')) return null;
+  let s = ip.split('%')[0].toLowerCase(); // a %zone is ignored
   let tail: number[] = [];
   if (s.includes('.')) {
     const i = s.lastIndexOf(':');
@@ -465,7 +463,7 @@ function v4Blocked(n: number): boolean {
 }
 
 /**
- * SSRF blocklist (design §2.8): true for any address that is not public, or not an IP literal.
+ * SSRF blocklist (08-relay § Client Rules, Blocked Addresses): true for any blocked address, or an input that is not an IP literal.
  * IPv4-mapped and 64:ff9b::/96 are judged by the embedded IPv4. Exported so callers that open
  * their own connections (e.g. direct delivery) apply the same policy.
  */
@@ -482,31 +480,12 @@ export function isBlockedAddress(ip: string): boolean {
   return V6_BLOCKED.some(([net, p]) => inV6(v6, net, p));
 }
 
-type LookupFn = (host: string, opts: { all: true; verbatim: true }) => Promise<Array<{ address: string; family: number }>>;
-
 /** Internal: injectable network dependencies (tests). */
 export interface FetchDeps {
   /** DNS resolution (default `node:dns` lookup; `null` = non-Node runtime, no DNS check). */
   lookup?: LookupFn | null;
   /** TCP port (default 443). */
   port?: number;
-}
-
-async function nodeHttps(): Promise<typeof import('node:https') | null> {
-  try {
-    return await import('node:https');
-  } catch {
-    return null;
-  }
-}
-
-async function defaultLookup(): Promise<LookupFn | null> {
-  try {
-    const dns = await import('node:dns');
-    return dns.promises.lookup as unknown as LookupFn;
-  } catch {
-    return null;
-  }
 }
 
 export interface FetchRegistrationFileOptions {
@@ -543,8 +522,8 @@ export async function fetchRegistrationFileWith(
     throw new ACEError('invalid_argument', 'timeoutMs must be positive');
   }
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new ACEError('invalid_argument', 'maxBytes must be a positive integer');
-  const lookup = deps.lookup === undefined ? await defaultLookup() : deps.lookup;
-  const https = lookup === null ? null : await nodeHttps();
+  const lookup = deps.lookup === undefined ? await loadLookup() : deps.lookup;
+  const https = lookup === null ? null : await loadHttps();
   let res: { status: number; contentType: string; body: () => Promise<Uint8Array> };
   if (lookup !== null && https !== null) {
     let addrs: Array<{ address: string; family: number }>;
@@ -557,7 +536,11 @@ export async function fetchRegistrationFileWith(
     if (opts.allowPrivateAddresses !== true && addrs.some((a) => isBlockedAddress(a.address))) {
       throw new ACEError('blocked_address', `${domain.slice(0, 100)} resolves to a blocked address`);
     }
-    res = await httpsGet(https, domain, addrs[0], deps.port ?? 443, timeoutMs, maxBytes + 1);
+    res = await pinnedRequest(https, {
+      host: domain, addr: addrs[0], port: deps.port ?? 443, path: '/.well-known/ace.json', method: 'GET',
+      headers: { Accept: 'application/json' }, timeoutMs, limit: maxBytes + 1, readBody: (status) => status === 200,
+      fail: (message) => new ACEError('fetch_failed', message),
+    });
   } else {
     res = await fetchGet(domain, timeoutMs, maxBytes + 1);
   }
@@ -579,67 +562,6 @@ export async function fetchRegistrationFileWith(
   const reg = parseRegistrationFile(data);
   verifyRegistrationFile(reg);
   return reg;
-}
-
-/** Node: one GET pinned to the validated address. */
-function httpsGet(
-  https: typeof import('node:https'), domain: string, addr: { address: string; family: number }, port: number,
-  timeoutMs: number, limit: number,
-): Promise<{ status: number; contentType: string; body: () => Promise<Uint8Array> }> {
-  return new Promise((resolve, reject) => {
-    const fail = (e: unknown) => reject(e instanceof ACEError ? e : new ACEError('fetch_failed', `fetch failed: ${e instanceof Error ? e.message : String(e)}`));
-    const pinned = (_host: string, o: unknown, cb: (...args: unknown[]) => void) => {
-      const all = typeof o === 'object' && o !== null && (o as { all?: boolean }).all === true;
-      if (all) cb(null, [{ address: addr.address, family: addr.family }]);
-      else cb(null, addr.address, addr.family);
-    };
-    const timer = setTimeout(() => {
-      req.destroy(new ACEError('fetch_failed', `timed out after ${timeoutMs} ms`));
-    }, timeoutMs);
-    (timer as { unref?: () => void }).unref?.();
-    const req = https.request({
-      host: domain, servername: domain, port, path: '/.well-known/ace.json', method: 'GET',
-      headers: { Accept: 'application/json' }, lookup: pinned as never, agent: false,
-    }, (msg) => {
-      const status = msg.statusCode ?? 0;
-      const contentType = String(msg.headers['content-type'] ?? '');
-      const body = () => new Promise<Uint8Array>((res2, rej2) => {
-        const chunks: Buffer[] = [];
-        let total = 0;
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          res2(new Uint8Array(Buffer.concat(chunks).subarray(0, limit)));
-        };
-        msg.on('data', (c: Buffer) => {
-          chunks.push(c);
-          total += c.length;
-          if (total >= limit) {
-            finish();
-            msg.destroy();
-          }
-        });
-        msg.on('end', finish);
-        msg.on('error', (e) => {
-          if (done) return;
-          clearTimeout(timer);
-          rej2(new ACEError('fetch_failed', `read failed: ${e.message}`));
-        });
-      });
-      if (status !== 200) {
-        clearTimeout(timer);
-        msg.resume();
-      }
-      resolve({ status, contentType, body });
-    });
-    req.on('error', (e) => {
-      clearTimeout(timer);
-      fail(e);
-    });
-    req.end();
-  });
 }
 
 /** Non-Node runtimes: plain fetch (no DNS check possible). */

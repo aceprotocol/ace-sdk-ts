@@ -1,9 +1,11 @@
 /** Webhook notifications (08-relay § Webhooks): signing (relay side) and verification (agent side). */
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { hmac } from '@noble/hashes/hmac.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import { ACEError } from './errors.js';
 import { assertFresh, freshnessWindow, parseTimestamp } from './auth.js';
-import { decimal, isACEId, isStreamId, wireInt } from './encoding.js';
+import { decimal, isACEId, isStreamId, utf8, wireInt } from './encoding.js';
 
 const SIG_RE = /^sha256=[0-9a-f]{64}$/;
 const bodyDecoder = new TextDecoder('utf-8', { fatal: true });
@@ -26,11 +28,23 @@ export interface WebhookNotificationInput {
 export function signWebhookNotification(secret: string, timestamp: number, body: Uint8Array | string): string {
   if (typeof secret !== 'string') throw new ACEError('invalid_argument', 'secret must be a string');
   if (wireInt(timestamp) === null) throw new ACEError('invalid_argument', 'timestamp must be a wire integer');
-  return 'sha256=' + webhookMac(secret, timestamp, body).toString('hex');
+  return 'sha256=' + bytesToHex(webhookMac(secret, timestamp, body));
 }
 
-function webhookMac(secret: string, timestamp: number, body: Uint8Array | string): Buffer {
-  return createHmac('sha256', secret).update(`${decimal(timestamp)}.`).update(body).digest();
+function webhookMac(secret: string, timestamp: number, body: Uint8Array | string): Uint8Array {
+  return hmac.create(sha256, utf8(secret))
+    .update(utf8(`${decimal(timestamp)}.`))
+    .update(typeof body === 'string' ? utf8(body) : body)
+    .digest();
+}
+
+/** Constant-time comparison of a MAC with lowercase hex `expected` (length already checked). */
+function macEquals(mac: Uint8Array, expectedHex: string): boolean {
+  const got = bytesToHex(mac);
+  if (got.length !== expectedHex.length) return false;
+  let diff = 0;
+  for (let i = 0; i < got.length; i++) diff |= got.charCodeAt(i) ^ expectedHex.charCodeAt(i);
+  return diff === 0;
 }
 
 /**
@@ -49,7 +63,8 @@ export function verifyWebhookNotification(o: WebhookNotificationInput): WebhookN
   if (ts === null) throw new ACEError('invalid_argument', 'X-ACE-Webhook-Timestamp is malformed');
   if (!SIG_RE.test(o.signature)) throw new ACEError('invalid_signature', 'X-ACE-Webhook-Signature is malformed');
   assertFresh(ts, freshnessWindow(o.windowSeconds), o.clock, 'X-ACE-Webhook-Timestamp');
-  if (!timingSafeEqual(webhookMac(o.secret, ts, o.body), Buffer.from(o.signature.slice('sha256='.length), 'hex'))) {
+  if (typeof o.body !== 'string' && !(o.body instanceof Uint8Array)) throw new ACEError('invalid_argument', 'body must be bytes or a string');
+  if (!macEquals(webhookMac(o.secret, ts, o.body), o.signature.slice('sha256='.length))) {
     throw new ACEError('invalid_signature', 'X-ACE-Webhook-Signature does not verify');
   }
   let parsed: unknown;

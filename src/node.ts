@@ -1,6 +1,9 @@
 /**
  * Node.js-only exports (`@ace-protocol/sdk/node`).
  *
+ * `postDirect` / `deliverDirectOrRelay`: the sending side of direct delivery
+ * (08-relay § Direct Delivery).
+ *
  * `FileStore(root)`: an `ACEStore` over a directory. Directories are 0700, files 0600.
  * Writes are atomic (temp file + fsync + rename + directory fsync). Locks are lock files
  * shared with the Python and Swift SDKs' protocol; concurrent mixed-language access to one
@@ -11,12 +14,46 @@ import { constants as fsc, promises as fs } from 'node:fs';
 import { hostname } from 'node:os';
 import { join, dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import * as https from 'node:https';
+import { promises as dns } from 'node:dns';
 import { ACEError } from './errors.js';
-import { checkKey, checkLockName, checkTimeout, lockTimeoutError, Mutex, type ACEStore } from './store.js';
+import { directOrRelayWith, postDirectWith, type DeliveryPath, type PostDirectOptions } from './direct.js';
+import type { LookupFn } from './pinned-https.js';
+import type { RelayClient } from './relay.js';
+import type { ACEMessage } from './types.js';
+import { checkKey, checkLockName, checkTimeout, checkValue, lockTimeoutError, MAX_VALUE_BYTES, Mutex, type ACEStore } from './store.js';
 
 export type { ACEStore } from './store.js';
+export type { DeliveryPath, PostDirectOptions } from './direct.js';
 
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
+/**
+ * POST `{"message": envelope}` to a peer's direct endpoint. The endpoint must be an ACE HTTPS
+ * URL whose host resolves only to non-blocked addresses (`isBlockedAddress`); the connection
+ * goes to the validated address (DNS pinned; SNI and certificate checks use the host name).
+ * Redirects are not followed; the default timeout is 5 s. Succeeds iff the answer is 2xx with
+ * JSON `{"ok": true}`.
+ *
+ * Errors: unsafe or malformed endpoint (or envelope) → `invalid_argument`; 400 or 413 →
+ * `direct_rejected` (permanent; `remoteCode` is the receiver's `error` when it matches
+ * `^[a-z0-9_]{1,64}$`; do not retry the envelope directly or through the relay); anything
+ * else (network, timeout, 429, 503, other status or body) → `direct_unavailable` (fall back
+ * to the relay).
+ */
+export async function postDirect(endpoint: string, envelope: ACEMessage, opts: PostDirectOptions = {}): Promise<void> {
+  await postDirectWith(endpoint, envelope, opts, { lookup: dns.lookup as unknown as LookupFn, https });
+}
+
+/**
+ * An `Outbox.deliver` transport: `postDirect` to `endpoint` when one is given, falling back
+ * to `relay.send` on `direct_unavailable` or an unsafe endpoint (`invalid_argument`). A
+ * `direct_rejected` is thrown (no relay fallback). Resolves to the path that delivered.
+ */
+export function deliverDirectOrRelay(
+  relay: Pick<RelayClient, 'send'>, endpoint?: string | null, opts: PostDirectOptions = {},
+): (env: ACEMessage) => Promise<DeliveryPath> {
+  return directOrRelayWith(relay, endpoint, (e, env) => postDirect(e, env, opts));
+}
+
 const LOCK_POLL_MS = 50;
 const STALE_UNPARSEABLE_MS = 60_000;
 const processMutexes = new Map<string, Mutex>();
@@ -92,11 +129,11 @@ export class FileStore implements ACEStore {
     try {
       const st = await fs.lstat(path);
       if (st.isSymbolicLink() || !st.isFile()) throw new ACEError('storage_failed', 'refusing a non-regular file');
-      if (st.size > MAX_FILE_BYTES) throw new ACEError('storage_failed', 'file exceeds 64 MiB');
+      if (st.size > MAX_VALUE_BYTES) throw new ACEError('storage_failed', 'file exceeds 64 MiB');
       const fh = await fs.open(path, fsc.O_RDONLY | fsc.O_NOFOLLOW);
       try {
         const data = await fh.readFile();
-        if (data.length > MAX_FILE_BYTES) throw new ACEError('storage_failed', 'file exceeds 64 MiB');
+        if (data.length > MAX_VALUE_BYTES) throw new ACEError('storage_failed', 'file exceeds 64 MiB');
         return new Uint8Array(data.buffer, data.byteOffset, data.length);
       } finally {
         await fh.close();
@@ -108,7 +145,7 @@ export class FileStore implements ACEStore {
   }
 
   async write(key: string, value: Uint8Array): Promise<void> {
-    if (!(value instanceof Uint8Array)) throw new ACEError('invalid_argument', 'value must be bytes');
+    checkValue(value);
     const path = (await this.#path(key, true))!;
     const dir = dirname(path);
     const tmp = join(dir, `.tmp-${randomBytes(8).toString('hex')}`);

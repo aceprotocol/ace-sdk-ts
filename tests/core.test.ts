@@ -12,8 +12,8 @@ import { isBlockedAddress } from '../src/discovery.js';
 import { expectCode, peerOf, codeOf } from './helpers.js';
 
 const VALUE_EXPORTS = [
-  'ACEError', 'MESSAGE_TYPES', 'ECONOMIC_TYPES', 'isMessageType', 'isEconomicType',
-  'MAX_PLAINTEXT_BYTES', 'MAX_PAYLOAD_BYTES', 'MAX_ENVELOPE_BYTES', 'MAX_JSON_DEPTH', 'MAX_THREAD_ID_LENGTH',
+  'ACEError', 'MESSAGE_TYPES', 'ECONOMIC_TYPES', 'isMessageType', 'isEconomicType', 'SIGNING_SCHEMES', 'isSigningScheme',
+  'MAX_PLAINTEXT_BYTES', 'MAX_PAYLOAD_BYTES', 'MAX_ENVELOPE_BYTES', 'MAX_DIRECT_BODY_BYTES', 'MAX_JSON_DEPTH', 'MAX_THREAD_ID_LENGTH',
   'MAX_OPEN_THREADS_PER_PEER', 'PullResult', 'createRegistrationFile',
   'TIMESTAMP_WINDOW_SECONDS', 'OFFLINE_WINDOW_SECONDS', 'MAX_REGISTRATION_FILE_BYTES', 'MAX_INBOX_PAGE',
   'KEM_SEED_SIZE', 'KEM_PUBLIC_KEY_SIZE', 'KEM_CIPHERTEXT_SIZE', 'DEFAULT_REPLAY_CAPACITY',
@@ -35,9 +35,9 @@ async function setup() {
 const now = () => Math.floor(Date.now() / 1000);
 
 describe('exports', () => {
-  it('index exports exactly the design list', () => {
+  it('index exports exactly the public list', () => {
     expect(Object.keys(api).sort()).toEqual([...VALUE_EXPORTS].sort());
-    expect(Object.keys(nodeApi)).toEqual(['FileStore']);
+    expect(Object.keys(nodeApi).sort()).toEqual(['FileStore', 'deliverDirectOrRelay', 'postDirect']);
   });
 
   it('ACEError categories', () => {
@@ -46,6 +46,19 @@ describe('exports', () => {
     expect(new ACEError('storage_failed').category).toBe('local');
     expect(new ACEError('handler_failed').isTransient).toBe(true);
     expect(() => new ACEError('nope' as never)).toThrow(TypeError);
+    expect(new ACEError('lock_busy').category).toBe('local');
+    expect(new ACEError('direct_rejected').category).toBe('permanent');
+    expect(new ACEError('direct_unavailable').category).toBe('transient');
+    expect(JSON.stringify(SoftwareIdentity.fromExport({ scheme: 'ed25519', signingPrivateKey: 'A'.repeat(43) + '=', encryptionPrivateKey: 'A'.repeat(43) + '=' }))).toBe('{}');
+  });
+
+  it('only the ./node entry imports node: modules statically', async () => {
+    const { readdirSync, readFileSync } = await import('node:fs');
+    const dir = new URL('../src/', import.meta.url);
+    for (const f of readdirSync(dir)) {
+      if (f === 'node.ts') continue;
+      expect(readFileSync(new URL(f, dir), 'utf8'), f).not.toMatch(/^import[^;]*from 'node:/m);
+    }
   });
 });
 
@@ -159,16 +172,16 @@ describe('peers and registration', () => {
 
   it('registration files: tier, ed25519 address round trip, id hash', async () => {
     const id = await SoftwareIdentity.generate('ed25519');
-    const reg = id.toRegistrationFile({ name: 'A', endpoint: 'https://a.example', tier: 1 });
+    const reg = createRegistrationFile(id, { name: 'A', endpoint: 'https://a.example', tier: 1 });
     expect(reg.tier).toBe(1);
     expect(verifyRegistrationFile(reg, { pinnedAt: 5 }).registeredAt).toBe(5);
     expect(codeOf(() => verifyRegistrationFile({ ...reg, id: 'ace:sha256:' + '0'.repeat(64) }))).toBe('invalid_registration');
     expect(codeOf(() => verifyRegistrationFile({ ...reg, endpoint: 'http://a.example' }))).toBe('invalid_registration');
     expect(codeOf(() => verifyRegistrationFile(reg, { pinnedAt: -1 }))).toBe('invalid_argument');
-    expect(() => id.toRegistrationFile({ name: 'A\n', endpoint: 'https://a.example' })).toThrow(ACEError);
+    expect(() => createRegistrationFile(id, { name: 'A\n', endpoint: 'https://a.example' })).toThrow(ACEError);
   });
 
-  it('createRegistrationFile works for any ACEIdentity (hardware-style wrapper), same as toRegistrationFile', async () => {
+  it('createRegistrationFile works for any ACEIdentity (hardware-style wrapper), same as for the software identity', async () => {
     for (const scheme of ['ed25519', 'secp256k1'] as const) {
       const sw = await SoftwareIdentity.generate(scheme);
       const hw: ACEIdentity = { // no SoftwareIdentity behind the interface
@@ -178,7 +191,7 @@ describe('peers and registration', () => {
       };
       const opts = { name: 'HW', endpoint: 'https://hw.example/ace', tier: 1 as const, hardwareBacking: 'secure-enclave' as const, settlement: ['x402'] };
       const reg = createRegistrationFile(hw, opts);
-      expect(reg).toEqual(sw.toRegistrationFile(opts));
+      expect(reg).toEqual(createRegistrationFile(sw, opts));
       expect(reg.signing.address).toBe(sw.getAddress());
       expect(verifyRegistrationFile(reg, { pinnedAt: 1 }).aceId).toBe(sw.getACEId());
       expect(codeOf(() => createRegistrationFile(hw, { name: '', endpoint: 'https://hw.example/ace' }))).toBe('invalid_registration');

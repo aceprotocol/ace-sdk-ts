@@ -2,7 +2,7 @@
 
 import { ACEError } from './errors.js';
 import {
-  canonicalJson, decodeB64, decodeSignature, isACEId, isConversationId, isMessageId, isThreadId,
+  canonicalJson, decodeB64, decodeSignature, isACEId, isConversationId, isMessageId, isObj, isThreadId,
   sha256Hex, wireInt,
 } from './encoding.js';
 import { MIN_PAYLOAD_BYTES } from './encryption.js';
@@ -13,10 +13,6 @@ import { isEconomicType, isMessageType, isSigningScheme } from './types.js';
 
 function bad(msg: string): ACEError {
   return new ACEError('invalid_envelope', msg);
-}
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 export function decodeKemCiphertext(text: unknown): Uint8Array {
@@ -38,7 +34,7 @@ export function decodePayload(text: unknown): Uint8Array {
  * Returns a fresh object with the known fields only (unknown fields are ignored).
  */
 export function decodeEnvelope(json: unknown): ACEMessage {
-  if (!isObject(json)) throw bad('envelope must be a JSON object');
+  if (!isObj(json)) throw bad('envelope must be a JSON object');
   const ace = json.ace;
   if (typeof ace !== 'string') throw bad('ace must be a string');
   if (ace !== '1.0') throw new ACEError('unsupported_version', `unsupported ACE version ${JSON.stringify(ace.slice(0, 16))}`);
@@ -56,11 +52,11 @@ export function decodeEnvelope(json: unknown): ACEMessage {
   const timestamp = wireInt(json.timestamp);
   if (timestamp === null) throw bad('timestamp must be an integer in [0, 2^53-1]');
   const enc = json.encryption;
-  if (!isObject(enc)) throw bad('encryption must be an object');
+  if (!isObj(enc)) throw bad('encryption must be an object');
   decodeKemCiphertext(enc.kemCiphertext);
   decodePayload(enc.payload);
   const sig = json.signature;
-  if (!isObject(sig)) throw bad('signature must be an object');
+  if (!isObj(sig)) throw bad('signature must be an object');
   if (!isSigningScheme(sig.scheme)) throw bad('unsupported signature scheme');
   decodeSignature(sig.value, sig.scheme, 'invalid_envelope');
   const env: ACEMessage = {

@@ -72,6 +72,13 @@ function tsArg(v: unknown, what: string): number {
   return n;
 }
 
+let coversImpl: (d: ReplayDetector, sender: string, ts: number) => boolean;
+
+/** Internal: true when `ts` is covered by the global horizon or `sender`'s horizon. */
+export function replayCovers(d: ReplayDetector, sender: string, ts: number): boolean {
+  return coversImpl(d, sender, ts);
+}
+
 export interface ReplayDetectorOptions {
   capacity?: number;
   horizon?: number;
@@ -115,13 +122,8 @@ export class ReplayDetector {
       : tsArg(opts.horizon, 'horizon');
   }
 
-  get horizon(): number {
-    return this.#horizon;
-  }
-
-  /** Internal: the sender horizon, if any. */
-  senderHorizon(sender: string): number | undefined {
-    return this.#sh.get(sender);
+  static {
+    coversImpl = (d, sender, ts) => ts <= Math.max(d.#horizon, d.#sh.get(sender) ?? d.#horizon);
   }
 
   accepts(messageId: string, sender: string, timestamp: number): boolean {

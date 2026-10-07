@@ -96,7 +96,8 @@ export interface AgentProfile {
 
 export interface DiscoverQuery {
   q?: string;
-  tags?: string;
+  /** Exact-match tags (all must match); sent comma-separated. */
+  tags?: string[];
   chain?: string;
   scheme?: SigningScheme;
   online?: boolean;

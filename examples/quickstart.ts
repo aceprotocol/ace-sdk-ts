@@ -24,8 +24,8 @@ export async function local(): Promise<ParsedMessage> {
   });
 }
 
-// 2. Over a relay: durable send (Outbox) and exactly-once receive (Inbox).
-//    Use FileStore from '@ace-protocol/sdk/node' instead of MemoryStore to persist state.
+// 2. Over a relay (e.g. https://relay.aceprotocol.org): durable send (Outbox) and exactly-once
+//    receive (Inbox). Use FileStore from '@ace-protocol/sdk/node' instead of MemoryStore to persist state.
 export async function overRelay(relayUrl: string): Promise<ParsedMessage[]> {
   const relay = new RelayClient(relayUrl);
   const alice = await SoftwareIdentity.generate('ed25519');

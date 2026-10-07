@@ -1,4 +1,4 @@
-/** Persistent thread records shared by Inbox and Outbox (design §2.11, Appendix A). */
+/** Persistent thread records shared by Inbox and Outbox (06-security § Appendix A). */
 
 import { ACEError } from './errors.js';
 import {
@@ -134,6 +134,32 @@ export function compareHistories(a: ThreadHistoryEntry[], b: ThreadHistoryEntry[
  * extra entries, which are reconciled when the bound is reached.
  */
 export class ThreadStore {
+  readonly #records: ThreadRecords;
+
+  constructor(opts: { store: ACEStore; localAceId: string; clock?: () => number }) {
+    this.#records = new ThreadRecords(opts);
+  }
+
+  async get(conversationId: string, threadId: string): Promise<ThreadSnapshot | null> {
+    return this.#records.get(conversationId, threadId);
+  }
+
+  async list(): Promise<ThreadSnapshot[]> {
+    return this.#records.list();
+  }
+
+  /** Delete a thread record; false when there was none. */
+  async remove(conversationId: string, threadId: string): Promise<boolean> {
+    return this.#records.remove(conversationId, threadId);
+  }
+
+  async allowedTypes(conversationId: string, threadId: string, senderAceId: string): Promise<MessageType[]> {
+    return this.#records.allowedTypes(conversationId, threadId, senderAceId);
+  }
+}
+
+/** Internal: the thread record store behind `ThreadStore`, used by Inbox and Outbox. */
+export class ThreadRecords {
   readonly localAceId: string;
   readonly #store: ACEStore;
   readonly #clock?: () => number;
@@ -182,8 +208,6 @@ export class ThreadStore {
     const rec = await this.loadRecord(conversationId, threadId);
     return restoreMachine(this.localAceId, rec?.snapshot ?? null).allowedTypes(conversationId, threadId, senderAceId);
   }
-
-  // --- internal API (Inbox / Outbox) ---
 
   /** Run `fn` under the `threads` lock. */
   async withLock<T>(fn: () => Promise<T>): Promise<T> {

@@ -1,4 +1,4 @@
-/** Pinned peer bindings with the rollback barrier (design §2.10, 02 § Rollback Barrier). */
+/** Pinned peer bindings with the rollback barrier (02-discovery § Rollback Barrier). */
 
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, isACEId, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';

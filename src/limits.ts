@@ -3,6 +3,8 @@
 export const MAX_PLAINTEXT_BYTES = 65508;
 export const MAX_PAYLOAD_BYTES = 65536;
 export const MAX_ENVELOPE_BYTES = 131072;
+/** The largest direct-delivery request body (`{"message": Envelope}`), 08-relay § Direct Delivery. */
+export const MAX_DIRECT_BODY_BYTES = MAX_ENVELOPE_BYTES + 1024;
 export const MAX_JSON_DEPTH = 32;
 export const MAX_THREAD_ID_LENGTH = 256;
 export const MAX_OPEN_THREADS_PER_PEER = 1000;

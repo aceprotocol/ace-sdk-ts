@@ -12,6 +12,10 @@ import { buildSignData, encodePayload, verifySignature } from '../src/signing.js
 import { adoptDecision, type VerifiedPeer } from '../src/discovery.js';
 import { authPayload } from '../src/auth.js';
 import { decodeBody } from '../src/messages.js';
+import {
+  Inbox, MAX_DIRECT_BODY_BYTES, MemoryStore, PeerStore, isBlockedAddress, signWebhookNotification, verifyWebhookNotification,
+} from '../src/index.js';
+import { normalizeRelayUrl, relayErrorFor } from '../src/relay.js';
 import { VECTORS, V, agent, peerOf, hex, unhex, b64 } from './helpers.js';
 import { createHash } from 'node:crypto';
 
@@ -20,7 +24,8 @@ describe('vectors', () => {
     expect(VECTORS.version).toBe('3');
     expect(V.auth).toHaveLength(18);
     for (const k of ['envelopes', 'bodies', 'transitions', 'replay', 'signatures', 'auth', 'registrations',
-      'registrationErrors', 'urls', 'base64', 'peerBinding']) expect(V).toHaveProperty(k);
+      'registrationErrors', 'urls', 'base64', 'peerBinding', 'webhooks', 'relayUrls', 'blockedAddresses', 'relayErrors',
+      'directReceive']) expect(V).toHaveProperty(k);
   });
 
   it.each(['alice', 'bob'] as const)('agent %s', (name) => {
@@ -279,6 +284,72 @@ describe('peer binding', () => {
         expect(pin!.registeredAt).toBe(s.pinRegisteredAt);
         expect(toBase64(pin!.encryptionPublicKey)).toBe(s.pinEncryptionPublicKey);
       }
+    }
+  });
+});
+
+// --- webhooks / relay URLs / blocked addresses / relay errors / direct receive -------------
+
+function codeOrResult(fn: () => unknown): unknown {
+  try {
+    return { result: fn() };
+  } catch (e) {
+    if (!(e instanceof ACEError)) throw e;
+    return { error: e.code };
+  }
+}
+
+describe('webhooks', () => {
+  it.each(V.webhooks.cases.map((c: any) => [c.name, c]))('%s', (_n, c: any) => {
+    const got = codeOrResult(() => verifyWebhookNotification({
+      secret: c.secret, timestamp: c.timestamp, signature: c.signature, body: new TextEncoder().encode(c.body), clock: () => c.now,
+    }));
+    expect(got).toEqual(c.result !== undefined ? { result: c.result } : { error: c.error });
+    if (c.result !== undefined) expect(signWebhookNotification(c.secret, Number(c.timestamp), c.body)).toBe(c.signature);
+  });
+});
+
+describe('relayUrls', () => {
+  it.each(V.relayUrls.cases.map((c: any) => [JSON.stringify(c.input), c]))('%s', (_n, c: any) => {
+    const got = codeOrResult(() => normalizeRelayUrl(c.input));
+    expect(got).toEqual(c.normalized !== undefined ? { result: c.normalized } : { error: c.error });
+  });
+});
+
+describe('blockedAddresses', () => {
+  it.each(V.blockedAddresses.cases.map((c: any) => [c.address, c]))('%s', (_n, c: any) => {
+    expect(isBlockedAddress(c.address)).toBe(c.blocked);
+  });
+});
+
+describe('relayErrors', () => {
+  it.each(V.relayErrors.cases.map((c: any) => [c.name, c]))('%s', (_n, c: any) => {
+    const headers = new Headers(c.headers);
+    const e = relayErrorFor(c.status, headers.get('retry-after'), c.body);
+    expect([e.code, e.category, e.relayCode ?? null, e.retryAfterSeconds ?? null, e.status])
+      .toEqual([c.code, c.category, c.relayCode, c.retryAfterSeconds, c.status]);
+  });
+});
+
+describe('directReceive', () => {
+  it('maxDirectBodyBytes', () => {
+    expect(V.directReceive.maxDirectBodyBytes).toBe(MAX_DIRECT_BODY_BYTES);
+  });
+
+  it.each(V.directReceive.cases.map((c: any) => [c.name, c]))('%s', async (_n, c: any) => {
+    const store = new MemoryStore();
+    const inbox = await Inbox.open({ identity: agent('bob'), store, peers: new PeerStore({ store }), onMessage: () => {} });
+    try {
+      let raw = c.bodyHex !== undefined ? unhex(c.bodyHex) : new TextEncoder().encode(c.body);
+      if (c.padTo !== undefined) {
+        const padded = new Uint8Array(c.padTo).fill(0x20);
+        padded.set(raw);
+        raw = padded;
+      }
+      const reply = await inbox.receiveDirect(raw);
+      expect([reply.status, reply.body]).toEqual([c.status, { ok: false, error: c.error }]);
+    } finally {
+      await inbox.close();
     }
   });
 });

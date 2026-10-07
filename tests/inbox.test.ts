@@ -9,8 +9,8 @@ import {
 } from '../src/index.js';
 import { FileStore } from '../src/node.js';
 import { pairKey, stringifySorted } from '../src/encoding.js';
-import { threadIndexKey, threadKey } from '../src/thread-store.js';
-import { expectCode } from './helpers.js';
+import { ThreadRecords, threadIndexKey, threadKey } from '../src/thread-store.js';
+import { expectCode, wire } from './helpers.js';
 import { Agent, Clock, CountingStore, cloneStore, json } from './pipeline.js';
 
 const RELAY = 'https://Relay.Example/';
@@ -53,7 +53,7 @@ describe('Inbox', () => {
     await rfq(alice, bob); // alice has an outbox-only thread
     await (await alice.open()).close();
     const inbox = await bob.open();
-    await inbox.receive(await rfq(alice, bob, 'deal-2'), relaySrc(1));
+    await inbox.receive(wire(await rfq(alice, bob, 'deal-2')), relaySrc(1));
     await inbox.close();
     await bob.store.delete('replay.json');
     await expectCode(bob.open(), 'storage_failed');
@@ -68,7 +68,7 @@ describe('Inbox', () => {
     const inbox = await bob.open({ store: counting });
     expect(counting.writes).toEqual(['replay.json']);
     counting.writes = [];
-    const out = await inbox.receive(env, relaySrc(7));
+    const out = await inbox.receive(wire(env), relaySrc(7));
     expect(out.kind).toBe('delivered');
     if (out.kind === 'delivered') expect(out.message.body).toEqual({ need: 'translate' });
     const dkey = deliveryKey(alice.id, env.messageId);
@@ -91,9 +91,9 @@ describe('Inbox', () => {
     expect(thread.peerAceId).toBe(alice.id);
     expect(raw).toBe(stringifySorted(thread)); // sorted keys, compact
     counting.writes = [];
-    expect((await inbox.receive(env, relaySrc(9))).kind).toBe('duplicate');
+    expect((await inbox.receive(wire(env), relaySrc(9))).kind).toBe('duplicate');
     expect(counting.writes).toEqual(['cursors.json']);
-    expect((await inbox.receive(env, relaySrc(8))).kind).toBe('duplicate');
+    expect((await inbox.receive(wire(env), relaySrc(8))).kind).toBe('duplicate');
     expect(inbox.cursor(SRC_RELAY)).toBe('9-0');
     expect((await new ThreadStore({ store: bob.store, localAceId: bob.id }).get(env.conversationId, 'deal-1'))!.state).toBe('rfq');
     expect(bob.host.calls).toEqual([[alice.id, env.messageId]]);
@@ -103,7 +103,7 @@ describe('Inbox', () => {
     const { clock, alice, bob } = await pair();
     const p = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'text', body: { message: 'hi' } });
     const inbox = await bob.open();
-    const out = await inbox.receive(p.message, { kind: 'direct' });
+    const out = await inbox.receive(wire(p.message), { kind: 'direct' });
     expect(out.kind).toBe('delivered');
     if (out.kind === 'delivered') expect(out.message.threadId).toBeNull();
     const rec = json(await bob.store.read(deliveryKey(alice.id, p.message.messageId)));
@@ -113,20 +113,20 @@ describe('Inbox', () => {
     clock.t += 301;
     const p2 = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'text', body: { message: 'late' } });
     clock.t += 301;
-    const late = await inbox.receive(p2.message, { kind: 'direct' });
+    const late = await inbox.receive(wire(p2.message), { kind: 'direct' });
     expect(late.kind).toBe('quarantined');
     if (late.kind === 'quarantined') {
       expect(late.error.code).toBe('stale_timestamp');
       expect(late.fingerprint).toBe(envelopeFingerprint(p2.message));
     }
     expect(await bob.store.list('quarantine/')).toEqual([]);
-    expect((await inbox.receive(p2.message, relaySrc(1))).kind).toBe('delivered');
+    expect((await inbox.receive(wire(p2.message), relaySrc(1))).kind).toBe('delivered');
   });
 
   it('decode failure and unknown peer are quarantined', async () => {
     const { clock, bob } = await pair();
     const inbox = await bob.open();
-    const out = await inbox.receive({ ace: '1.0' }, relaySrc(1));
+    const out = await inbox.receive(wire({ ace: '1.0' }), relaySrc(1));
     expect(out).toMatchObject({ kind: 'quarantined', fingerprint: null });
     if (out.kind === 'quarantined') expect(out.error.code).toBe('invalid_envelope');
     expect(inbox.cursor(SRC_RELAY)).toBe('1-0');
@@ -134,7 +134,7 @@ describe('Inbox', () => {
     const eve = await Agent.create('eve', 'ed25519', clock);
     await eve.pin(bob);
     const env = (await eve.outbox.stage({ recipient: await eve.peer(bob), type: 'text', body: { message: 'x' } })).message;
-    const q = await inbox.receive(env, relaySrc(2));
+    const q = await inbox.receive(wire(env), relaySrc(2));
     expect(q.kind).toBe('quarantined');
     if (q.kind !== 'quarantined') return;
     expect(q.error.code).toBe('unknown_peer');
@@ -143,11 +143,12 @@ describe('Inbox', () => {
     expect(rec.source).toBe('relay');
     expect(rec.envelope).toEqual(env);
     expect(Object.keys(rec).sort()).toEqual(['code', 'envelope', 'fingerprint', 'quarantinedAt', 'reason', 'source', 'version']);
-    expect((await inbox.receive(env, { kind: 'direct' })).kind).toBe('quarantined');
+    expect((await inbox.receive(wire(env), { kind: 'direct' })).kind).toBe('quarantined');
     expect((await bob.store.list('quarantine/')).length).toBe(1);
   });
 
   it('quarantine is capped at 1000 (trimmed to 900) without listing on every insert', async () => {
+    // 999 older records are seeded directly (no crypto), so the test is fast and deterministic
     const clock = new Clock();
     const store = new CountingStore(new MemoryStore());
     const alice = await Agent.create('alice', 'ed25519', clock);
@@ -155,14 +156,24 @@ describe('Inbox', () => {
     await alice.pin(bob);
     await bob.pin(alice);
     const env = await rfq(alice, bob);
+    for (let n = 0; n < 999; n++) {
+      const fp = n.toString(16).padStart(64, '0');
+      await store.inner.write(`quarantine/${fp}.json`, wire({
+        code: 'invalid_signature', envelope: env, fingerprint: fp, quarantinedAt: clock.t - 1000 + n, reason: 'seeded', source: 'relay', version: 1,
+      }));
+    }
     const inbox = await bob.open();
-    for (let n = 0; n <= 1000; n++) {
+    const fresh: string[] = [];
+    for (let n = 0; n < 2; n++) {
       // a fresh messageId under the old signature: invalid_signature, a new fingerprint
       const forged = { ...env, messageId: `00000000-0000-4000-8000-${String(n).padStart(12, '0')}` };
-      const out = await inbox.receive(forged, relaySrc(n + 1));
+      const out = await inbox.receive(wire(forged), relaySrc(n + 1));
       expect(out.kind === 'quarantined' && out.error.code).toBe('invalid_signature');
+      if (out.kind === 'quarantined') fresh.push(`quarantine/${out.fingerprint}.json`);
     }
-    expect((await store.inner.list('quarantine/')).length).toBe(900);
+    const left = await store.inner.list('quarantine/');
+    expect(left.length).toBe(900);
+    for (const k of fresh) expect(left).toContain(k); // the oldest were trimmed
     expect(store.lists.filter((p) => p === 'quarantine/')).toHaveLength(1); // the first insert only
     await inbox.close();
   });
@@ -171,7 +182,7 @@ describe('Inbox', () => {
     const { clock, alice, bob } = await pair();
     const inbox = await bob.open();
     const env = await rfq(alice, bob);
-    expect((await inbox.receive(env, relaySrc(1))).kind).toBe('delivered');
+    expect((await inbox.receive(wire(env), relaySrc(1))).kind).toBe('delivered');
     const snap = (await new ThreadStore({ store: bob.store, localAceId: bob.id }).get(env.conversationId, 'deal-1'))!;
     // alice (the buyer) forges a seller move with a machine in which bob is the buyer
     const machine = ThreadStateMachine.fromState([{
@@ -182,16 +193,16 @@ describe('Inbox', () => {
       sender: alice.identity, recipient: await alice.peer(bob), type: 'offer', body: { price: '1', currency: 'USDC' },
       threads: machine, threadId: 'deal-1', timestamp: clock.t,
     });
-    const out = await inbox.receive(offer, relaySrc(2));
+    const out = await inbox.receive(wire(offer), relaySrc(2));
     expect(out.kind).toBe('quarantined');
     if (out.kind !== 'quarantined') return;
     expect(out.error.code).toBe('wrong_role');
     expect(await bob.store.read(`quarantine/${out.fingerprint}.json`)).not.toBeNull();
     expect(inbox.cursor(SRC_RELAY)).toBe('2-0');
-    expect((await inbox.receive(offer, relaySrc(3))).kind).toBe('duplicate');
+    expect((await inbox.receive(wire(offer), relaySrc(3))).kind).toBe('duplicate');
     await inbox.close();
     const again = await bob.open();
-    expect((await again.receive(offer, relaySrc(4))).kind).toBe('duplicate');
+    expect((await again.receive(wire(offer), relaySrc(4))).kind).toBe('duplicate');
     expect((await new ThreadStore({ store: bob.store, localAceId: bob.id }).get(env.conversationId, 'deal-1'))!.state).toBe('rfq');
     expect(bob.host.calls).toEqual([[alice.id, env.messageId]]);
   });
@@ -204,7 +215,7 @@ describe('Inbox', () => {
       identity: bob.identity, store, peers: new PeerStore({ store, relay: down as never, clock: clock.fn }),
       onMessage: bob.host.fn, clock: clock.fn,
     });
-    const out = await inbox.receive(await rfq(alice, bob), relaySrc(5));
+    const out = await inbox.receive(wire(await rfq(alice, bob)), relaySrc(5));
     expect(out.kind).toBe('retryable');
     if (out.kind === 'retryable') expect(out.error.code).toBe('relay_unavailable');
     expect(inbox.cursor(SRC_RELAY)).toBeNull();
@@ -216,12 +227,12 @@ describe('Inbox', () => {
     const inbox = await bob.open();
     const env = await rfq(alice, bob);
     bob.host.fail = true;
-    const out = await inbox.receive(env, relaySrc(1));
+    const out = await inbox.receive(wire(env), relaySrc(1));
     expect(out.kind).toBe('retryable');
     if (out.kind === 'retryable') expect(out.error.code).toBe('handler_failed');
     expect(inbox.cursor(SRC_RELAY)).toBeNull();
     bob.host.fail = false;
-    expect((await inbox.receive(env, relaySrc(1))).kind).toBe('delivered');
+    expect((await inbox.receive(wire(env), relaySrc(1))).kind).toBe('delivered');
     expect(inbox.cursor(SRC_RELAY)).toBe('1-0');
     expect(bob.host.calls).toEqual([[alice.id, env.messageId]]);
   });
@@ -231,21 +242,21 @@ describe('Inbox', () => {
     const inbox = await bob.open();
     const env = await rfq(alice, bob);
     bob.host.fail = true;
-    await inbox.receive(env, relaySrc(1));
+    await inbox.receive(wire(env), relaySrc(1));
     await inbox.close();
     await expectCode(bob.open(), 'handler_failed');
     bob.host.fail = false;
     const again = await bob.open();
     expect(bob.host.calls).toEqual([[alice.id, env.messageId]]);
     expect(json(await bob.store.read(deliveryKey(alice.id, env.messageId))).status).toBe('acked');
-    expect((await again.receive(env, relaySrc(1))).kind).toBe('duplicate');
+    expect((await again.receive(wire(env), relaySrc(1))).kind).toBe('duplicate');
   });
 
   it('recovery refuses a delivery record that diverges from the stored thread', async () => {
     const { alice, bob } = await pair();
     const inbox = await bob.open();
     const env = await rfq(alice, bob);
-    await inbox.receive(env, relaySrc(1));
+    await inbox.receive(wire(env), relaySrc(1));
     await inbox.close();
     const tkey = threadKey(env.conversationId, 'deal-1');
     const rec = json(await bob.store.read(tkey));
@@ -258,14 +269,14 @@ describe('Inbox', () => {
     const { clock, alice, bob } = await pair();
     const inbox = await bob.open({ offlineWindowSeconds: 1000 });
     const env = await rfq(alice, bob);
-    expect((await inbox.receive(env, relaySrc(1))).kind).toBe('delivered');
+    expect((await inbox.receive(wire(env), relaySrc(1))).kind).toBe('delivered');
     clock.t += 2000;
     const late = (await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'text', body: { message: 'later' } })).message;
-    expect((await inbox.receive(late, relaySrc(2))).kind).toBe('delivered'); // floor raises H
+    expect((await inbox.receive(wire(late), relaySrc(2))).kind).toBe('delivered'); // floor raises H
     await inbox.close();
     const reopened = await bob.open({ offlineWindowSeconds: 1000 }); // recovery deletes covered acked records
     expect(await bob.store.list('deliveries/')).toEqual([deliveryKey(alice.id, late.messageId)]);
-    const out = await reopened.receive(env, relaySrc(3));
+    const out = await reopened.receive(wire(env), relaySrc(3));
     expect(out.kind).toBe('quarantined');
     if (out.kind === 'quarantined') expect(out.error.code).toBe('stale_timestamp');
     expect(bob.host.calls.length).toBe(2);
@@ -276,10 +287,10 @@ describe('Inbox', () => {
     const aInbox = await alice.open();
     const bInbox = await bob.open();
     const sent = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'rfq', body: { need: 'x' }, threadId: 'd', requestId: 'r1' });
-    expect((await bInbox.receive(sent.message, relaySrc(1))).kind).toBe('delivered');
+    expect((await bInbox.receive(wire(sent.message), relaySrc(1))).kind).toBe('delivered');
     const offer = await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'offer', body: { price: '5', currency: 'USDC' }, threadId: 'd' });
     expect((await alice.outbox.pending()).map((p) => p.requestId)).toEqual(['r1']);
-    expect((await aInbox.receive(offer.message, relaySrc(1))).kind).toBe('delivered');
+    expect((await aInbox.receive(wire(offer.message), relaySrc(1))).kind).toBe('delivered');
     expect(await alice.outbox.pending()).toEqual([]);
     expect((await new ThreadStore({ store: alice.store, localAceId: alice.id }).get(sent.message.conversationId, 'd'))!.state).toBe('offered');
   });
@@ -294,7 +305,7 @@ describe('Inbox', () => {
         await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'offer', body: { price: '1', currency: 'USDC' }, threadId: m.threadId!, requestId: `reply-${m.messageId}` });
       },
     });
-    expect((await inbox.receive(env, relaySrc(1))).kind).toBe('delivered');
+    expect((await inbox.receive(wire(env), relaySrc(1))).kind).toBe('delivered');
     expect((await new ThreadStore({ store, localAceId: bob.id }).get(env.conversationId, 'deal-1'))!.state).toBe('offered');
     await inbox.close();
   });
@@ -306,7 +317,7 @@ describe('Inbox', () => {
     const env = (await eve.outbox.stage({ recipient: await eve.peer(bob), type: 'text', body: { message: 'x' } })).message;
     await (await bob.open()).close();
     const inbox = await bob.open({ store: new CountingStore(bob.store, 1) });
-    const out = await inbox.receive(env, relaySrc(1));
+    const out = await inbox.receive(wire(env), relaySrc(1));
     expect(out.kind).toBe('retryable');
     expect(inbox.cursor(SRC_RELAY)).toBeNull();
     expect(await bob.store.list('quarantine/')).toEqual([]);
@@ -323,7 +334,7 @@ async function scenario(clock: Clock) {
   await bob.pin(alice);
   const aInbox = await alice.open();
   const sent = await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'rfq', body: { need: 'x' }, threadId: 'd', requestId: 'r1' });
-  await aInbox.receive(sent.message, relaySrc(1));
+  await aInbox.receive(wire(sent.message), relaySrc(1));
   const offer = (await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'offer', body: { price: '5', currency: 'USDC' }, threadId: 'd' })).message;
   await (await bob.open()).close(); // creates replay.json
   return { bob, offer };
@@ -347,11 +358,11 @@ describe('crash injection', () => {
       const conv = offer.conversationId;
       const failing = new CountingStore(base, failAt);
       const inbox = await bob.open({ store: failing });
-      const out = await inbox.receive(offer, relaySrc(3));
+      const out = await inbox.receive(wire(offer), relaySrc(3));
       expect(out.kind).toBe('retryable');
       if (out.kind === 'retryable') expect(out.error.code).toBe('storage_failed');
       if (failAt > 1) {
-        const later = await inbox.receive(offer, relaySrc(3));
+        const later = await inbox.receive(wire(offer), relaySrc(3));
         expect(later.kind).toBe('retryable');
         if (later.kind === 'retryable') expect(later.error.message).toContain('failed state');
       }
@@ -365,9 +376,9 @@ describe('crash injection', () => {
         const snap = (await threads.get(conv, 'd'))!;
         expect(snap.state).toBe('offered');
         expect(snap.history.map((h) => h.type)).toEqual(['rfq', 'offer']);
-        expect((await threads.loadRecord(conv, 'd'))!.pending).toBeNull(); // delivery proven by the offer
+        expect((await new ThreadRecords({ store: base, localAceId: bob.id }).loadRecord(conv, 'd'))!.pending).toBeNull(); // delivery proven by the offer
       }
-      const redelivered = await recovered.receive(offer, relaySrc(3)); // cursor was not advanced
+      const redelivered = await recovered.receive(wire(offer), relaySrc(3)); // cursor was not advanced
       expect(redelivered.kind).toBe(failAt === 1 ? 'delivered' : 'duplicate');
       expect(recovered.cursor(SRC_RELAY)).toBe('3-0');
       expect((await threads.get(conv, 'd'))!.state).toBe('offered');
@@ -378,7 +389,7 @@ describe('crash injection', () => {
       expect(replay.accepts(offer.messageId, offer.from, offer.timestamp)).toBe(false);
       await recovered.close();
       const third = await bob.open({ store: base });
-      expect((await third.receive(offer, relaySrc(4))).kind).toBe('duplicate');
+      expect((await third.receive(wire(offer), relaySrc(4))).kind).toBe('duplicate');
       expect(bob.host.calls.length).toBe(failAt === 4 ? 2 : 1);
       await third.close();
     });
@@ -396,9 +407,9 @@ describe('crash between delivery and thread writes, then Outbox', () => {
     await (await bob.open()).close();
     const failing = new CountingStore(bob.store, 2); // 1 = delivery record, 2 = thread record
     const inbox = await bob.open({ store: failing });
-    expect((await inbox.receive(env, relaySrc(1))).kind).toBe('retryable');
+    expect((await inbox.receive(wire(env), relaySrc(1))).kind).toBe('retryable');
     // while failed, the instance keeps holding `threads`
-    await expectCode(bob.store.lock('threads', { timeoutMs: 50 }), 'storage_failed');
+    await expectCode(bob.store.lock('threads', { timeoutMs: 50 }), 'lock_busy');
     await inbox.close(); // the process "dies"; `threads` is released
     const threads = new ThreadStore({ store: bob.store, localAceId: bob.id });
     expect(await threads.get(env.conversationId, 'd')).toBeNull(); // thread write was lost
@@ -411,10 +422,105 @@ describe('crash between delivery and thread writes, then Outbox', () => {
 
     const recovered = await bob.open(); // no divergence: the stored history extends the delivery snapshot
     expect(bob.host.calls).toEqual([[alice.id, env.messageId]]);
-    expect((await recovered.receive(env, relaySrc(1))).kind).toBe('duplicate');
+    expect((await recovered.receive(wire(env), relaySrc(1))).kind).toBe('duplicate');
     const snap = (await threads.get(env.conversationId, 'd'))!;
     expect(snap.state).toBe('offered');
     expect(snap.history.map((h) => h.messageId)).toEqual([env.messageId, offer.message.messageId]);
     await recovered.close();
+  });
+});
+
+describe('raw bytes, direct delivery and recovery rules', () => {
+  it('receive takes bytes: oversize or non-JSON is quarantined and advances the cursor; misuse throws', async () => {
+    const { bob } = await pair();
+    const inbox = await bob.open();
+    for (const [n, raw] of [[1, new TextEncoder().encode('not json')], [2, new Uint8Array([0x22, 0xff, 0x22])], [3, new Uint8Array(131073).fill(0x20)]] as const) {
+      const out = await inbox.receive(raw, relaySrc(n));
+      expect(out).toMatchObject({ kind: 'quarantined', fingerprint: null });
+      if (out.kind === 'quarantined') expect(out.error.code).toBe('invalid_envelope');
+      expect(inbox.cursor(SRC_RELAY)).toBe(`${n}-0`);
+    }
+    await expectCode(inbox.receive({ ace: '1.0' } as never, relaySrc(4)), 'invalid_argument');
+    await expectCode(inbox.receive(wire({}), { kind: 'nope' } as never), 'invalid_argument');
+    await expectCode(inbox.receive(wire({}), { kind: 'relay', relayUrl: 'https://r.example/?x' }), 'invalid_argument');
+    await inbox.close();
+    await expectCode(inbox.receive(wire({}), { kind: 'direct' }), 'invalid_argument');
+    // a closed inbox is not accepting: 503, so the sender falls back to the relay
+    expect(await inbox.receiveDirect(wire({ message: {} }))).toEqual({ status: 503, body: { ok: false, error: 'internal_error' } });
+    expect((await inbox.receiveDirect(new Uint8Array(200_000))).status).toBe(503);
+  });
+
+  it('Inbox.open pre-validates capacity', async () => {
+    const { bob } = await pair();
+    for (const capacity of [0, -1, 1.5, '10' as never]) await expectCode(bob.open({ capacity } as never), 'invalid_argument');
+    expect(await bob.store.list('')).not.toContain('locks/receive.lock');
+    await (await bob.open()).close(); // the receive lock was never taken
+  });
+
+  it('the quarantine reason is the raw error message (no "code: " prefix)', async () => {
+    const { clock, bob } = await pair();
+    const inbox = await bob.open();
+    const eve = await Agent.create('eve', 'ed25519', clock);
+    await eve.pin(bob);
+    const env = (await eve.outbox.stage({ recipient: await eve.peer(bob), type: 'text', body: { message: 'x' } })).message;
+    const q = await inbox.receive(wire(env), relaySrc(1));
+    if (q.kind !== 'quarantined') throw new Error('expected quarantine');
+    const rec = json(await bob.store.read(`quarantine/${q.fingerprint}.json`));
+    expect(rec.code).toBe('unknown_peer');
+    expect(rec.reason).not.toMatch(/^unknown_peer: /);
+    expect(`unknown_peer: ${rec.reason}`).toBe(q.error.message);
+    await inbox.close();
+  });
+
+  it('only delivered outcomes count towards the deliveries sweep', async () => {
+    const { bob } = await pair();
+    const store = new CountingStore(bob.store);
+    const inbox = await bob.open({ store });
+    const before = store.lists.filter((p) => p === 'deliveries/').length;
+    for (let i = 0; i < 1100; i++) await inbox.receive(new TextEncoder().encode('x'), { kind: 'direct' });
+    expect(store.lists.filter((p) => p === 'deliveries/').length).toBe(before);
+    await inbox.close();
+  });
+
+  it('recovery skips acked records covered by the replay horizon (pruned threads stay pruned)', async () => {
+    const { alice, bob } = await pair();
+    const env = await rfq(alice, bob, 'p');
+    const inbox = await bob.open();
+    expect((await inbox.receive(wire(env), relaySrc(1))).kind).toBe('delivered');
+    await inbox.close();
+    const dkey = deliveryKey(alice.id, env.messageId);
+    expect(json(await bob.store.read(dkey)).status).toBe('acked');
+    const threads = new ThreadStore({ store: bob.store, localAceId: bob.id });
+    expect(await threads.remove(env.conversationId, 'p')).toBe(true); // as if pruned
+    // the horizon moves past the message (e.g. the offline window elapsed)
+    await bob.store.write('replay.json', wire({ entries: [], horizon: env.timestamp, senderHorizons: {}, version: 1 }));
+    await Outbox.open({ identity: bob.identity, store: bob.store, clock: bob.clock.fn });
+    expect(await threads.get(env.conversationId, 'p')).toBeNull();
+    const again = await bob.open();
+    expect(await threads.get(env.conversationId, 'p')).toBeNull();
+    expect(await bob.store.read(dkey)).toBeNull();
+    expect(bob.host.calls).toHaveLength(1);
+    await again.close();
+  });
+
+  it('receiveDirect answers delivered, duplicate, rejected and retryable messages per 08 § Direct Delivery', async () => {
+    const { clock, alice, bob } = await pair();
+    const inbox = await bob.open();
+    const p = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'text', body: { message: 'hi' } });
+    const ok = await inbox.receiveDirect(wire({ message: p.message, extra: true }));
+    expect([ok.status, ok.body, ok.outcome?.kind]).toEqual([200, { ok: true, messageId: p.message.messageId }, 'delivered']);
+    const dup = await inbox.receiveDirect(wire({ message: p.message }));
+    expect([dup.status, dup.body, dup.outcome?.kind]).toEqual([200, { ok: true, messageId: p.message.messageId }, 'duplicate']);
+    clock.t += 301;
+    const late = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'text', body: { message: 'late' } });
+    clock.t += 301;
+    const stale = await inbox.receiveDirect(wire({ message: late.message }));
+    expect([stale.status, stale.body]).toEqual([400, { ok: false, error: 'stale_timestamp' }]);
+    expect(await bob.store.list('quarantine/')).toEqual([]);
+    bob.host.fail = true;
+    const fresh = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'text', body: { message: 'again' } });
+    const busy = await inbox.receiveDirect(wire({ message: fresh.message }));
+    expect([busy.status, busy.body]).toEqual([503, { ok: false, error: 'handler_failed' }]);
+    await inbox.close();
   });
 });

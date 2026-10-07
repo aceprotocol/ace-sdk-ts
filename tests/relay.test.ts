@@ -1,11 +1,11 @@
 // RelayClient against a local fake relay (08-relay); PeerStore; Inbox.pull / follow end to end.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  ACEError, MemoryStore, PeerStore, RelayClient, SoftwareIdentity, verifyPeerRecord, type ReceiveOutcome,
+  ACEError, MemoryStore, PeerStore, RelayClient, SoftwareIdentity, createRegistrationFile, verifyPeerRecord, type ReceiveOutcome,
 } from '../src/index.js';
 import { parseSSE } from '../src/relay.js';
 import { toBase64 } from '../src/encoding.js';
-import { FakeRelay } from './fake-relay.js';
+import { FakeRelay, RawFrame } from './fake-relay.js';
 import { expectCode } from './helpers.js';
 import { Agent, Clock } from './pipeline.js';
 
@@ -51,6 +51,14 @@ describe('SSE parser', () => {
       { id: '1-0', event: 'catchup', data: '{"a":\n1}' },
       { id: '2-0', event: 'message', data: '{}' },
     ]);
+  });
+
+  it('dispatches only events with data; id and event do not carry over to the next event', async () => {
+    const events = [];
+    for await (const e of parseSSE(stream(['id: 1-0\nevent: message\n\ndata: a\n\nid: 2-0\nevent: drain\n\nevent: x\ndata: b\n\n']))) {
+      if (e.event !== ':') events.push(e);
+    }
+    expect(events).toEqual([{ id: '', event: 'message', data: 'a' }, { id: '', event: 'x', data: 'b' }]);
   });
 
   it('rejects oversized frames', async () => {
@@ -196,7 +204,7 @@ describe('RelayClient', () => {
     const seen: Array<[string, unknown, boolean]> = [];
     const it = a.relay!.listen(a.identity, { signal: ctrl.signal });
     for await (const ev of it) {
-      seen.push([ev.streamId, ev.message, ev.catchup]);
+      seen.push([ev.streamId, JSON.parse(ev.data), ev.catchup]);
       if (seen.length === 3) {
         relay.dropListens = 2; // the next two connections close without events
         // force a reconnect by draining the current stream
@@ -250,7 +258,7 @@ describe('RelayClient', () => {
     relay.enqueueRaw(a.id, { n: 0 });
     const c = new RelayClient(relay.url, { clock: clock.fn, reconnectBaseMs: 5, fetch: deafFetch });
     for await (const ev of c.listen(a.identity)) {
-      expect(ev.message).toEqual({ n: 0 });
+      expect(JSON.parse(ev.data)).toEqual({ n: 0 });
       break;
     }
     await until(() => relay.openListens === 0);
@@ -262,7 +270,7 @@ describe('RelayClient', () => {
     for (const err of thrown) {
       relay.enqueueRaw(a.id, { n: 0 });
       const gen = a.relay!.listen(a.identity);
-      expect((await gen.next()).value?.message).toEqual({ n: 0 });
+      expect(JSON.parse((await gen.next()).value!.data)).toEqual({ n: 0 });
       await expect(gen.throw(err)).rejects.toBe(err);
       await until(() => relay.openListens === 0);
     }
@@ -313,7 +321,159 @@ describe('RelayClient', () => {
     await expectCode((async () => { for await (const _ of client().listen(stranger)) { /* none */ } })(), 'not_registered');
     const a = await registered('a');
     for (let i = 0; i < 10; i++) relay.inject.push({ path: '/v1/listen', status: 503, code: 'down', headers: { 'Retry-After': '0' } });
-    await expectCode((async () => { for await (const _ of a.relay!.listen(a.identity)) { /* none */ } })(), 'relay_unavailable');
+    const fast = new RelayClient(relay.url, { clock: clock.fn, reconnectBaseMs: 0 }); // no backoff sleeps: fast under load
+    await expectCode((async () => { for await (const _ of fast.listen(a.identity)) { /* none */ } })(), 'relay_unavailable');
+    expect(relay.requests.filter(([, p]) => p === '/v1/listen').length).toBe(11);
+  });
+});
+
+describe('RelayClient strictness', () => {
+  it('a 3xx is relay_protocol_error and is never followed (requests and listen)', async () => {
+    const a = await registered('a');
+    for (const status of [301, 302, 307, 308]) {
+      relay.inject.push({ path: '/v1/peer', status, code: 'moved', headers: { Location: `${relay.url}/v1/peer?aceId=${a.id}` } });
+      const e = await expectCode(a.relay!.lookupPeer(a.id), 'relay_protocol_error');
+      expect(e.status).toBe(status);
+    }
+    expect(relay.requests.filter(([, p]) => p === '/v1/peer').length).toBe(4); // never followed
+    relay.inject.push({ path: '/v1/listen', status: 302, code: 'moved', headers: { Location: '/elsewhere' } });
+    await expectCode((async () => { for await (const _ of a.relay!.listen(a.identity)) { /* none */ } })(), 'relay_protocol_error');
+  });
+
+  it('429: rate_limited is transient with Retry-After; other codes are relay_rejected without it', async () => {
+    const a = await registered('a');
+    relay.inject.push({ path: '/v1/inbox', status: 429, code: 'rate_limited', headers: { 'Retry-After': '3' } });
+    const t = await expectCode(a.relay!.fetchInbox(a.identity), 'relay_unavailable');
+    expect(t.retryAfterSeconds).toBe(3);
+    relay.inject.push({ path: '/v1/intents', status: 429, code: 'max_open_intents', headers: { 'Retry-After': '3' } });
+    const r = await expectCode(a.relay!.postIntent(a.identity, { need: 'x', ttl: 60 }), 'relay_rejected');
+    expect([r.relayCode, r.retryAfterSeconds, r.isTransient]).toEqual(['max_open_intents', undefined, false]);
+  });
+
+  it('page cursors are strict: wrong type or absent is relay_protocol_error', async () => {
+    const a = await registered('a');
+    for (const cursor of [5, {}, undefined]) {
+      relay.inject.push({ path: '/v1/discover', status: 200, body: { agents: [], ...(cursor === undefined ? {} : { cursor }) } });
+      await expectCode(a.relay!.discover(), 'relay_protocol_error');
+      relay.inject.push({ path: '/v1/intents', status: 200, body: { intents: [], ...(cursor === undefined ? {} : { cursor }) } });
+      await expectCode(a.relay!.listIntents(), 'relay_protocol_error');
+    }
+    for (const cursor of [5, 'latest', undefined]) {
+      relay.inject.push({ path: '/v1/inbox', status: 200, body: { messages: [], ...(cursor === undefined ? {} : { cursor }) } });
+      await expectCode(a.relay!.fetchInbox(a.identity), 'relay_protocol_error');
+    }
+    relay.inject.push({ path: '/v1/discover', status: 200, body: { agents: [], cursor: 'opaque' } });
+    expect((await a.relay!.discover()).cursor).toBe('opaque');
+    relay.inject.push({ path: '/v1/inbox', status: 200, body: { messages: [], cursor: null } });
+    expect((await a.relay!.fetchInbox(a.identity)).cursor).toBeNull();
+    relay.inject.push({ path: '/v1/peer', status: 200, body: undefined });
+    await expectCode(a.relay!.lookupPeer(a.id), 'relay_protocol_error'); // empty 2xx body
+  });
+
+  it('listIntents: a present but malformed optional field is relay_protocol_error', async () => {
+    const a = await registered('a');
+    const base = { intentId: 'i', from: a.id, need: 'x', tags: [], ttl: 60, createdAt: 1, expiresAt: 61 };
+    for (const extra of [{ maxPrice: 5 }, { maxPrice: null }, { currency: 1 }, { from: 'someone' }]) {
+      relay.inject.push({ path: '/v1/intents', status: 200, body: { intents: [{ ...base, ...extra }], cursor: null } });
+      await expectCode(a.relay!.listIntents(), 'relay_protocol_error');
+    }
+  });
+
+  it('tags are string arrays (joined with ","); postIntent always sends tags', async () => {
+    const a = await registered('a');
+    await a.relay!.discover({ tags: ['gpu', 'ml'] });
+    await a.relay!.listIntents({ tags: ['gpu'] });
+    await a.relay!.discover({ tags: [] });
+    const q = relay.queries.filter(([p]) => p === '/v1/discover' || p === '/v1/intents').map(([, x]) => x.tags);
+    expect(q).toEqual(['gpu,ml', 'gpu', undefined]);
+    await expectCode(a.relay!.discover({ tags: ['a,b'] }), 'invalid_argument');
+    await expectCode(a.relay!.listIntents({ tags: 'gpu' as never }), 'invalid_argument');
+    await a.relay!.postIntent(a.identity, { need: 'x', ttl: 60 });
+    expect(relay.bodies.filter(([p]) => p === '/v1/intents').map(([, b]) => b)).toEqual([{ need: 'x', tags: [], ttl: 60 }]);
+  });
+
+  it('listen: comments (heartbeats) do not reset the failure count; 10 broken streams → relay_unavailable', async () => {
+    const id = await SoftwareIdentity.generate('ed25519');
+    let connects = 0;
+    const broken: typeof fetch = async () => {
+      connects++;
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(': hb\n\n: hb\r\n\r\n'));
+          c.error(new Error('connection reset'));
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    const c = new RelayClient('https://relay.example', { fetch: broken, reconnectBaseMs: 0 });
+    await expectCode((async () => { for await (const _ of c.listen(id)) { /* none */ } })(), 'relay_unavailable');
+    expect(connects).toBe(10);
+  });
+
+  it('listen: 200, `connected`, then an end (no progress) is a failure; 10 of them → relay_unavailable', async () => {
+    const id = await SoftwareIdentity.generate('ed25519');
+    let connects = 0;
+    const empty: typeof fetch = async () => {
+      connects++;
+      return new Response('event: connected\ndata: {}\n\n: hb\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    // base 1 ms: backoff 1, 2, 4 … 256 ms between the 10 connects (>= 511 ms in total)
+    const c = new RelayClient('https://relay.example', { fetch: empty, reconnectBaseMs: 1 });
+    const started = Date.now();
+    await expectCode((async () => { for await (const _ of c.listen(id)) { /* none */ } })(), 'relay_unavailable');
+    expect(connects).toBe(10);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(500);
+  });
+
+  it('listen: a clean end after an event frame (drain included) reconnects at once', async () => {
+    const id = await SoftwareIdentity.generate('ed25519');
+    const bodies = ['id: 1-0\nevent: message\ndata: {}\n\n', 'event: drain\ndata: {}\n\n', 'id: 2-0\nevent: message\ndata: {}\n\n'];
+    const urls: string[] = [];
+    const seq: typeof fetch = async (input) => {
+      urls.push(String(input));
+      return new Response(bodies.shift() ?? '', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    };
+    // a huge base delay: any backoff sleep would time the test out
+    const c = new RelayClient('https://relay.example', { fetch: seq, reconnectBaseMs: 1_000_000 });
+    const got: string[] = [];
+    for await (const ev of c.listen(id)) {
+      got.push(ev.streamId);
+      if (got.length === 2) break;
+    }
+    expect(got).toEqual(['1-0', '2-0']);
+    expect(urls).toHaveLength(3);
+  });
+
+  it('listen yields raw frame data; follow quarantines a non-JSON frame and moves on', async () => {
+    const alice = await registered('alice');
+    const bob = await registered('bob', 'secp256k1');
+    relay.enqueueRaw(bob.id, new RawFrame('not json'));
+    const gen = bob.relay!.listen(bob.identity);
+    expect((await gen.next()).value).toMatchObject({ data: 'not json', catchup: true });
+    await gen.return();
+    relay.streams.delete(bob.id); // the live phase gets the raw frame below
+    const inbox = await bob.open();
+    const bobPeer = await alice.peers.resolve(bob.id);
+    const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: 'after' } });
+    const kinds: string[] = [];
+    const ctrl = new AbortController();
+    let sent: Promise<void> | null = null;
+    for await (const o of inbox.follow(bob.relay!, {
+      signal: ctrl.signal,
+      onLive: () => {
+        if (sent === null) {
+          relay.enqueueRaw(bob.id, new RawFrame('not json'));
+          sent = alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
+        }
+      },
+    })) {
+      kinds.push(o.kind);
+      if (o.kind === 'delivered') ctrl.abort();
+    }
+    await sent;
+    expect(kinds).toEqual(['quarantined', 'delivered']);
+    expect(inbox.cursor(bob.relay!)).toBe('1003-0');
+    await inbox.close();
   });
 });
 
@@ -344,12 +504,12 @@ describe('PeerStore', () => {
     const store = new MemoryStore();
     const peers = new PeerStore({ store, clock: clock2.fn });
     const bob = await SoftwareIdentity.generate('secp256k1');
-    const reg = bob.toRegistrationFile({ name: 'Bob', endpoint: 'https://bob.example/ace' });
+    const reg = createRegistrationFile(bob, { name: 'Bob', endpoint: 'https://bob.example/ace' });
     const p = await peers.pinRegistrationFile(reg);
     expect(p.registeredAt).toBe(clock2.t);
     expect((await peers.adopt(p)).outcome).toBe('unchanged');
     const other = SoftwareIdentity.fromExport({ ...bob.exportPrivateKey(), encryptionPrivateKey: toBase64(new Uint8Array(32).fill(7)) });
-    await expectCode(peers.pinRegistrationFile(other.toRegistrationFile({ name: 'Bob', endpoint: 'https://bob.example/ace' }), { pinnedAt: clock2.t + 100 }), 'stale_peer_binding');
+    await expectCode(peers.pinRegistrationFile(createRegistrationFile(other, { name: 'Bob', endpoint: 'https://bob.example/ace' }), { pinnedAt: clock2.t + 100 }), 'stale_peer_binding');
     await expectCode(peers.resolve('ace:sha256:' + '1'.repeat(64)), 'unknown_peer');
     const [key] = await store.list('peers/');
     const doc = JSON.parse(new TextDecoder().decode((await store.read(key))!));

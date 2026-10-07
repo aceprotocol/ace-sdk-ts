@@ -3,9 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_OPEN_THREADS_PER_PEER, MemoryStore, ThreadStore, computeConversationId, type ACEStore, type ThreadSnapshot,
 } from '../src/index.js';
-import { sha256Hex } from '../src/encoding.js';
-import { THREAD_RETENTION_SECONDS, threadIndexKey, threadKey } from '../src/thread-store.js';
-import { expectCode } from './helpers.js';
+import { canonicalStateBytes, sha256Hex } from '../src/encoding.js';
+import { THREAD_RETENTION_SECONDS, ThreadRecords, threadIndexKey, threadKey } from '../src/thread-store.js';
+import { expectCode, wire } from './helpers.js';
 import { Agent, Clock } from './pipeline.js';
 
 const RELAY_SRC = { kind: 'relay', relayUrl: 'https://relay.example', streamId: '1-0' } as const;
@@ -17,10 +17,23 @@ function rfqSnapshot(local: string, peer: string, conversationId: string, thread
   };
 }
 
-/** `n` open threads (an rfq from `peer`) in the conversation. */
-async function fill(store: ACEStore, local: string, peer: string, conversationId: string, n: number, ts: number): Promise<ThreadStore> {
-  const threads = new ThreadStore({ store, localAceId: local, clock: () => ts });
-  for (let i = 0; i < n; i++) await threads.saveRecord({ snapshot: rfqSnapshot(local, peer, conversationId, `fill-${i}`, ts), pending: null });
+/**
+ * `n` open threads (an rfq from `peer`) in the conversation. The first is saved normally; the
+ * rest are seeded in bulk in the same format with one index write, which keeps the 1000-thread
+ * tests fast under load (saving one by one rewrites the growing index each time).
+ */
+async function fill(store: ACEStore, local: string, peer: string, conversationId: string, n: number, ts: number): Promise<ThreadRecords> {
+  const threads = new ThreadRecords({ store, localAceId: local, clock: () => ts });
+  if (n === 0) return threads;
+  await threads.saveRecord({ snapshot: rfqSnapshot(local, peer, conversationId, 'fill-0', ts), pending: null });
+  const open = [threadKey(conversationId, 'fill-0').slice(0, -'.json'.length)];
+  for (let i = 1; i < n; i++) {
+    const s = rfqSnapshot(local, peer, conversationId, `fill-${i}`, ts);
+    const key = threadKey(conversationId, s.threadId);
+    await store.write(key, canonicalStateBytes({ ...s, pending: null, version: 1 }));
+    open.push(key.slice(0, -'.json'.length));
+  }
+  await store.write(threadIndexKey(peer), canonicalStateBytes({ open: open.sort(), version: 1 }));
   return threads;
 }
 
@@ -57,7 +70,7 @@ describe('open-thread bound per peer', () => {
     const inbox = await bob.open(); // replay state first: the filled threads model earlier receipts
     const threads = await fill(bob.store, bob.id, alice.id, conv, MAX_OPEN_THREADS_PER_PEER, clock.t);
     const env = (await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'rfq', body: { need: 'x' }, threadId: 'one-more' })).message;
-    const out = await inbox.receive(env, RELAY_SRC);
+    const out = await inbox.receive(wire(env), RELAY_SRC);
     expect(out.kind).toBe('quarantined');
     if (out.kind === 'quarantined') expect(out.error.code).toBe('limit_exceeded');
     expect(bob.host.calls).toEqual([]);
@@ -94,11 +107,11 @@ describe('retention', () => {
     const { alice, bob, conv } = await pair();
     const old = 10_000;
     const now = old + THREAD_RETENTION_SECONDS + 1;
-    const seed = new ThreadStore({ store, localAceId: bob.id, clock: () => old });
+    const seed = new ThreadRecords({ store, localAceId: bob.id, clock: () => old });
     await seed.saveRecord({ snapshot: rfqSnapshot(bob.id, alice.id, conv, 'idle', old), pending: null });
     await seed.saveRecord({ snapshot: rfqSnapshot(bob.id, alice.id, conv, 'mine', old, bob.id), pending: null });
     await seed.saveRecord({ snapshot: rfqSnapshot(bob.id, alice.id, conv, 'recent', now - 10), pending: null });
-    const later = new ThreadStore({ store, localAceId: bob.id, clock: () => now });
+    const later = new ThreadRecords({ store, localAceId: bob.id, clock: () => now });
     await later.saveRecord({ snapshot: rfqSnapshot(bob.id, alice.id, conv, 'trigger', now), pending: null });
     expect((await later.list()).map((s) => s.threadId).sort()).toEqual(['mine', 'recent', 'trigger']);
     expect(await later.openThreadCount(alice.id)).toBe(3);

@@ -11,7 +11,9 @@ TypeScript SDK for the **ACE Protocol** (Agent Commerce Engine) — a secure, en
 - **Replay protection** — seen store with horizons, per-sender quota and canonical persistence
 - **Pipeline** — `PeerStore` (rollback barrier), `Outbox` (durable send), `Inbox` (exactly-once receive with crash recovery), `RelayClient` (HTTP + SSE), over any `ACEStore` (`MemoryStore`, or `FileStore` from `@ace-protocol/sdk/node`)
 
-Every failure is an `ACEError` with a stable `code` and a `category` (`permanent`, `transient` or `local`; `isTransient` means retry).
+Every failure is an `ACEError` with a stable `code` and a `category` (`permanent`, `transient` or `local`; `isTransient` means retry). The codes and categories are those of ace-spec 06-security § SDK Error Codes.
+
+**Signatures may be non-deterministic.** secp256k1 signatures use RFC 6979 with extra randomness, so signing the same data twice can give different (equally valid) signatures. Treat signatures as verify-only: never compare signature bytes, deduplicate on them, or expect them to match a fixture.
 
 ## Encryption
 
@@ -31,7 +33,7 @@ The `kemCiphertext` is part of the signed message payload, so a relay cannot swa
 npm install @ace-protocol/sdk
 ```
 
-Requires Node.js >= 20.19.0. `FileStore` is Node-only (`import { FileStore } from '@ace-protocol/sdk/node'`); everything else also runs in browsers and edge runtimes.
+Requires Node.js >= 20.19.0. `FileStore`, `postDirect` and `deliverDirectOrRelay` are Node-only (`import { FileStore, postDirect, deliverDirectOrRelay } from '@ace-protocol/sdk/node'`); the main entry has no static Node imports and also runs in browsers and edge runtimes.
 
 ## Quick Start
 
@@ -62,8 +64,8 @@ export async function local(): Promise<ParsedMessage> {
   });
 }
 
-// 2. Over a relay: durable send (Outbox) and exactly-once receive (Inbox).
-//    Use FileStore from '@ace-protocol/sdk/node' instead of MemoryStore to persist state.
+// 2. Over a relay (e.g. https://relay.aceprotocol.org): durable send (Outbox) and exactly-once
+//    receive (Inbox). Use FileStore from '@ace-protocol/sdk/node' instead of MemoryStore to persist state.
 export async function overRelay(relayUrl: string): Promise<ParsedMessage[]> {
   const relay = new RelayClient(relayUrl);
   const alice = await SoftwareIdentity.generate('ed25519');
@@ -116,7 +118,7 @@ Economic messages require a `threadId` and follow the transition table of the sp
 
 ### Identity and keys
 
-- `SoftwareIdentity.generate(scheme)`, `SoftwareIdentity.fromExport(data)`, `identity.exportPrivateKey()`, `identity.toRegistrationFile(opts)`
+- `SoftwareIdentity.generate(scheme)`, `SoftwareIdentity.fromExport(data)`, `identity.exportPrivateKey()`; `SIGNING_SCHEMES`, `isSigningScheme(value)`
 - `createRegistrationFile(identity, { name, endpoint, description?, tier?, hardwareBacking?, capabilities?, settlement?, chains? })` — the registration file of any `ACEIdentity` (hardware-backed ones included); `invalid_registration` on invalid input
 - `ACEIdentity` — implement it for hardware keys; `decrypt` may use `decryptWithSeed(kemCiphertext, payload, seed, conversationId)`. A non-`ACEError` thrown by `decrypt` is reported as `identity_unavailable` (retryable).
 - `computeACEId`, `computeConversationId`, `kemPublicKeyFromSeed`, `generateKemSeed`, `toBase64`, `fromBase64`
@@ -133,45 +135,101 @@ Economic messages require a `threadId` and follow the transition table of the sp
 
 - `VerifiedPeer` — only obtainable from `verifyPeerRecord`, `verifyRegistrationFile`, `verifyRegistrationRequest`, `PeerStore` or `RelayClient`. Its `profile` is unverified relay metadata.
 - `fetchRegistrationFile(domain, { timeoutMs?, maxBytes?, allowPrivateAddresses? })` — SSRF-checked (the DNS check needs Node), no redirects
-- `isBlockedAddress(ip)` — the SSRF policy behind `fetchRegistrationFile`: true for any non-public address (or non-IP input); IPv4-mapped and NAT64 addresses are judged by the embedded IPv4. For callers that open their own connections (e.g. direct delivery).
+- `isBlockedAddress(ip)` — the SSRF policy (08-relay § Client Rules, Blocked Addresses) behind `fetchRegistrationFile` and `postDirect`: true for any blocked address (or non-IP input); IPv4-mapped and NAT64 addresses are judged by the embedded IPv4. For callers that open their own connections.
 - `validateProfile`, `createRegistrationRequest`, `verifyRegistrationRequest` (returns `{ request, peer, requestDigest }`)
-- `createAuthHeaders`, `parseAuthHeaders`, `verifyAuthHeaders` for `listen` / `inbox` / `unregister` / `intent`
+- `createAuthHeaders`, `parseAuthHeaders`, `verifyAuthHeaders` for `listen` / `inbox` / `unregister` / `intent` / `webhook`
 
 ### State
 
 - `ThreadStateMachine({ localAceId })` — `check`, `apply`, `getState`, `getSnapshot`, `allowedTypes`, `exportState`, `ThreadStateMachine.fromState`
-- `ReplayDetector({ capacity?, horizon?, clock? })` — `accepts`, `commit`, `clone`, `exportState`, `ReplayDetector.fromState`
+- `ReplayDetector({ capacity?, horizon?, clock? })` — `accepts`, `commit`, `clone`, `exportState`, `ReplayDetector.fromState`. Horizons are internal.
 
 ### Pipeline
 
-- `ACEStore` — `read` / `write` (atomic) / `delete` / `list` / `lock`; `MemoryStore`, `FileStore(root)`
+- `ACEStore` — `read` / `write` (atomic; values up to 64 MiB, larger is `invalid_argument`) / `delete` / `list` / `lock(name, { timeoutMs? })` (names `^[a-z0-9][a-z0-9_-]{0,63}$`, default timeout 10 s; a lock not acquired in time is `receiver_busy` for `receive` and `lock_busy` otherwise; `storage_failed` is I/O only); `MemoryStore`, `FileStore(root)`
 - `PeerStore({ store, relay?, ttlSeconds?, clock? })` — `get`, `resolve`, `adopt`, `pinRegistrationFile`, `remove`. A registration file never rotates a pinned encryption key; rotation needs a newer signed relay binding.
-- `Outbox.open({ identity, store })` — repairs threads from crashed receives, then `stage`, `deliver(requestId, transport)`, `resign` (after `envelope_expired`), `abandon`, `pending`. Staging a message that opens a thread with a peer already holding `MAX_OPEN_THREADS_PER_PEER` (1000) non-terminal threads is `limit_exceeded`.
-- `Inbox.open({ identity, store, peers, onMessage })` — `onMessage` must persist its effect idempotently keyed by `(from, messageId)`.
-  - `receive(envelope, source)` → `ReceiveOutcome` (`delivered` / `duplicate` / `quarantined` / `retryable`). A message that would open thread 1001 with one peer is quarantined `limit_exceeded`.
+- `Outbox.open({ identity, store })` — repairs threads from crashed receives, then `stage`, `deliver(requestId, transport)` (returns what `transport` returns; an `expired` send is refused with `envelope_expired` before any transport call), `resign` (after `envelope_expired`), `abandon`, `pending`. Staging a message that opens a thread with a peer already holding `MAX_OPEN_THREADS_PER_PEER` (1000) non-terminal threads is `limit_exceeded`.
+- `Inbox.open({ identity, store, peers, onMessage, capacity? })` — `onMessage` must persist its effect idempotently keyed by `(from, messageId)`. An invalid `capacity` is `invalid_argument`.
+  - `receive(message: Uint8Array, source)` → `ReceiveOutcome` (`delivered` / `duplicate` / `quarantined` / `retryable`). `message` is the raw UTF-8 JSON of an envelope; bytes that are oversize, not JSON or not an envelope are `quarantined` (`invalid_envelope`). `source` is `{ kind: 'relay', relayUrl, streamId? }` or `{ kind: 'direct' }`; an invalid source or a closed inbox throws `invalid_argument`. A message that would open thread 1001 with one peer is quarantined `limit_exceeded`.
+  - `receiveDirect(body: Uint8Array)` → `DirectReply { status, body, outcome? }` — see [Direct delivery](#direct-delivery).
   - `pull(relay, { limit?, maxPages?, signal? })` → `PullResult { outcomes, blocked, hasMore }`: every non-retryable outcome in relay order, the error that stopped the drain (or `null`), and `hasMore` when `maxPages` or an abort stopped it early. `pull` never throws: an invalid `limit` / `maxPages` is `blocked` with `invalid_argument`. `outcomes` grows with the backlog, so bound it with `maxPages` (or use `follow`). Convenience getters: `messages`, `delivered`, `duplicates`, `quarantined`.
   - `follow(relay, { signal?, onLive? })` — async iterable of the initial pull's outcomes, then live ones. `onLive()` runs once the initial pull is done and the event stream is connected, and again after every reconnect. A retryable outcome is yielded, then thrown; a failed inbox fetch is thrown.
   - `cursor(relay)` — the persisted cursor, keyed by `relay.baseUrl`; `close()`.
-- `ThreadStore({ store, localAceId })` — read access to persisted threads. Keeps a per-peer index of non-terminal threads (`threads/index/`); prunes threads idle for 30 days that are terminal or hold no local message.
-- `RelayClient(baseUrl)` — `baseUrl` is the normalized URL (the cursor key). `register`, `unregister`, `lookupPeer`, `discover`, `send`, `fetchInbox`, `listen(identity, { since?, signal?, onOpen? })`, `postIntent`, `listIntents`
+- `ThreadStore({ store, localAceId })` — `get`, `list`, `remove` (→ `boolean`), `allowedTypes`. Keeps a per-peer index of non-terminal threads (`threads/index/`); prunes threads idle for 30 days that are terminal or hold no local message.
+- `RelayClient(baseUrl)` — `register`, `unregister`, `lookupPeer`, `discover({ q?, tags?: string[], chain?, scheme?, online?, limit?, cursor? })`, `send`, `fetchInbox`, `listen(identity, { since?, signal?, onOpen? })` (yields `{ streamId, data, catchup }` with the raw frame `data`; the Inbox decides what it is), `postIntent(identity, { need, tags?, maxPrice?, currency?, ttl })`, `listIntents({ q?, tags?: string[], limit?, cursor? })`, `setWebhook` / `getWebhook` / `clearWebhook`.
+  - `baseUrl` is the normalized relay URL (08-relay § Client Rules): `http`/`https`, no userinfo, `?`, `#`, whitespace or control characters (`invalid_argument`), lowercase scheme and host, default port and trailing `/` removed. It is the key of the persisted inbox cursor.
+  - Redirects are never followed: any 3xx is `relay_protocol_error`. 408 / 5xx / 429 `rate_limited` are `relay_unavailable` (with `retryAfterSeconds` from an integer `Retry-After`); any other 429 (`recipient_inbox_full`, `sender_quota_exceeded`, `max_open_intents`, …) and other 4xx are `relay_rejected` (`relayCode` holds the relay's `error`), except 400 `envelope_expired`, 403 `not_registered` and 404 `unknown_peer`, which keep their own codes. A response missing a required field, or with a present but malformed optional field (a page `cursor` of the wrong type, say), is `relay_protocol_error`.
 
 Persisted files follow ace-spec 06 Appendix A (compact JSON, sorted keys), so the Python and Swift SDKs read the same state.
+
+### Webhooks
+
+An agent without a permanent connection can ask its relay to POST a wake-up notification when a message is queued for it (08-relay § Webhooks):
+
+```typescript
+await relay.setWebhook(identity, { url: 'https://agent.example.com/ace/wake', secret });   // secret: 16-128 chars
+const hook = await relay.getWebhook(identity);   // { url, status: 'active' | 'disabled', failures, updatedAt, lastDeliveredAt?, lastError? } | null
+await relay.clearWebhook(identity);
+```
+
+On the agent's HTTP endpoint, authenticate each notification before acting on it, then pull the inbox:
+
+```typescript
+import { verifyWebhookNotification } from '@ace-protocol/sdk';
+
+const { aceId, streamId } = verifyWebhookNotification({
+  secret,
+  timestamp: req.headers['x-ace-webhook-timestamp'],
+  signature: req.headers['x-ace-webhook-signature'],
+  body: rawBody,              // the raw request bytes, not re-serialized JSON
+});                            // invalid_argument / invalid_signature / stale_timestamp on failure
+await inbox.pull(relay);
+```
+
+The signature is `sha256=` + hex HMAC-SHA256(secret, `<timestamp>.<body>`), checked in constant time, with a ±300 s freshness window (`windowSeconds`, `clock` to override). `signWebhookNotification(secret, timestamp, body)` and `isWebhookSecret` are the relay side.
+
+### Direct delivery
+
+Agents that advertise an `endpoint` accept envelopes directly (08-relay § Direct Delivery) as `POST <endpoint>` with `{"message": Envelope}`. Both paths carry the same envelope, so a copy that also arrives through the relay is a duplicate.
+
+Receiving — the application owns the HTTP server, routing and rate limiting; the SDK answers the request body:
+
+```typescript
+const reply = await inbox.receiveDirect(rawBody);   // rawBody: Uint8Array
+res.writeHead(reply.status, { 'Content-Type': 'application/json' }).end(JSON.stringify(reply.body));
+```
+
+| Request | `status` | `body` |
+|---------|----------|--------|
+| Any, while the inbox is closed (the sender falls back to the relay) | 503 | `{ ok: false, error: 'internal_error' }` |
+| Larger than `MAX_DIRECT_BODY_BYTES` (132096) | 413 | `{ ok: false, error: 'payload_too_large' }` |
+| Not UTF-8 JSON with an object top level and a `message` member | 400 | `{ ok: false, error: 'invalid_argument' }` |
+| Delivered, or a duplicate | 200 | `{ ok: true, messageId }` |
+| Rejected by the pipeline (direct rejections are never persisted) | 400 | `{ ok: false, error: <code> }` |
+| Retryable (`transient` / `local`) | 503 | `{ ok: false, error: <code> }` |
+| Any other failure | 503 | `{ ok: false, error: 'internal_error' }` |
+
+Sending (Node only):
+
+```typescript
+import { deliverDirectOrRelay, postDirect } from '@ace-protocol/sdk/node';
+
+await postDirect(peerEndpoint, envelope, { timeoutMs: 5000 });
+// or, as an Outbox transport that falls back to the relay:
+const path = await outbox.deliver(requestId, deliverDirectOrRelay(relay, peerEndpoint));   // 'direct' | 'relay'
+```
+
+`postDirect` requires an ACE HTTPS URL whose host resolves only to non-blocked addresses and connects to the validated address (DNS pinned); it never follows redirects and succeeds iff the answer is 2xx `{"ok": true}`. An unsafe or malformed endpoint is `invalid_argument`; 400 / 413 are `direct_rejected` (permanent, `remoteCode` is the receiver's `error` when it matches `^[a-z0-9_]{1,64}$`: the recipient rejected this envelope, so it is not retried directly nor through the relay); anything else is `direct_unavailable` (transient). `deliverDirectOrRelay` falls back to `relay.send` on `direct_unavailable` or an unsafe endpoint and throws `direct_rejected`.
+
+## Development
+
+```sh
+npm ci
+npm run lint && npm test && npm run build
+```
+
+The tests run `examples/quickstart.ts` and the shared cross-language vectors in `tests/fixtures` (a copy of ace-spec `test-vectors.json`, with its source revision and SHA-256 digest).
 
 ## License
 
 Apache-2.0 — see [LICENSE](./LICENSE) for details.
-
-## Validate unpublished SDK changes in a consumer
-
-Run `npm ci` in this SDK, then:
-
-```sh
-node scripts/install-local.mjs --update-locks /absolute/path/to/ace-cli /absolute/path/to/relay
-```
-
-The script builds and packs this source, records the actual tarball integrity in consumer
-lockfiles, seeds npm's content-addressed cache, and runs `npm ci`. Omit `--update-locks`
-to verify that the current source exactly matches the locked artifact. No package is
-published. Release the same SDK artifact before relying on registry-only installation.
-The SDK tests execute `examples/quickstart.ts`; interoperability fixtures are included
-in `tests/fixtures` with a source revision and SHA-256 digest.

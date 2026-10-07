@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { ACEError, Outbox, ThreadStore, type ACEMessage } from '../src/index.js';
 import { sha256Hex } from '../src/encoding.js';
 import { threadKey } from '../src/thread-store.js';
-import { expectCode } from './helpers.js';
+import { expectCode, wire } from './helpers.js';
 import { Agent, Clock, json } from './pipeline.js';
 
 const outboxKey = (rid: string) => `outbox/${sha256Hex(rid)}.json`;
@@ -105,7 +105,7 @@ describe('Outbox', () => {
     const got: ACEMessage[] = [];
     await alice.outbox.deliver('r', async (e) => { got.push(e); });
     const inbox = await bob.open();
-    const out = await inbox.receive(got[0], { kind: 'relay', relayUrl: 'https://r.example', streamId: '1-0' });
+    const out = await inbox.receive(wire(got[0]), { kind: 'relay', relayUrl: 'https://r.example', streamId: '1-0' });
     expect(out.kind).toBe('delivered');
     if (out.kind === 'delivered') expect(out.message.timestamp).toBe(t0 + 1000);
   });
@@ -129,7 +129,7 @@ describe('Outbox', () => {
     const first = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'rfq', body: { need: 'x' }, threadId: 'd', requestId: 'r1' });
     await alice.outbox.deliver('r1', async () => {});
     const inbox = await bob.open();
-    await inbox.receive(first.message, { kind: 'direct' });
+    await inbox.receive(wire(first.message), { kind: 'direct' });
     const offer = await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'offer', body: { price: '3', currency: 'USDC' }, threadId: 'd', requestId: 'o1' });
     await bob.outbox.abandon('o1');
     const snap = (await new ThreadStore({ store: bob.store, localAceId: bob.id }).get(offer.message.conversationId, 'd'))!;
@@ -147,7 +147,7 @@ describe('Outbox', () => {
     const p = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'rfq', body: { need: 'x' }, threadId: 'old', requestId: 'a' });
     await alice.outbox.deliver('a', async () => {});
     const inbox = await bob.open();
-    await inbox.receive(p.message, { kind: 'direct' });
+    await inbox.receive(wire(p.message), { kind: 'direct' });
     const rej = await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'reject', body: { reason: 'busy' }, threadId: 'old', requestId: 'r' });
     await bob.outbox.deliver('r', async () => {});
     const store = new ThreadStore({ store: bob.store, localAceId: bob.id, clock: clock.fn });

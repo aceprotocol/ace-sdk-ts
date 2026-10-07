@@ -2,7 +2,7 @@
 
 import { ACEError } from './errors.js';
 import {
-  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isThreadId, loadsBody, toBase64, wireInt,
+  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isObj, isThreadId, loadsBody, toBase64, wireInt,
 } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { computeConversationId, encrypt } from './encryption.js';
@@ -31,10 +31,6 @@ const SCHEMAS: Record<MessageType, Array<[string, FieldKind]>> = {
   text: [['message', 'str']],
 };
 
-function isPlainObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
-
 /**
  * Validate a body against its type's schema; failures are `invalid_body`
  * (an unknown type is `invalid_argument`). Optional fields set to null are absent;
@@ -42,7 +38,7 @@ function isPlainObj(v: unknown): v is Record<string, unknown> {
  */
 export function validateBody(type: MessageType, body: JSONObject): void {
   if (!isMessageType(type)) throw new ACEError('invalid_argument', 'unknown message type');
-  if (!isPlainObj(body)) throw new ACEError('invalid_body', 'body must be a JSON object');
+  if (!isObj(body)) throw new ACEError('invalid_body', 'body must be a JSON object');
   for (const [name, kind] of SCHEMAS[type]) {
     const v = body[name];
     if (v === null || v === undefined) {
@@ -50,7 +46,7 @@ export function validateBody(type: MessageType, body: JSONObject): void {
       continue;
     }
     const ok = kind === 'str' || kind === 'optStr' ? typeof v === 'string'
-      : kind === 'obj' || kind === 'optObj' ? isPlainObj(v)
+      : kind === 'obj' || kind === 'optObj' ? isObj(v)
         : wireInt(v) !== null;
     if (!ok) throw new ACEError('invalid_body', `${type}.${name} has the wrong type`);
   }
@@ -92,7 +88,7 @@ export interface CreateMessageInput {
   timestamp?: number;
 }
 
-/** Encrypt, sign and record an outbound message (design §2.5 order). */
+/** Encrypt, sign and record an outbound message. */
 export async function createMessage(opts: CreateMessageInput): Promise<ACEMessage> {
   return buildMessage(opts);
 }
@@ -114,7 +110,7 @@ export async function buildMessage(opts: CreateMessageInput, reuseMessageId?: st
   const ts = opts.timestamp ?? nowOf();
   if (wireInt(ts) === null) throw new ACEError('invalid_argument', 'timestamp must be an integer in [0, 2^53-1]');
   // 2. JSON values, then schema
-  if (!isPlainObj(body)) throw new ACEError('invalid_body', 'body must be a JSON object');
+  if (!isObj(body)) throw new ACEError('invalid_body', 'body must be a JSON object');
   checkJsonValue(body);
   validateBody(type, body);
   // 3. conversation
