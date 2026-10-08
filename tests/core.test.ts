@@ -12,7 +12,7 @@ import { isBlockedAddress } from '../src/discovery.js';
 import { expectCode, peerOf, codeOf } from './helpers.js';
 
 const VALUE_EXPORTS = [
-  'ACEError', 'MESSAGE_TYPES', 'ECONOMIC_TYPES', 'isMessageType', 'isEconomicType', 'SIGNING_SCHEMES', 'isSigningScheme',
+  'ACEError', 'MESSAGE_TYPES', 'ECONOMIC_TYPES', 'PRINCIPAL_TYPES', 'isMessageType', 'isEconomicType', 'isPrincipalType', 'SIGNING_SCHEMES', 'isSigningScheme',
   'MAX_PLAINTEXT_BYTES', 'MAX_PAYLOAD_BYTES', 'MAX_ENVELOPE_BYTES', 'MAX_DIRECT_BODY_BYTES', 'MAX_JSON_DEPTH', 'MAX_THREAD_ID_LENGTH',
   'MAX_OPEN_THREADS_PER_PEER', 'PullResult', 'createRegistrationFile',
   'TIMESTAMP_WINDOW_SECONDS', 'OFFLINE_WINDOW_SECONDS', 'MAX_REGISTRATION_FILE_BYTES', 'MAX_INBOX_PAGE',

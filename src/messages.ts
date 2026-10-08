@@ -2,7 +2,7 @@
 
 import { ACEError } from './errors.js';
 import {
-  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isObj, isThreadId, loadsBody, toBase64, wireInt,
+  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isConversationId, isMessageId, isObj, isThreadId, loadsBody, toBase64, wireInt,
 } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { computeConversationId, encrypt } from './encryption.js';
@@ -29,7 +29,23 @@ const SCHEMAS: Record<MessageType, Array<[string, FieldKind]>> = {
   confirm: [['deliverId', 'str'], ['message', 'optStr']],
   info: [['message', 'str']],
   text: [['message', 'str']],
+  request: [['action', 'str'], ['summary', 'str'], ['ref', 'optObj'], ['amount', 'optStr'], ['currency', 'optStr'], ['details', 'optObj'], ['ttl', 'optTtl']],
+  decision: [['requestId', 'str'], ['outcome', 'str'], ['reason', 'optStr'], ['result', 'optObj']],
+  report: [['action', 'str'], ['summary', 'str'], ['outcome', 'str'], ['ref', 'optObj'], ['requestId', 'optStr'], ['proof', 'optObj']],
 };
+
+const OUTCOMES: Partial<Record<MessageType, readonly string[]>> = {
+  decision: ['approve', 'deny'],
+  report: ['ok', 'failed', 'skipped'],
+};
+
+function checkRef(type: MessageType, ref: Record<string, unknown>): void {
+  if (!isConversationId(ref.conversationId)) throw new ACEError('invalid_body', `${type}.ref.conversationId must be 64 lowercase hex`);
+  if (!isMessageId(ref.messageId)) throw new ACEError('invalid_body', `${type}.ref.messageId must be a lowercase UUID v4`);
+  if (ref.threadId !== undefined && ref.threadId !== null && !isThreadId(ref.threadId)) {
+    throw new ACEError('invalid_body', `${type}.ref.threadId must be a valid thread ID`);
+  }
+}
 
 /**
  * Validate a body against its type's schema; failures are `invalid_body`
@@ -55,6 +71,13 @@ export function validateBody(type: MessageType, body: JSONObject): void {
     const required = kind === 'inline' ? 'content' : kind === 'reference' ? 'uri' : null;
     if (required === null) throw new ACEError('invalid_body', "deliver.type must be 'inline' or 'reference'");
     if (typeof body[required] !== 'string') throw new ACEError('invalid_body', `deliver (${kind}) requires ${required}`);
+  }
+  const outcomes = OUTCOMES[type];
+  if (outcomes && !outcomes.includes(body.outcome as string)) {
+    throw new ACEError('invalid_body', `${type}.outcome must be one of ${outcomes.join(', ')}`);
+  }
+  if ((type === 'request' || type === 'report') && body.ref !== undefined && body.ref !== null) {
+    checkRef(type, body.ref as Record<string, unknown>);
   }
 }
 

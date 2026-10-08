@@ -4,7 +4,7 @@ export type {
   ACEIdentity, SigningScheme, IdentityTier, HardwareBacking, RegistrationFile, SigningConfig, Capability,
   PricingInfo, ChainInfo, AgentProfile, ProfilePricing, DiscoverQuery, PeerRecord, ACEMessage, MessageType,
   EncryptionEnvelope, SignatureEnvelope, RfqBody, OfferBody, AcceptBody, RejectBody, InvoiceBody, ReceiptBody,
-  DeliverBody, ConfirmBody, InfoBody, TextBody, JSONValue, JSONObject, ParsedMessage, ReplayState,
+  DeliverBody, ConfirmBody, InfoBody, TextBody, MessageRef, RequestBody, DecisionBody, ReportBody, JSONValue, JSONObject, ParsedMessage, ReplayState,
   RegistrationRequest, Intent,
 } from './types.js';
 export type { ThreadState, ThreadSnapshot, ThreadHistoryEntry, ThreadEvent } from './state-machine.js';
@@ -18,7 +18,7 @@ export type { ACEErrorCode, ACEErrorCategory } from './errors.js';
 export type { SoftwareIdentityExport } from './identity.js';
 
 export { ACEError } from './errors.js';
-export { MESSAGE_TYPES, ECONOMIC_TYPES, isMessageType, isEconomicType, SIGNING_SCHEMES, isSigningScheme } from './types.js';
+export { MESSAGE_TYPES, ECONOMIC_TYPES, PRINCIPAL_TYPES, isMessageType, isEconomicType, isPrincipalType, SIGNING_SCHEMES, isSigningScheme } from './types.js';
 export {
   MAX_PLAINTEXT_BYTES, MAX_PAYLOAD_BYTES, MAX_ENVELOPE_BYTES, MAX_DIRECT_BODY_BYTES, MAX_JSON_DEPTH, MAX_THREAD_ID_LENGTH,
   MAX_OPEN_THREADS_PER_PEER, TIMESTAMP_WINDOW_SECONDS, OFFLINE_WINDOW_SECONDS, MAX_REGISTRATION_FILE_BYTES, MAX_INBOX_PAGE,

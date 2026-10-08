@@ -153,12 +153,15 @@ export interface ReplayState {
 
 export type MessageType =
   | 'rfq' | 'offer' | 'accept' | 'reject' | 'invoice' | 'receipt' | 'deliver' | 'confirm'
-  | 'info' | 'text';
+  | 'info' | 'text'
+  | 'request' | 'decision' | 'report';
 
 export const MESSAGE_TYPES: readonly MessageType[] = [
   'rfq', 'offer', 'accept', 'reject', 'invoice', 'receipt', 'deliver', 'confirm', 'info', 'text',
+  'request', 'decision', 'report',
 ];
 export const ECONOMIC_TYPES: readonly MessageType[] = MESSAGE_TYPES.slice(0, 8);
+export const PRINCIPAL_TYPES: readonly MessageType[] = MESSAGE_TYPES.slice(10);
 
 export function isMessageType(t: unknown): t is MessageType {
   return typeof t === 'string' && (MESSAGE_TYPES as readonly string[]).includes(t);
@@ -166,6 +169,10 @@ export function isMessageType(t: unknown): t is MessageType {
 
 export function isEconomicType(t: unknown): boolean {
   return typeof t === 'string' && (ECONOMIC_TYPES as readonly string[]).includes(t);
+}
+
+export function isPrincipalType(t: unknown): boolean {
+  return typeof t === 'string' && (PRINCIPAL_TYPES as readonly string[]).includes(t);
 }
 
 export interface EncryptionEnvelope {
@@ -225,3 +232,12 @@ export interface DeliverBody {
 export interface ConfirmBody { deliverId: string; message?: string }
 export interface InfoBody { message: string }
 export interface TextBody { message: string }
+
+export interface MessageRef { conversationId: string; threadId?: string; messageId: string }
+export interface RequestBody {
+  action: string; summary: string; ref?: MessageRef; amount?: string; currency?: string; details?: JSONObject; ttl?: number;
+}
+export interface DecisionBody { requestId: string; outcome: 'approve' | 'deny'; reason?: string; result?: JSONObject }
+export interface ReportBody {
+  action: string; summary: string; outcome: 'ok' | 'failed' | 'skipped'; ref?: MessageRef; requestId?: string; proof?: JSONObject;
+}
