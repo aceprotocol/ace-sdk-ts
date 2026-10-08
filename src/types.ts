@@ -75,6 +75,28 @@ export interface RegistrationFile {
   chains?: ChainInfo[];
 }
 
+// === Principal (09) ===
+
+export type PrincipalRole = 'controller' | 'agent';
+
+/** A `(scheme, publicKey)` pair as it appears in a principal record (`publicKey` is canonical Base64). */
+export interface PrincipalKey {
+  scheme: SigningScheme;
+  publicKey: string;
+}
+
+/** 09-principal § Principal Record (wire shape). Semantic checks: `validatePrincipalRecord`. */
+export interface PrincipalRecord {
+  account: string;
+  roles: PrincipalRole[];
+  signer: PrincipalKey;
+  issuedAt: number;
+  /** Required; `issuedAt < expiresAt <= issuedAt + 31622400`. */
+  expiresAt: number;
+  scope?: string;
+  signature: string;
+}
+
 // === Discovery ===
 
 export interface ProfilePricing {
