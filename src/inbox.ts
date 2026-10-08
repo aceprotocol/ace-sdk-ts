@@ -505,13 +505,19 @@ export class Inbox {
   /**
    * R-P20 (09 § Same-Account Rules, SDK note): when the pinned sender principal fails steps 2-5, refresh the sender's
    * binding from the relay once (rollback barrier) and return the binding the rules run on. Only an envelope that
-   * verifies under the pinned key and scheme triggers a refresh (R-P30); otherwise the pipeline rejects it. Runs before
+   * passes the recipient, timestamp-window and replay checks and verifies under the pinned key and scheme triggers a
+   * refresh (R-P30); otherwise the pipeline rejects it. Runs before
    * any store lock (R-P29). A transient failure throws (the message is retryable, the cursor stays); a non-ACE error is
    * `relay_unavailable`; a permanent error, no relay or a different binding leaves the pinned binding to decide.
    */
   async #refreshPrincipalSender(env: ACEMessage, peer: VerifiedPeer, now: number): Promise<VerifiedPeer> {
     const ctx = this.#principalContext();
     if (ctx === undefined || senderPrincipalUsable(peer.principal, peer.signingPublicKey, ctx, now)) return peer;
+    // the cheap parse checks first (recipient, timestamp window, replay): a misaddressed, stale or replayed
+    // envelope never costs a relay lookup; the pipeline rejects it
+    if (env.to !== this.#identity.getACEId()) return peer;
+    if (env.timestamp < this.#floor() || env.timestamp > now + TIMESTAMP_WINDOW_SECONDS) return peer;
+    if (!this.#replay.accepts(env.messageId, env.from, env.timestamp)) return peer;
     if (!authenticatedBy(env, peer)) return peer;
     let fresh: VerifiedPeer | null;
     try {

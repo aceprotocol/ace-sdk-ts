@@ -7,7 +7,7 @@ export type {
   DeliverBody, ConfirmBody, InfoBody, TextBody, MessageRef, RequestBody, DecisionBody, ReportBody, JSONValue, JSONObject, ParsedMessage, ReplayState,
   RegistrationRequest, Intent, PrincipalKey, PrincipalRecord, PrincipalRole,
 } from './types.js';
-export type { PrincipalSigner, PrincipalContext, OpenRequestTo, RefreshSender, RequestRecord } from './principal.js';
+export type { PrincipalSigner, PrincipalContext, RequestRecord } from './principal.js';
 export type { ThreadState, ThreadSnapshot, ThreadHistoryEntry, ThreadEvent } from './state-machine.js';
 export type { RelayAuthRequest, WebhookMethod } from './auth.js';
 export type { Webhook, ListenEvent, InboxPage } from './relay.js';
@@ -32,7 +32,7 @@ export { decodeEnvelope, verifyEnvelopeSignature, envelopeFingerprint } from './
 export { createMessage, parseMessage, validateBody } from './messages.js';
 export {
   PRINCIPAL_ROLES, isCaip10, principalSignerFromIdentity, principalPayload, principalSignData, createPrincipalRecord,
-  validatePrincipalRecord, parsePrincipalRecord, checkPrincipalRules, requestKey, loadRequestRecord, recordRequest, fillDecision,
+  validatePrincipalRecord, parsePrincipalRecord, checkPrincipalRules, loadRequestRecord,
 } from './principal.js';
 export {
   VerifiedPeer, verifyPeerRecord, verifyRegistrationFile, fetchRegistrationFile, validateProfile, isBlockedAddress,

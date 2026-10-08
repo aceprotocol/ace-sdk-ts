@@ -25,8 +25,7 @@ const VALUE_EXPORTS = [
   'isHttpsUrl', 'isWebhookSecret', 'signWebhookNotification', 'verifyWebhookNotification',
   'ReplayDetector', 'ThreadStateMachine', 'ThreadStore', 'PeerStore', 'Inbox', 'Outbox', 'RelayClient', 'MemoryStore',
   'PRINCIPAL_ROLES', 'isCaip10', 'principalSignerFromIdentity', 'principalPayload', 'principalSignData', 'createPrincipalRecord',
-  'validatePrincipalRecord', 'parsePrincipalRecord', 'checkPrincipalRules', 'requestKey', 'loadRequestRecord', 'recordRequest',
-  'fillDecision',
+  'validatePrincipalRecord', 'parsePrincipalRecord', 'checkPrincipalRules', 'loadRequestRecord',
 ];
 
 async function setup() {

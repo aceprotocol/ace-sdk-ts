@@ -13,7 +13,7 @@ import { ReplayDetector } from './replay.js';
 import { verifySignature } from './signing.js';
 import { ThreadStateMachine, type ThreadEvent } from './state-machine.js';
 import type { ACEIdentity, ACEMessage, JSONObject, MessageType, ParsedMessage } from './types.js';
-import { isEconomicType, isMessageType, isPrincipalType } from './types.js';
+import { isEconomicType, isMessageType, isPrincipalType, isSigningScheme } from './types.js';
 
 // --- body schema --------------------------------------------------------------------
 
@@ -174,12 +174,17 @@ export interface ParseMessageOptions {
   principal?: PrincipalContext;
 }
 
+function isPrincipalKeyShape(v: unknown): boolean {
+  return isObj(v) && isSigningScheme(v.scheme) && typeof v.publicKey === 'string' && v.publicKey.length > 0;
+}
+
 function isPrincipalContext(v: unknown): v is PrincipalContext {
   if (typeof v !== 'object' || v === null) return false;
   const c = v as Record<string, unknown>;
   return typeof c.account === 'string' && typeof c.openRequestTo === 'function'
     && (c.refreshSender === undefined || typeof c.refreshSender === 'function')
-    && (c.trustedSigners === undefined || Array.isArray(c.trustedSigners));
+    && (c.selfSigner === undefined || isPrincipalKeyShape(c.selfSigner))
+    && (c.trustedSigners === undefined || (Array.isArray(c.trustedSigners) && c.trustedSigners.every(isPrincipalKeyShape)));
 }
 
 /**

@@ -670,6 +670,13 @@ describe('principal pipeline', () => {
     expect(parsed.type).toBe('request');
     expect(parsed.threadId).toBeNull();
     await expectCode(parseMessage(env, a.identity, (await a.peers.get(b.id))!, { ...opts(), principal: { account: ACC } as any }), 'invalid_argument');
+    for (const bad of [
+      { ...ctx, selfSigner: { scheme: 'rsa', publicKey: 'AA==' } }, { ...ctx, selfSigner: 'k' },
+      { ...ctx, trustedSigners: [{ scheme: 'ed25519', publicKey: 3 }] }, { ...ctx, trustedSigners: [null] },
+      { ...ctx, selfSigner: { scheme: 'ed25519', publicKey: '' } },
+    ]) {
+      await expectCode(parseMessage(env, a.identity, (await a.peers.get(b.id))!, { ...opts(), principal: bad as any }), 'invalid_argument');
+    }
   });
 
   it('request → decision round trip; a second different decision is bad_reference; a replayed one is a duplicate', async () => {
@@ -845,6 +852,32 @@ describe('principal pipeline', () => {
     expect(relay.calls).toBe(0);
     r = await ia.receive(wire(p.message), SRC(2));
     expect(r.kind).toBe('delivered');
+    expect(relay.calls).toBe(1);
+  });
+
+  it('a replayed, misaddressed or stale envelope triggers no relay call', async () => {
+    const relay = new StubRelay();
+    const { clock, owner, a, b } = await pairP({ relay, pinB: false });
+    relay.record = await peerRecord(b.identity, { name: 'b' }, NOW); // useless refresh: the pin stays unusable
+    const ia = await openP(a, { owner });
+    const p = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's' } });
+    let r = await ia.receive(wire(p.message), SRC(1));
+    expect(errCode(r)).toBe('wrong_principal');
+    expect(relay.calls).toBe(1);
+    // the verified envelope is one-shot: its redelivery is a duplicate without a relay lookup
+    r = await ia.receive(wire(p.message), SRC(2));
+    expect(r.kind).toBe('duplicate');
+    expect(relay.calls).toBe(1);
+    // misaddressed (to rewritten: the signature no longer matters, the recipient check fails first)
+    const q = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's2' } });
+    r = await ia.receive(wire({ ...q.message, to: b.id }), SRC(3));
+    expect(r.kind).toBe('quarantined');
+    expect(errCode(r)).toBe('wrong_recipient');
+    expect(relay.calls).toBe(1);
+    // stale: outside the acceptance window (timestamp more than 300 s in the future)
+    clock.t = NOW - 1000;
+    r = await ia.receive(wire(q.message), SRC(4));
+    expect(errCode(r)).toBe('stale_timestamp');
     expect(relay.calls).toBe(1);
   });
 
