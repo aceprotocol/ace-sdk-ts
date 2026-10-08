@@ -2,13 +2,13 @@
 
 import { ACEError } from './errors.js';
 import {
-  bytesEqual, checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isConversationId, isMessageId, isObj, isThreadId, loadsBody, toBase64, wireInt,
+  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isConversationId, isMessageId, isObj, isThreadId, loadsBody, toBase64, wireInt,
 } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { computeConversationId, encrypt } from './encryption.js';
 import { decodeEnvelope, decodeKemCiphertext, decodePayload, messageSignData } from './envelope.js';
 import { MAX_PLAINTEXT_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
-import { checkPrincipalRules, senderPrincipalUsable, type PrincipalContext } from './principal.js';
+import { checkPrincipalRules, type PrincipalContext } from './principal.js';
 import { ReplayDetector } from './replay.js';
 import { verifySignature } from './signing.js';
 import { ThreadStateMachine, type ThreadEvent } from './state-machine.js';
@@ -182,7 +182,6 @@ function isPrincipalContext(v: unknown): v is PrincipalContext {
   if (typeof v !== 'object' || v === null) return false;
   const c = v as Record<string, unknown>;
   return typeof c.account === 'string' && typeof c.openRequestTo === 'function'
-    && (c.refreshSender === undefined || typeof c.refreshSender === 'function')
     && (c.selfSigner === undefined || isPrincipalKeyShape(c.selfSigner))
     && (c.trustedSigners === undefined || (Array.isArray(c.trustedSigners) && c.trustedSigners.every(isPrincipalKeyShape)));
 }
@@ -259,18 +258,13 @@ export async function parseMessage(
 }
 
 /**
- * 06 step 7 for principal types (09 § Same-Account Rules). With `ctx.refreshSender`, a sender whose pinned principal
- * fails steps 2-5 is refreshed once (R-P20) before the rules run; a refresh that returns null or another binding
- * leaves the pinned binding to decide. (The Inbox refreshes before parsing instead, outside any store lock.)
+ * 06 step 7 for principal types (09 § Same-Account Rules). (The Inbox refreshes the
+ * sender before parsing, outside any store lock, R-P20.)
  */
 async function checkPrincipal(
   env: ACEMessage, body: JSONObject, sender: VerifiedPeer, ctx: PrincipalContext | undefined, now: number,
 ): Promise<void> {
-  let peer = sender;
-  if (ctx?.refreshSender !== undefined && !senderPrincipalUsable(peer.principal, peer.signingPublicKey, ctx, now)) {
-    const fresh = await ctx.refreshSender(peer.aceId);
-    if (isVerifiedPeer(fresh) && fresh.aceId === peer.aceId && bytesEqual(fresh.signingPublicKey, peer.signingPublicKey)) peer = fresh;
-  }
+  const peer = sender;
   await checkPrincipalRules(env.type, body, {
     conversationId: env.conversationId, senderPrincipal: peer.principal ?? null, senderSigningPublicKey: peer.signingPublicKey,
     selfAccount: ctx?.account ?? null, openRequestTo: ctx?.openRequestTo, now, selfSigner: ctx?.selfSigner,

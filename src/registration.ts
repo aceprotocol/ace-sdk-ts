@@ -8,6 +8,7 @@ import {
   bindingSignData, checkProfilePrincipal, decodeEncryptionKey, decodeSigningKey, mintPeer, validateProfile, verifyRegistrationFile,
   type VerifiedPeer,
 } from './discovery.js';
+import { validatePrincipalRecord } from './principal.js';
 import { KEM_PUBLIC_KEY_SIZE, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { buildSignData, computeACEId, encodePayload, signingAddress, verifySignature } from './signing.js';
 import type {
@@ -54,7 +55,10 @@ export function createRegistrationFile(identity: ACEIdentity, opts: {
   if (opts.settlement !== undefined) reg.settlement = opts.settlement;
   if (opts.chains !== undefined) reg.chains = opts.chains;
   if (opts.principal !== undefined) reg.principal = opts.principal;
-  verifyRegistrationFile(reg, { pinnedAt: 0, clock: () => opts.principal?.issuedAt ?? Math.floor(Date.now() / 1000) });
+  // R-P44: the principal is validated at the real now (no allow-expired, no issuedAt-relative clock)
+  const now = Math.floor(Date.now() / 1000);
+  if (opts.principal !== undefined) validatePrincipalRecord(opts.principal, signingPublicKey, now);
+  verifyRegistrationFile(reg, { pinnedAt: 0, clock: () => now });
   return reg;
 }
 

@@ -27,12 +27,6 @@ const WRONG_DECIDER = 'decision from a different controller than the request was
  */
 export type OpenRequestTo = (conversationId: string, requestId: string, now: number) => string | null | Promise<string | null>;
 
-/**
- * `refreshSender(aceId)`: re-fetch the sender's peer binding once (relay lookup through the Rollback Barrier) and
- * return it, or null when the refresh failed (R-P20).
- */
-export type RefreshSender = (aceId: string) => Promise<VerifiedPeer | null>;
-
 export function isCaip10(v: unknown): v is string {
   return typeof v === 'string' && CAIP10_RE.test(v);
 }
@@ -193,15 +187,13 @@ export async function createPrincipalRecord(signer: PrincipalSigner, o: {
 /**
  * Step-7 inputs from the receiver: its own principal `account`; the keys accepted as authorities of that account
  * (`selfSigner`, the signer of the receiver's own record — absent fails closed — and host-provided `trustedSigners`,
- * e.g. read from chain); the ledger lookup `openRequestTo`; and `refreshSender`, for callers that refresh the sender's
- * binding once when the pinned principal is unusable (09 steps 2-5, R-P20).
+ * e.g. read from chain); and the ledger lookup `openRequestTo`.
  */
 export interface PrincipalContext {
   account: string;
   openRequestTo: OpenRequestTo;
   selfSigner?: PrincipalKey;
   trustedSigners?: readonly PrincipalKey[];
-  refreshSender?: RefreshSender;
 }
 
 const sameKey = (a: PrincipalKey, b: PrincipalKey | undefined) => b !== undefined && a.scheme === b.scheme && a.publicKey === b.publicKey;

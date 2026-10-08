@@ -1,7 +1,7 @@
 // Principal binding (09-principal): types, bodies, records, rules, pipeline.
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ACEError, ECONOMIC_TYPES, MESSAGE_TYPES, MemoryStore, PeerStore, SoftwareIdentity, createRegistrationFile, createRegistrationRequest,
   validateBody, validateProfile, verifyPeerRecord, verifyRegistrationFile, verifyRegistrationRequest,
@@ -413,6 +413,25 @@ async function peerRecord(id: SoftwareIdentity, profile: any, ts = NOW) {
 }
 
 describe('principal in registration and peers', () => {
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(NOW * 1000); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('R-P44: createRegistrationFile and createRegistrationRequest validate the principal at the real now', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('secp256k1');
+    const opts = (principal: PrincipalRecord) => ({ name: 'M', endpoint: 'https://m.example/ace', principal });
+    // future issuedAt (beyond the 5-minute window)
+    const future = await rec(owner, me, { issuedAt: NOW + 3600, expiresAt: NOW + 7200 });
+    expect(codeOf(() => createRegistrationFile(me, opts(future)))).toBe('invalid_principal');
+    await expectCode(createRegistrationRequest(me, { name: 'A', principal: future }), 'invalid_principal');
+    // expired: valid at its own issuedAt, not now
+    const expired = await rec(owner, me, { issuedAt: NOW - 100, expiresAt: NOW - 1 });
+    expect(codeOf(() => createRegistrationFile(me, opts(expired)))).toBe('invalid_principal');
+    await expectCode(createRegistrationRequest(me, { name: 'A', principal: expired }), 'invalid_principal');
+    // a current one still works
+    expect(createRegistrationFile(me, opts(await rec(owner, me))).principal).toBeDefined();
+  });
+
   it('registration request round trip and rejection', async () => {
     const owner = await SoftwareIdentity.generate('ed25519');
     const me = await SoftwareIdentity.generate('secp256k1');
