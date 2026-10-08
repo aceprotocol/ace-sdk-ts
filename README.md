@@ -111,6 +111,7 @@ if (process.env.ACE_RELAY_URL) console.log((await overRelay(process.env.ACE_RELA
 | Economic | `rfq`, `offer`, `accept`, `reject`, `invoice`, `receipt`, `deliver`, `confirm` |
 | System   | `info` |
 | Social   | `text` |
+| Principal | `request`, `decision`, `report` (09-principal: same-account rules) |
 
 Economic messages require a `threadId` and follow the transition table of the spec (04-messages): the `rfq` sender is the buyer; each transition requires a sender role; `accept`, `invoice`, `receipt` and `confirm` must reference fixed history positions.
 
@@ -161,6 +162,18 @@ Economic messages require a `threadId` and follow the transition table of the sp
   - Redirects are never followed: any 3xx is `relay_protocol_error`. 408 / 5xx / 429 `rate_limited` are `relay_unavailable` (with `retryAfterSeconds` from an integer `Retry-After`); any other 429 (`recipient_inbox_full`, `sender_quota_exceeded`, `max_open_intents`, …) and other 4xx are `relay_rejected` (`relayCode` holds the relay's `error`), except 400 `envelope_expired`, 403 `not_registered` and 404 `unknown_peer`, which keep their own codes. A response missing a required field, or with a present but malformed optional field (a page `cursor` of the wrong type, say), is `relay_protocol_error`.
 
 Persisted files follow ace-spec 06 Appendix A (compact JSON, sorted keys), so the Python and Swift SDKs read the same state.
+
+### Principal binding (0.3.0, 09-principal)
+
+A principal record binds an agent's signing key to an account (CAIP-10), signed by an authority key of that account.
+
+- `createPrincipalRecord(principalSignerFromIdentity(ownerKey), { subjectSigningPublicKey, account, roles, expiresAt, scope?, issuedAt? })` signs a record; any key source works through the `PrincipalSigner` interface (`{ scheme, publicKey, sign(digest) }`: passkey PRF, Secure Enclave, HSM). `roles` are `controller` and/or `agent`. Put the record in a profile or registration file; peers carrying one are verified against their signing key (`invalid_principal`).
+- `validatePrincipalRecord(record, subjectSigningPublicKey, now)` checks it and returns the typed record; `principalPayload` / `principalSignData` expose the signed bytes; `parsePrincipalRecord`, `isCaip10`, `PRINCIPAL_ROLES` are helpers.
+- `Inbox.open({ ..., principal: { account, selfSigner?, trustedSigners? } })` accepts `request` / `decision` / `report` under the same-account rules. The default is fail-closed: without `principal`, every principal message is `wrong_principal`. `selfSigner` (the signer of your own record) and `trustedSigners` (e.g. read from chain) name the keys accepted as authorities of the account; `eip155` accounts also accept the secp256k1 key whose address is the account.
+- Errors: `wrong_principal` (missing/foreign principal, non-authority signer, `decision` from a non-controller or from a key the request was not sent to), `bad_reference` (a `decision.requestId` that names no open request in this conversation, or an already decided or expired one), `invalid_principal` (malformed or expired record).
+- The Outbox records every sent `request` in the `requests/` ledger (06 Appendix A) once the transport succeeded; an accepted `decision` closes it. `loadRequestRecord(store, conversationId, messageId)` reads a record. The ledger writers are not part of the public surface.
+- When the pinned sender principal is unusable (steps 2-5), the Inbox refreshes the sender's binding from the relay once, and only for an envelope that already passed the recipient, window, replay and signature pre-checks. A transient refresh failure is retryable (the message is retried and the cursor stays); a permanent one leaves the pinned binding to decide.
+- `checkPrincipalRules(type, body, { conversationId, senderPrincipal, senderSigningPublicKey, selfAccount, openRequestTo, now, selfSigner?, trustedSigners? })` runs the rules directly (pure apart from `openRequestTo`).
 
 ### Webhooks
 

@@ -1,4 +1,4 @@
-// Shared cross-language vectors (ace-spec/test-vectors.json, version 2).
+// Shared cross-language vectors (ace-spec/test-vectors.json, version 4).
 import { describe, expect, it } from 'vitest';
 import {
   ACEError, ReplayDetector, ThreadStateMachine, computeACEId, computeConversationId, decodeEnvelope,
@@ -16,16 +16,19 @@ import {
   Inbox, MAX_DIRECT_BODY_BYTES, MemoryStore, PeerStore, isBlockedAddress, signWebhookNotification, verifyWebhookNotification,
 } from '../src/index.js';
 import { normalizeRelayUrl, relayErrorFor } from '../src/relay.js';
-import { VECTORS, V, agent, peerOf, hex, unhex, b64 } from './helpers.js';
+import {
+  checkPrincipalRules, createPrincipalRecord, principalPayload, principalSignData, principalSignerFromIdentity, validatePrincipalRecord,
+} from '../src/principal.js';
+import { VECTORS, V, agent, peerOf, hex, unhex, b64, codeOf } from './helpers.js';
 import { createHash } from 'node:crypto';
 
 describe('vectors', () => {
   it('version and sections', () => {
-    expect(VECTORS.version).toBe('3');
-    expect(V.auth).toHaveLength(18);
+    expect(VECTORS.version).toBe('4');
+    expect(V.auth).toHaveLength(22);
     for (const k of ['envelopes', 'bodies', 'transitions', 'replay', 'signatures', 'auth', 'registrations',
       'registrationErrors', 'urls', 'base64', 'peerBinding', 'webhooks', 'relayUrls', 'blockedAddresses', 'relayErrors',
-      'directReceive']) expect(V).toHaveProperty(k);
+      'directReceive', 'principal', 'principalRules']) expect(V).toHaveProperty(k);
   });
 
   it.each(['alice', 'bob'] as const)('agent %s', (name) => {
@@ -211,7 +214,7 @@ function authRequest(r: any): RelayAuthRequest {
 }
 
 describe('auth', () => {
-  it.each(V.auth.map((v: any, i: number) => [`${i}-${v.agent}-${v.action}`, v]))('%s', async (_n, v: any) => {
+  it.each(V.auth.filter((v: any) => v.action !== 'principal').map((v: any, i: number) => [`${i}-${v.agent}-${v.action}`, v]))('%s', async (_n, v: any) => {
     const id = agent(v.agent);
     const req = authRequest(v.request);
     expect(hex(authPayload(req))).toBe(v.payloadHex);
@@ -350,6 +353,74 @@ describe('directReceive', () => {
       expect([reply.status, reply.body]).toEqual([c.status, { ok: false, error: c.error }]);
     } finally {
       await inbox.close();
+    }
+  });
+});
+
+// --- principal (09) -------------------------------------------------------------------------
+
+describe('principal vectors', () => {
+  it('four principal auth entries', () => {
+    expect(V.auth.filter((v: any) => v.action === 'principal')).toHaveLength(4);
+  });
+
+  it.each(V.auth.filter((v: any) => v.action === 'principal').map((v: any, i: number) => [`${i}-${v.agent}`, v]))('auth %s', async (_n, v: any) => {
+    const r = v.request;
+    const spk = b64(v.subjectSigningPublicKey);
+    expect(r.subjectSigningPublicKey).toBe(v.subjectSigningPublicKey);
+    const payload = encodePayload(r.account, r.roles.join(','), r.signerScheme, r.signerPublicKey, r.subjectSigningPublicKey, r.scope ?? '', String(r.expiresAt));
+    expect(hex(payload)).toBe(v.payloadHex);
+    expect(hex(buildSignData('principal', r.subjectAceId, v.timestamp, payload))).toBe(v.signDataHex);
+    const rec = validatePrincipalRecord(v.record, spk, v.now);
+    expect(rec.signature).toBe(v.signature);
+    expect(hex(principalSignData(rec, spk))).toBe(v.signDataHex);
+    if (!v.verifyOnly) {
+      const mine = await createPrincipalRecord(principalSignerFromIdentity(agent(v.agent)), {
+        subjectSigningPublicKey: spk, account: r.account, roles: r.roles, scope: r.scope, expiresAt: r.expiresAt, issuedAt: v.timestamp,
+      });
+      expect(mine).toEqual(v.record);
+    }
+  });
+
+  it.each(V.principal.valid.map((v: any) => [v.name, v]))('valid: %s', (_n, v: any) => {
+    const spk = b64(v.subjectSigningPublicKey);
+    const r = validatePrincipalRecord(v.record, spk, V.principal.now);
+    expect(hex(principalPayload(r, spk))).toBe(v.payloadHex);
+    expect(hex(principalSignData(r, spk))).toBe(v.signDataHex);
+  });
+
+  it.each(V.principal.invalid.map((v: any) => [v.name, v]))('invalid: %s', (_n, v: any) => {
+    expect(codeOf(() => validatePrincipalRecord(v.record, b64(v.subjectSigningPublicKey), v.now))).toBe(v.error);
+  });
+
+  it('principalRules has 28 cases', () => {
+    expect(V.principalRules.cases).toHaveLength(28);
+  });
+
+  it.each(V.principalRules.cases.map((c: any) => [c.name, c]))('rules: %s', async (_n, c: any) => {
+    const pr = V.principalRules;
+    const now: number = c.now ?? pr.now;
+    const open = new Map<string, { to: string; expiresAt: number | null }>(Object.entries(c.openRequests));
+    const openRequestTo = (conv: string, rid: string, at: number): string | null => {
+      const e = open.get(rid);
+      if (conv !== pr.conversationId || e === undefined) return null;
+      return e.expiresAt === null || e.expiresAt === undefined || at <= e.expiresAt ? e.to : null;
+    };
+    for (const s of c.steps) {
+      const snd = pr.senders[s.sender];
+      let got = 'ok';
+      try {
+        await checkPrincipalRules(s.type, s.body, {
+          conversationId: pr.conversationId, senderPrincipal: snd.principal, senderSigningPublicKey: b64(snd.signingPublicKey),
+          selfAccount: c.selfAccount, openRequestTo, now,
+          selfSigner: c.selfSigner ?? undefined, trustedSigners: c.trustedSigners,
+        });
+      } catch (e) {
+        if (!(e instanceof ACEError)) throw e;
+        got = `error:${e.code}`;
+      }
+      expect(got, JSON.stringify(s)).toBe(s.expect);
+      if (got === 'ok' && s.type === 'decision') open.delete(s.body.requestId);
     }
   });
 });
