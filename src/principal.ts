@@ -138,6 +138,27 @@ export function validatePrincipalRecord(record: unknown, subjectSigningPublicKey
 }
 
 /**
+ * R-P40: true when `record` fails `validatePrincipalRecord` at `now` only at the expiry step (rule 10): rules 1-9 pass
+ * (evaluated at `expiresAt - 1`, which no rule other than 10 and the future-`issuedAt` check depends on) and
+ * `expiresAt <= now`. Any other failure, or a valid record, is false.
+ */
+export function isExpiredOnly(record: unknown, subjectSigningPublicKey: Uint8Array, now: number): boolean {
+  let r: PrincipalRecord;
+  try {
+    r = parsePrincipalRecord(record);
+  } catch {
+    return false;
+  }
+  if (!(r.expiresAt <= now)) return false;
+  try {
+    validatePrincipalRecord(r, subjectSigningPublicKey, r.expiresAt - 1);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Sign a principal record for a subject key. Roles are canonicalized (deduplicated, `controller` first); an unknown
  * role is `invalid_argument`. Rules 1-7 run before the signer is asked to sign; the result is validated at `issuedAt`
  * (`invalid_principal` for invalid inputs). `expiresAt` is required (09 § Principal Record); `scope: null` is absent.

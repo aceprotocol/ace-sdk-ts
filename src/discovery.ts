@@ -13,7 +13,7 @@ import { loadHttps, loadLookup, pinnedRequest, type LookupFn } from './pinned-ht
 import type {
   AgentProfile, Capability, ChainInfo, PeerRecord, PrincipalRecord, ProfilePricing, RegistrationFile, SigningScheme,
 } from './types.js';
-import { parsePrincipalRecord, validatePrincipalRecord } from './principal.js';
+import { isExpiredOnly, parsePrincipalRecord, validatePrincipalRecord } from './principal.js';
 import { isSigningScheme } from './types.js';
 
 // --- VerifiedPeer ------------------------------------------------------------------------
@@ -167,7 +167,6 @@ function parseProfile(d: unknown): AgentProfile {
     if (max !== undefined) pricing.maxAmount = max;
     out.pricing = pricing;
   }
-  if (d.principal !== undefined && d.principal !== null) out.principal = parsePrincipalRecord(d.principal);
   return out;
 }
 
@@ -181,6 +180,7 @@ function tagList(items: string[], name: string, max: number): void {
 /** Validate a discovery profile (`invalid_profile`); returns the normalized profile. */
 export function validateProfile(profile: AgentProfile): AgentProfile {
   const p = parseProfile(profile);
+  const rawPrincipal = (profile as { principal?: unknown }).principal;
   const text = (v: string | undefined, name: string, lo: number, hi: number) => {
     if (v === undefined) return;
     const n = codePointLength(v);
@@ -206,6 +206,7 @@ export function validateProfile(profile: AgentProfile): AgentProfile {
       throw new ACEError('invalid_profile', 'profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)');
     }
   }
+  if (rawPrincipal !== undefined && rawPrincipal !== null) p.principal = parsePrincipalRecord(rawPrincipal); // after the other members (08 order)
   return p;
 }
 
@@ -232,6 +233,20 @@ export function bindingSignData(aceId: string, timestamp: number, encB64: string
 /** 09 § Validation of `profile.principal` (`invalid_principal`). */
 export function checkProfilePrincipal(profile: AgentProfile | null, subjectKey: Uint8Array, now: number): void {
   if (profile?.principal !== undefined) validatePrincipalRecord(profile.principal, subjectKey, now);
+}
+
+/**
+ * R-P40, fetched records: validate `profile.principal`; one that fails only because it has expired is dropped
+ * (`null` when nothing else remains). Any other failure is `invalid_principal`.
+ */
+export function dropExpiredPrincipal(profile: AgentProfile | null, subjectKey: Uint8Array, now: number): AgentProfile | null {
+  if (profile?.principal === undefined) return profile;
+  if (isExpiredOnly(profile.principal, subjectKey, now)) {
+    const { principal: _p, ...rest } = profile;
+    return Object.keys(rest).length === 0 ? null : rest;
+  }
+  validatePrincipalRecord(profile.principal, subjectKey, now);
+  return profile;
 }
 
 /**
@@ -263,7 +278,7 @@ export function verifyPeerRecord(record: unknown, opts: { clock?: () => number }
       throw new ACEError(code, e instanceof ACEError ? e.message : 'invalid profile');
     }
   }
-  checkProfilePrincipal(profile, signingKey, Math.floor(opts.clock ? opts.clock() : Date.now() / 1000));
+  profile = dropExpiredPrincipal(profile, signingKey, Math.floor(opts.clock ? opts.clock() : Date.now() / 1000));
   return mintPeer({
     aceId, scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey, registeredAt,
     registrationSignature: signature as string, source: 'relay', profile,
@@ -374,7 +389,7 @@ export function verifyRegistrationFile(
   if (computeACEId(signingKey) !== r.id) throw new ACEError(code, 'id does not match the signing key');
   const encKey = decodeEncryptionKey(s.encryptionPublicKey, code);
   const now = Math.floor(opts.clock ? opts.clock() : Date.now() / 1000);
-  const profile = r.principal === undefined ? null : { principal: validatePrincipalRecord(r.principal, signingKey, now) };
+  const profile = dropExpiredPrincipal(r.principal === undefined ? null : { principal: r.principal }, signingKey, now);
   return mintPeer({
     aceId: r.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
     registeredAt: opts.pinnedAt ?? now, registrationSignature: null, source: 'registration', profile,

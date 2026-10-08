@@ -4,7 +4,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import { describe, expect, it } from 'vitest';
 import {
   ACEError, ECONOMIC_TYPES, MESSAGE_TYPES, MemoryStore, PeerStore, SoftwareIdentity, createRegistrationFile, createRegistrationRequest,
-  validateBody, verifyPeerRecord, verifyRegistrationFile, verifyRegistrationRequest,
+  validateBody, validateProfile, verifyPeerRecord, verifyRegistrationFile, verifyRegistrationRequest,
 } from '../src/index.js';
 import { canonicalStateBytes, pairKey, toBase64, utf8 } from '../src/encoding.js';
 import {
@@ -432,9 +432,50 @@ describe('principal in registration and peers', () => {
     const other = await SoftwareIdentity.generate('ed25519');
     const r: any = await peerRecord(me, { name: 'A', principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
     expect(verifyPeerRecord(r, { clock: () => NOW }).principal?.roles).toEqual(['controller', 'agent']);
-    expect(codeOf(() => verifyPeerRecord(r, { clock: () => NOW + 50 }))).toBe('invalid_principal');
     r.profile.principal = await rec(owner, other);
     expect(codeOf(() => verifyPeerRecord(r, { clock: () => NOW }))).toBe('invalid_principal');
+    // expired AND for another subject: not expiry-only, still rejected
+    r.profile.principal = await rec(owner, other, { expiresAt: NOW + 50 });
+    expect(codeOf(() => verifyPeerRecord(r, { clock: () => NOW + 50 }))).toBe('invalid_principal');
+  });
+
+  it('R-P40: an expired-only principal in a fetched record is treated as absent', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('ed25519');
+    const r: any = await peerRecord(me, { name: 'A', principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
+    const peer = verifyPeerRecord(r, { clock: () => NOW + 50 });
+    expect(peer.profile?.name).toBe('A');
+    expect(peer.profile?.principal).toBeUndefined();
+    const only: any = await peerRecord(me, { principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
+    expect(verifyPeerRecord(only, { clock: () => NOW + 50 }).profile).toBeNull();
+    // a tampered expired principal is not expiry-only
+    const forged: any = await peerRecord(me, { name: 'A', principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
+    forged.profile.principal = { ...forged.profile.principal, scope: 'x' };
+    expect(codeOf(() => verifyPeerRecord(forged, { clock: () => NOW + 50 }))).toBe('invalid_principal');
+  });
+
+  it('R-P40: registration file with an expired-only principal; relay registration still rejects', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('secp256k1');
+    const other = await SoftwareIdentity.generate('ed25519');
+    const reg = createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
+    const peer = verifyRegistrationFile(reg, { pinnedAt: NOW, clock: () => NOW + 50 });
+    expect(peer.profile).toBeNull();
+    expect(peer.aceId).toBe(me.getACEId());
+    const wrong = { ...reg, principal: await rec(owner, other, { expiresAt: NOW + 50 }) };
+    expect(codeOf(() => verifyRegistrationFile(wrong, { pinnedAt: NOW, clock: () => NOW + 50 }))).toBe('invalid_principal');
+    const req = await createRegistrationRequest(me, { name: 'A', principal: await rec(owner, me, { expiresAt: NOW + 50 }) }, NOW);
+    expect(codeOf(() => verifyRegistrationRequest(JSON.parse(JSON.stringify(req)), { clock: () => NOW + 50 }))).toBe('invalid_principal');
+  });
+
+  it('R-P40: parseProfile reports invalid_profile before a malformed principal', async () => {
+    const me = await SoftwareIdentity.generate('ed25519');
+    const r: any = await peerRecord(me, { name: 'A' });
+    r.profile = { name: 'A', tags: 'nope', principal: { bogus: 1 } };
+    // via validateProfile
+    expect(codeOf(() => validateProfile(r.profile))).toBe('invalid_profile');
+    r.profile = { name: 'A', principal: { bogus: 1 } };
+    expect(codeOf(() => validateProfile(r.profile))).toBe('invalid_principal');
   });
 
   it('registration file principal', async () => {

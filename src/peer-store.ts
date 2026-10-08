@@ -3,7 +3,7 @@
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, isACEId, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import {
-  adoptDecision, checkProfilePrincipal, decodeEncryptionKey, decodeSigningKey, isVerifiedPeer, mintPeer, validateProfile,
+  adoptDecision, dropExpiredPrincipal, decodeEncryptionKey, decodeSigningKey, isVerifiedPeer, mintPeer, validateProfile,
   verifyPeerRecord, verifyRegistrationFile, type AdoptOutcome, type VerifiedPeer,
 } from './discovery.js';
 import type { RelayClient } from './relay.js';
@@ -176,8 +176,7 @@ export class PeerStore {
         if (computeACEId(signingKey) !== aceId) throw bad('aceId does not match the signing key');
         const registeredAt = wireInt(d.registeredAt);
         if (registeredAt === null) throw bad('invalid registeredAt');
-        const profile = d.profile === null ? null : validateProfile(d.profile as AgentProfile);
-        checkProfilePrincipal(profile, signingKey, fetchedAt);
+        const profile = dropExpiredPrincipal(d.profile === null ? null : validateProfile(d.profile as AgentProfile), signingKey, fetchedAt);
         peer = mintPeer({
           aceId, scheme: d.scheme, signingPublicKey: signingKey,
           encryptionPublicKey: decodeEncryptionKey(d.encryptionPublicKey, 'storage_failed'),
