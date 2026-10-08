@@ -11,8 +11,9 @@ import {
 } from './signing.js';
 import { loadHttps, loadLookup, pinnedRequest, type LookupFn } from './pinned-https.js';
 import type {
-  AgentProfile, Capability, ChainInfo, PeerRecord, ProfilePricing, RegistrationFile, SigningScheme,
+  AgentProfile, Capability, ChainInfo, PeerRecord, PrincipalRecord, ProfilePricing, RegistrationFile, SigningScheme,
 } from './types.js';
+import { parsePrincipalRecord, validatePrincipalRecord } from './principal.js';
 import { isSigningScheme } from './types.js';
 
 // --- VerifiedPeer ------------------------------------------------------------------------
@@ -68,6 +69,11 @@ export class VerifiedPeer {
 
   static {
     isPeerImpl = (x: unknown) => typeof x === 'object' && x !== null && #brand in x;
+  }
+
+  /** The peer's principal record, verified when the peer was verified (09). */
+  get principal(): PrincipalRecord | undefined {
+    return this.profile?.principal;
   }
 
   get signingPublicKey(): Uint8Array {
@@ -161,6 +167,7 @@ function parseProfile(d: unknown): AgentProfile {
     if (max !== undefined) pricing.maxAmount = max;
     out.pricing = pricing;
   }
+  if (d.principal !== undefined && d.principal !== null) out.principal = parsePrincipalRecord(d.principal);
   return out;
 }
 
@@ -222,8 +229,16 @@ export function bindingSignData(aceId: string, timestamp: number, encB64: string
   return buildSignData('register', aceId, timestamp, encodePayload(encB64, sigB64));
 }
 
-/** Verify a relay `PeerRecord`; every failure is `invalid_peer`. */
-export function verifyPeerRecord(record: unknown): VerifiedPeer {
+/** 09 § Validation of `profile.principal` (`invalid_principal`). */
+export function checkProfilePrincipal(profile: AgentProfile | null, subjectKey: Uint8Array, now: number): void {
+  if (profile?.principal !== undefined) validatePrincipalRecord(profile.principal, subjectKey, now);
+}
+
+/**
+ * Verify a relay `PeerRecord`; every failure is `invalid_peer`, except an invalid `profile.principal`
+ * (`invalid_principal`, checked at `clock`).
+ */
+export function verifyPeerRecord(record: unknown, opts: { clock?: () => number } = {}): VerifiedPeer {
   const code: ACEErrorCode = 'invalid_peer';
   if (!isObj(record)) throw new ACEError(code, 'peer record must be an object');
   const { aceId, scheme, encryptionPublicKey: encB64, signingPublicKey: sigB64 } = record;
@@ -244,9 +259,11 @@ export function verifyPeerRecord(record: unknown): VerifiedPeer {
     try {
       profile = validateProfile(record.profile as AgentProfile);
     } catch (e) {
+      if (e instanceof ACEError && e.code === 'invalid_principal') throw e;
       throw new ACEError(code, e instanceof ACEError ? e.message : 'invalid profile');
     }
   }
+  checkProfilePrincipal(profile, signingKey, Math.floor(opts.clock ? opts.clock() : Date.now() / 1000));
   return mintPeer({
     aceId, scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey, registeredAt,
     registrationSignature: signature as string, source: 'relay', profile,
@@ -312,6 +329,7 @@ export function parseRegistrationFile(d: unknown): RegistrationFile {
       return { network: req(c, 'network', 'string', code, 'chain'), address: req(c, 'address', 'string', code, 'chain') };
     });
   }
+  if (d.principal !== undefined && d.principal !== null) reg.principal = parsePrincipalRecord(d.principal);
   return reg;
 }
 
@@ -356,15 +374,35 @@ export function verifyRegistrationFile(
   if (computeACEId(signingKey) !== r.id) throw new ACEError(code, 'id does not match the signing key');
   const encKey = decodeEncryptionKey(s.encryptionPublicKey, code);
   const now = Math.floor(opts.clock ? opts.clock() : Date.now() / 1000);
+  const profile = r.principal === undefined ? null : { principal: validatePrincipalRecord(r.principal, signingKey, now) };
   return mintPeer({
     aceId: r.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
-    registeredAt: opts.pinnedAt ?? now, registrationSignature: null, source: 'registration', profile: null,
+    registeredAt: opts.pinnedAt ?? now, registrationSignature: null, source: 'registration', profile,
   });
 }
 
 // --- rollback barrier (02) ---------------------------------------------------------------------
 
 export type AdoptOutcome = 'adopted' | 'unchanged' | 'rotated';
+
+function withProfile(pin: VerifiedPeer, profile: AgentProfile | null): VerifiedPeer {
+  return mintPeer({
+    aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey, encryptionPublicKey: pin.encryptionPublicKey,
+    registeredAt: pin.registeredAt, registrationSignature: pin.registrationSignature, source: pin.source, profile,
+  });
+}
+
+/** Registration-file merge: supplied members replace, absent ones carry over; the principal only moves forward (R-P26). */
+function fileProfile(cached: AgentProfile | null, cand: AgentProfile | null): AgentProfile | null {
+  const old = cached?.principal;
+  const next = cand?.principal;
+  const keep = old === undefined || (next !== undefined && next.issuedAt >= old.issuedAt) ? next : old;
+  const { principal: _a, ...base } = cached ?? {};
+  const { principal: _b, ...supplied } = cand ?? {};
+  const out: AgentProfile = { ...base, ...supplied };
+  if (keep !== undefined) out.principal = keep;
+  return cached === null && cand === null ? null : out;
+}
 
 /**
  * Internal pure rule used by `PeerStore.adopt`: the binding to store and the outcome.
@@ -381,7 +419,11 @@ export function adoptDecision(pin: VerifiedPeer | null, candidate: VerifiedPeer,
   }
   const unsigned = candidate.registrationSignature === null;
   if (bytesEqual(pin.encryptionPublicKey, candidate.encryptionPublicKey)) {
-    if (unsigned) return { peer: pin, outcome: 'unchanged' };
+    if (unsigned) {
+      // An unsigned source never changes the pinned binding; the kept candidate replaces the other profile members
+      // and never removes or downgrades the cached principal (R-P26).
+      return { peer: withProfile(pin, fileProfile(pin.profile, candidate.profile)), outcome: 'unchanged' };
+    }
     const newer = candidate.registeredAt > pin.registeredAt ? candidate : pin;
     return {
       peer: mintPeer({

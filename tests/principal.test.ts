@@ -1,6 +1,9 @@
 // Principal binding (09-principal): types, bodies, records, rules, pipeline.
 import { describe, expect, it } from 'vitest';
-import { ACEError, ECONOMIC_TYPES, MESSAGE_TYPES, MemoryStore, SoftwareIdentity, validateBody } from '../src/index.js';
+import {
+  ACEError, ECONOMIC_TYPES, MESSAGE_TYPES, MemoryStore, PeerStore, SoftwareIdentity, createRegistrationFile, createRegistrationRequest,
+  validateBody, verifyPeerRecord, verifyRegistrationFile, verifyRegistrationRequest,
+} from '../src/index.js';
 import { canonicalStateBytes, pairKey, toBase64, utf8 } from '../src/encoding.js';
 import {
   PRINCIPAL_ROLES, checkPrincipalRules, createPrincipalRecord, fillDecision, isCaip10, loadRequestRecord, openRequestTo,
@@ -398,5 +401,93 @@ describe('requests/ ledger', () => {
     await expectCode(loadRequestRecord(store, CONV, MID), 'storage_failed');
     await store.write(requestKey(CONV, MID), utf8('[1]'));
     await expectCode(loadRequestRecord(store, CONV, MID), 'storage_failed');
+  });
+});
+
+async function peerRecord(id: SoftwareIdentity, profile: any, ts = NOW) {
+  const req = await createRegistrationRequest(id, profile, ts);
+  return { aceId: req.aceId, scheme: req.scheme, encryptionPublicKey: req.encryptionPublicKey, signingPublicKey: req.signingPublicKey,
+    registrationSignature: req.signature, registeredAt: ts, profile: req.profile };
+}
+
+describe('principal in registration and peers', () => {
+  it('registration request round trip and rejection', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('secp256k1');
+    const other = await SoftwareIdentity.generate('ed25519');
+    const good = await rec(owner, me);
+    const req = await createRegistrationRequest(me, { name: 'A', principal: good }, NOW);
+    const v = verifyRegistrationRequest(JSON.parse(JSON.stringify(req)), { clock: () => NOW });
+    expect(v.peer.principal?.account).toBe(ACC);
+    await expectCode(createRegistrationRequest(me, { name: 'A', principal: await rec(owner, other) }, NOW), 'invalid_principal');
+    const bad = { ...req, profile: { name: 'A', principal: { ...good, roles: ['agent', 'controller'] } } };
+    expect(codeOf(() => verifyRegistrationRequest(bad, { clock: () => NOW }))).toBe('invalid_principal');
+  });
+
+  it('peer record principal verified, expiry, subject', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('ed25519');
+    const other = await SoftwareIdentity.generate('ed25519');
+    const r: any = await peerRecord(me, { name: 'A', principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
+    expect(verifyPeerRecord(r, { clock: () => NOW }).principal?.roles).toEqual(['controller', 'agent']);
+    expect(codeOf(() => verifyPeerRecord(r, { clock: () => NOW + 50 }))).toBe('invalid_principal');
+    r.profile.principal = await rec(owner, other);
+    expect(codeOf(() => verifyPeerRecord(r, { clock: () => NOW }))).toBe('invalid_principal');
+  });
+
+  it('registration file principal', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('secp256k1');
+    const reg = createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal: await rec(owner, me) });
+    const peer = verifyRegistrationFile(reg, { pinnedAt: NOW, clock: () => NOW });
+    expect(peer.profile).toEqual({ principal: reg.principal });
+    expect(verifyRegistrationFile(createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace' }), { pinnedAt: 0 }).profile).toBeNull();
+  });
+
+  it('an expired pin still loads (re-verified at fetchedAt)', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('ed25519');
+    let t = NOW;
+    const store = new MemoryStore();
+    await new PeerStore({ store, clock: () => t }).adopt(
+      verifyPeerRecord(await peerRecord(me, { principal: await rec(owner, me, { expiresAt: NOW + 5 }) }), { clock: () => NOW }));
+    t = NOW + 10_000;
+    expect((await new PeerStore({ store, clock: () => t }).get(me.getACEId()))?.principal).toBeDefined();
+  });
+
+  it('registration payload carries the principal group (absent: eight empty fields)', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('ed25519');
+    const a = await createRegistrationRequest(me, { name: 'A' }, NOW);
+    const b = await createRegistrationRequest(me, { name: 'A', principal: await rec(owner, me) }, NOW);
+    expect(a.authorization).not.toBe(b.authorization);
+    const tampered = { ...b, profile: { name: 'A' } };
+    expect(codeOf(() => verifyRegistrationRequest(tampered, { clock: () => NOW }))).toBe('invalid_authorization');
+  });
+
+  it('a registration file never removes or downgrades a cached principal (R-P26)', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('ed25519');
+    const store = new MemoryStore();
+    const ps = new PeerStore({ store, clock: () => NOW });
+    const cached = await rec(owner, me, { issuedAt: NOW - 10 });
+    await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Relay', principal: cached }), { clock: () => NOW }));
+    const file = (principal?: PrincipalRecord) =>
+      verifyRegistrationFile(createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal }), { pinnedAt: NOW, clock: () => NOW });
+    // no principal in file: cached kept, other members carry over
+    let r = await ps.adopt(file());
+    expect(r.peer.principal).toEqual(cached);
+    expect(r.peer.profile?.name).toBe('Relay');
+    // older issuedAt: kept
+    r = await ps.adopt(file(await rec(owner, me, { issuedAt: NOW - 100 })));
+    expect(r.peer.principal).toEqual(cached);
+    // newer: replaces
+    const newer = await rec(owner, me, { issuedAt: NOW - 5 });
+    r = await ps.adopt(file(newer));
+    expect(r.peer.principal).toEqual(newer);
+    expect((await ps.get(me.getACEId()))?.principal).toEqual(newer);
+    // a relay record without a principal clears it
+    r = await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Relay' }, NOW + 1), { clock: () => NOW + 1 }));
+    expect(r.peer.principal).toBeUndefined();
   });
 });

@@ -3,7 +3,7 @@
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, isACEId, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import {
-  adoptDecision, decodeEncryptionKey, decodeSigningKey, isVerifiedPeer, mintPeer, validateProfile,
+  adoptDecision, checkProfilePrincipal, decodeEncryptionKey, decodeSigningKey, isVerifiedPeer, mintPeer, validateProfile,
   verifyPeerRecord, verifyRegistrationFile, type AdoptOutcome, type VerifiedPeer,
 } from './discovery.js';
 import type { RelayClient } from './relay.js';
@@ -90,9 +90,8 @@ export class PeerStore {
       const pin = await this.#load(peer.aceId);
       const now = this.#now();
       const decision = adoptDecision(pin?.peer ?? null, peer, now);
-      // An unsigned (registration-file) candidate with the pinned key keeps the pin exactly.
-      const keepExactly = decision.outcome === 'unchanged' && peer.registrationSignature === null;
-      if (!keepExactly) await this.#write(decision.peer, now);
+      // Every adopted or kept candidate replaces the cached record, profile and fetchedAt included (02).
+      await this.#write(decision.peer, now);
       return decision;
     } finally {
       await release();
@@ -101,7 +100,7 @@ export class PeerStore {
 
   /** Verify a registration file and adopt it (`registeredAt = pinnedAt ?? now`). */
   async pinRegistrationFile(reg: RegistrationFile, opts: { pinnedAt?: number } = {}): Promise<VerifiedPeer> {
-    const peer = verifyRegistrationFile(reg, { pinnedAt: opts.pinnedAt ?? this.#now() });
+    const peer = verifyRegistrationFile(reg, { pinnedAt: opts.pinnedAt ?? this.#now(), clock: this.#clock });
     return (await this.adopt(peer)).peer;
   }
 
@@ -150,18 +149,20 @@ export class PeerStore {
         peer = verifyPeerRecord({
           aceId: d.aceId, scheme: d.scheme, encryptionPublicKey: d.encryptionPublicKey, signingPublicKey: d.signingPublicKey,
           registrationSignature: d.registrationSignature, registeredAt: d.registeredAt, profile: d.profile,
-        });
+        }, { clock: () => fetchedAt });
       } else if (d.source === 'registration') {
         if (d.registrationSignature !== null || !isSigningScheme(d.scheme)) throw bad('invalid registration pin');
         const signingKey = decodeSigningKey(d.scheme, d.signingPublicKey, 'storage_failed');
         if (computeACEId(signingKey) !== aceId) throw bad('aceId does not match the signing key');
         const registeredAt = wireInt(d.registeredAt);
         if (registeredAt === null) throw bad('invalid registeredAt');
+        const profile = d.profile === null ? null : validateProfile(d.profile as AgentProfile);
+        checkProfilePrincipal(profile, signingKey, fetchedAt);
         peer = mintPeer({
           aceId, scheme: d.scheme, signingPublicKey: signingKey,
           encryptionPublicKey: decodeEncryptionKey(d.encryptionPublicKey, 'storage_failed'),
           registeredAt, registrationSignature: null, source: 'registration',
-          profile: d.profile === null ? null : validateProfile(d.profile as AgentProfile),
+          profile,
         });
       } else {
         throw bad('unknown source');

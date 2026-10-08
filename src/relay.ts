@@ -302,7 +302,7 @@ export class RelayClient {
   /** `GET /v1/discover`; unverifiable entries are dropped and counted in `rejected`. */
   async discover(q: DiscoverQuery = {}): Promise<{ agents: VerifiedPeer[]; rejected: number; cursor: string | null }> {
     const res = await this.#request('GET', this.#url('/v1/discover', {
-      q: q.q, tags: tagsParam(q.tags), chain: q.chain, scheme: q.scheme,
+      q: q.q, tags: tagsParam(q.tags), chain: q.chain, scheme: q.scheme, account: q.account,
       online: q.online === undefined ? undefined : String(q.online),
       limit: q.limit === undefined ? undefined : String(q.limit), cursor: q.cursor,
     }));

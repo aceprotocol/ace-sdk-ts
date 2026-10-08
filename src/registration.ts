@@ -5,13 +5,13 @@ import { ACEError } from './errors.js';
 import { decodeB64, decodeSignature, encodeSignature, isACEId, toBase64, wireInt } from './encoding.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
-  bindingSignData, decodeEncryptionKey, decodeSigningKey, mintPeer, validateProfile, verifyRegistrationFile,
+  bindingSignData, checkProfilePrincipal, decodeEncryptionKey, decodeSigningKey, mintPeer, validateProfile, verifyRegistrationFile,
   type VerifiedPeer,
 } from './discovery.js';
 import { KEM_PUBLIC_KEY_SIZE, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { buildSignData, computeACEId, encodePayload, signingAddress, verifySignature } from './signing.js';
 import type {
-  ACEIdentity, AgentProfile, Capability, ChainInfo, HardwareBacking, IdentityTier, RegistrationFile, RegistrationRequest,
+  ACEIdentity, AgentProfile, Capability, ChainInfo, HardwareBacking, IdentityTier, PrincipalRecord, RegistrationFile, RegistrationRequest,
 } from './types.js';
 import { isSigningScheme } from './types.js';
 
@@ -30,6 +30,7 @@ export function createRegistrationFile(identity: ACEIdentity, opts: {
   capabilities?: Capability[];
   settlement?: string[];
   chains?: ChainInfo[];
+  principal?: PrincipalRecord;
 }): RegistrationFile {
   if (typeof opts !== 'object' || opts === null) throw new ACEError('invalid_argument', 'options are required');
   const scheme = identity.getSigningScheme();
@@ -52,7 +53,8 @@ export function createRegistrationFile(identity: ACEIdentity, opts: {
   if (opts.capabilities !== undefined) reg.capabilities = opts.capabilities;
   if (opts.settlement !== undefined) reg.settlement = opts.settlement;
   if (opts.chains !== undefined) reg.chains = opts.chains;
-  verifyRegistrationFile(reg, { pinnedAt: 0 });
+  if (opts.principal !== undefined) reg.principal = opts.principal;
+  verifyRegistrationFile(reg, { pinnedAt: 0, clock: () => opts.principal?.issuedAt ?? Math.floor(Date.now() / 1000) });
   return reg;
 }
 
@@ -61,11 +63,15 @@ function registrationPayload(encB64: string, sigB64: string, scheme: string, pro
   if (profile === KEEP) return encodePayload(encB64, sigB64, scheme, 'keep');
   if (profile === null) return encodePayload(encB64, sigB64, scheme, 'remove');
   const pr = profile.pricing;
+  const pp = profile.principal;
   return encodePayload(
     encB64, sigB64, scheme, 'replace', profile.name ?? '', profile.description ?? '', profile.image ?? '',
     encodePayload(...(profile.tags ?? [])), encodePayload(...(profile.capabilities ?? [])),
     encodePayload(...(profile.chains ?? [])), profile.endpoint ?? '',
     pr ? 'present' : 'absent', pr ? pr.currency : '', pr ? (pr.maxAmount ?? '') : '',
+    pp ? 'present' : 'absent', pp ? pp.account : '', pp ? pp.roles.join(',') : '', pp ? pp.signer.scheme : '',
+    pp ? pp.signer.publicKey : '', pp ? String(pp.issuedAt) : '', pp ? String(pp.expiresAt ?? 0) : '',
+    pp ? (pp.scope ?? '') : '', pp ? pp.signature : '',
   );
 }
 
@@ -87,6 +93,7 @@ export async function createRegistrationRequest(
     throw new ACEError('invalid_key', 'identity encryption public key must be 1216 bytes');
   }
   const snapshot = profile === undefined ? KEEP : profile === null ? null : validateProfile(profile);
+  if (snapshot !== KEEP && snapshot !== null) checkProfilePrincipal(snapshot, identity.getSigningPublicKey(), ts);
   const epk = toBase64(enc);
   const spk = toBase64(identity.getSigningPublicKey());
   const aceId = identity.getACEId();
@@ -111,7 +118,7 @@ export interface VerifiedRegistration {
 /**
  * Verify a registration request. Check order (first failure wins): schema →
  * `invalid_registration`; freshness → `stale_timestamp`; ID hash → `invalid_registration`;
- * signing / encryption key → `invalid_key`; profile → `invalid_profile`; binding →
+ * signing / encryption key → `invalid_key`; profile → `invalid_profile`; principal → `invalid_principal`; binding →
  * `invalid_signature`; authorization → `invalid_authorization`.
  */
 export function verifyRegistrationRequest(
@@ -146,6 +153,7 @@ export function verifyRegistrationRequest(
   const signingKey = decodeSigningKey(scheme, spk, 'invalid_key');
   const encKey = decodeEncryptionKey(epk, 'invalid_key');
   const profile = rawProfile === null ? null : validateProfile(rawProfile as AgentProfile);
+  checkProfilePrincipal(profile, signingKey, nowOf(opts.clock));
   if (!verifySignature(bindingSignData(aceId, ts, epk, spk), sig, scheme, signingKey)) {
     throw new ACEError('invalid_signature', 'registration binding signature does not verify');
   }

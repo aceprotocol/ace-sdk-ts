@@ -73,6 +73,7 @@ export interface RegistrationFile {
   capabilities?: Capability[];
   settlement?: string[];
   chains?: ChainInfo[];
+  principal?: PrincipalRecord;
 }
 
 // === Principal (09) ===
@@ -114,6 +115,8 @@ export interface AgentProfile {
   chains?: string[];
   endpoint?: string;
   pricing?: ProfilePricing;
+  /** Principal record (09), verified against the peer's signing key when the peer is verified. */
+  principal?: PrincipalRecord;
 }
 
 export interface DiscoverQuery {
@@ -122,6 +125,8 @@ export interface DiscoverQuery {
   tags?: string[];
   chain?: string;
   scheme?: SigningScheme;
+  /** CAIP-10 account (exact match on profile.principal.account). */
+  account?: string;
   online?: boolean;
   limit?: number;
   cursor?: string;
