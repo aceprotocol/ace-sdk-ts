@@ -393,8 +393,9 @@ function withProfile(pin: VerifiedPeer, profile: AgentProfile | null): VerifiedP
 }
 
 /** Registration-file merge: supplied members replace, absent ones carry over; the principal only moves forward (R-P26). */
-function fileProfile(cached: AgentProfile | null, cand: AgentProfile | null): AgentProfile | null {
-  const old = cached?.principal;
+function fileProfile(cached: AgentProfile | null, cand: AgentProfile | null, now: number): AgentProfile | null {
+  // Only an unexpired cached principal is carried over: expiry is revocation, and an expired one would make the pin unloadable (R-P35).
+  const old = cached?.principal !== undefined && cached.principal.expiresAt > now ? cached.principal : undefined;
   const next = cand?.principal;
   const keep = old === undefined || (next !== undefined && next.issuedAt >= old.issuedAt) ? next : old;
   const { principal: _a, ...base } = cached ?? {};
@@ -422,7 +423,7 @@ export function adoptDecision(pin: VerifiedPeer | null, candidate: VerifiedPeer,
     if (unsigned) {
       // An unsigned source never changes the pinned binding; the kept candidate replaces the other profile members
       // and never removes or downgrades the cached principal (R-P26).
-      return { peer: withProfile(pin, fileProfile(pin.profile, candidate.profile)), outcome: 'unchanged' };
+      return { peer: withProfile(pin, fileProfile(pin.profile, candidate.profile, now)), outcome: 'unchanged' };
     }
     const newer = candidate.registeredAt > pin.registeredAt ? candidate : pin;
     return {

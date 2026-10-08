@@ -379,6 +379,14 @@ describe('RelayClient strictness', () => {
     }
   });
 
+  it('discover sends the account param', async () => {
+    const a = await registered('a');
+    const acc = 'eip155:1:0x' + 'ab'.repeat(20);
+    await a.relay!.discover({ account: acc });
+    const q = relay.queries.filter(([p]) => p === '/v1/discover').map(([, x]) => x.account);
+    expect(q).toEqual([acc]);
+  });
+
   it('tags are string arrays (joined with ","); postIntent always sends tags', async () => {
     const a = await registered('a');
     await a.relay!.discover({ tags: ['gpu', 'ml'] });

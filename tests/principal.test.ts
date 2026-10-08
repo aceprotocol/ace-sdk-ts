@@ -490,4 +490,26 @@ describe('principal in registration and peers', () => {
     r = await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Relay' }, NOW + 1), { clock: () => NOW + 1 }));
     expect(r.peer.principal).toBeUndefined();
   });
+
+  it('an expired cached principal is dropped, not carried, by a kept file candidate (R-P35)', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('ed25519');
+    const store = new MemoryStore();
+    let t = NOW;
+    const ps = new PeerStore({ store, clock: () => t });
+    await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Relay', principal: await rec(owner, me, { expiresAt: NOW + 5 }) }), { clock: () => NOW }));
+    t = NOW + 100;
+    const file = verifyRegistrationFile(createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace' }), { pinnedAt: NOW, clock: () => t });
+    const r = await ps.adopt(file);
+    expect(r.peer.principal).toBeUndefined();
+    expect(r.peer.profile?.name).toBe('Relay');
+    const got = await new PeerStore({ store, clock: () => t }).get(me.getACEId());
+    expect(got?.principal).toBeUndefined();
+    // an unexpired cached principal is still carried
+    const me2 = await SoftwareIdentity.generate('ed25519');
+    const keep = await rec(owner, me2, { expiresAt: NOW + 500 });
+    await ps.adopt(verifyPeerRecord(await peerRecord(me2, { principal: keep }), { clock: () => NOW }));
+    const r2 = await ps.adopt(verifyRegistrationFile(createRegistrationFile(me2, { name: 'M', endpoint: 'https://m.example/ace' }), { pinnedAt: NOW, clock: () => t }));
+    expect(r2.peer.principal).toEqual(keep);
+  });
 });
