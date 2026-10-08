@@ -1,4 +1,6 @@
 // Principal binding (09-principal): types, bodies, records, rules, pipeline.
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import { describe, expect, it } from 'vitest';
 import {
   ACEError, ECONOMIC_TYPES, MESSAGE_TYPES, MemoryStore, PeerStore, SoftwareIdentity, createRegistrationFile, createRegistrationRequest,
@@ -511,5 +513,37 @@ describe('principal in registration and peers', () => {
     await ps.adopt(verifyPeerRecord(await peerRecord(me2, { principal: keep }), { clock: () => NOW }));
     const r2 = await ps.adopt(verifyRegistrationFile(createRegistrationFile(me2, { name: 'M', endpoint: 'https://m.example/ace' }), { pinnedAt: NOW, clock: () => t }));
     expect(r2.peer.principal).toEqual(keep);
+  });
+
+  it('rollback monotonicity: older relay record keeps profile; principal needs newer issuedAt (R-P36)', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const me = await SoftwareIdentity.generate('ed25519');
+    const store = new MemoryStore();
+    let t = NOW;
+    const ps = new PeerStore({ store, clock: () => t });
+    const cached = await rec(owner, me, { issuedAt: NOW - 10 });
+    await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Cur', principal: cached }), { clock: () => NOW }));
+    // older registeredAt, different profile and a newer principal: profile unchanged, fetchedAt refreshed
+    t = NOW + 50;
+    const older = await rec(owner, me, { issuedAt: NOW - 1 });
+    const r = await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Old', principal: older }, NOW - 1), { clock: () => t }));
+    expect(r.peer.profile).toEqual({ name: 'Cur', principal: cached });
+    expect(JSON.parse(new TextDecoder().decode((await store.read(`peers/${bytesToHex(sha256(utf8(me.getACEId())))}.json`))!)).fetchedAt).toBe(NOW + 50);
+    // equal issuedAt, different principal (scope): cached kept
+    const alt = await rec(owner, me, { issuedAt: NOW - 10, scope: 'x' });
+    t = NOW + 60;
+    let r2 = await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Same', principal: alt }, NOW + 1), { clock: () => t }));
+    expect(r2.peer.principal).toEqual(cached);
+    expect(r2.peer.profile?.name).toBe('Same');
+    // equal issuedAt, identical: fine
+    r2 = await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Same', principal: cached }, NOW + 2), { clock: () => t }));
+    expect(r2.peer.principal).toEqual(cached);
+    // strictly newer replaces
+    const newer = await rec(owner, me, { issuedAt: NOW - 5 });
+    r2 = await ps.adopt(verifyPeerRecord(await peerRecord(me, { principal: newer }, NOW + 3), { clock: () => t }));
+    expect(r2.peer.principal).toEqual(newer);
+    // newer relay record without a principal clears it
+    r2 = await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'N' }, NOW + 4), { clock: () => t }));
+    expect(r2.peer.principal).toBeUndefined();
   });
 });

@@ -3,7 +3,7 @@
 import bs58 from 'bs58';
 import { ACEError, type ACEErrorCode } from './errors.js';
 import {
-  bytesEqual, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, isObj, wireInt,
+  bytesEqual, canonicalJson, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, isObj, wireInt,
 } from './encoding.js';
 import { KEM_PUBLIC_KEY_SIZE, MAX_REGISTRATION_FILE_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import {
@@ -392,17 +392,43 @@ function withProfile(pin: VerifiedPeer, profile: AgentProfile | null): VerifiedP
   });
 }
 
+/** Byte-identical comparison via canonical JSON (the serializer has no arrays, so roles are joined). */
+function samePrincipal(a: PrincipalRecord, b: PrincipalRecord): boolean {
+  const c = (r: PrincipalRecord) => canonicalJson({ ...r, roles: r.roles.join(',') });
+  return c(a) === c(b) && a.roles.length === b.roles.length;
+}
+
+/**
+ * Principal monotonicity (R-P36): `next` replaces the unexpired cached principal only when it is strictly newer
+ * (`issuedAt`) or byte-identical at the same `issuedAt`; otherwise the cached one stays. Expired cached ones are
+ * dropped first (R-P35).
+ */
+function pickPrincipal(cached: PrincipalRecord | undefined, next: PrincipalRecord | undefined, now: number, absentClears = false): PrincipalRecord | undefined {
+  const old = cached !== undefined && cached.expiresAt > now ? cached : undefined;
+  if (next === undefined) return absentClears ? undefined : old;
+  if (old === undefined) return next;
+  if (next.issuedAt > old.issuedAt || (next.issuedAt === old.issuedAt && samePrincipal(next, old))) return next;
+  return old;
+}
+
+function withPrincipal(base: AgentProfile | null, principal: PrincipalRecord | undefined): AgentProfile | null {
+  const { principal: _p, ...rest } = base ?? {};
+  if (principal === undefined) return base === null ? null : rest;
+  return { ...rest, principal };
+}
+
 /** Registration-file merge: supplied members replace, absent ones carry over; the principal only moves forward (R-P26). */
 function fileProfile(cached: AgentProfile | null, cand: AgentProfile | null, now: number): AgentProfile | null {
-  // Only an unexpired cached principal is carried over: expiry is revocation, and an expired one would make the pin unloadable (R-P35).
-  const old = cached?.principal !== undefined && cached.principal.expiresAt > now ? cached.principal : undefined;
-  const next = cand?.principal;
-  const keep = old === undefined || (next !== undefined && next.issuedAt >= old.issuedAt) ? next : old;
   const { principal: _a, ...base } = cached ?? {};
   const { principal: _b, ...supplied } = cand ?? {};
-  const out: AgentProfile = { ...base, ...supplied };
-  if (keep !== undefined) out.principal = keep;
-  return cached === null && cand === null ? null : out;
+  const merged = cached === null && cand === null ? null : { ...base, ...supplied };
+  return withPrincipal(merged, pickPrincipal(cached?.principal, cand?.principal, now));
+}
+
+/** Relay (signed) merge: replaces the profile only when not older than the pin; an older record keeps it (R-P36). */
+function relayProfile(pin: VerifiedPeer, candidate: VerifiedPeer, now: number): AgentProfile | null {
+  if (candidate.registeredAt < pin.registeredAt) return withPrincipal(pin.profile, pickPrincipal(pin.profile?.principal, undefined, now));
+  return withPrincipal(candidate.profile, pickPrincipal(pin.profile?.principal, candidate.profile?.principal, now, true));
 }
 
 /**
@@ -431,7 +457,7 @@ export function adoptDecision(pin: VerifiedPeer | null, candidate: VerifiedPeer,
         aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
         encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
         registrationSignature: newer.registrationSignature, source: newer.source,
-        profile: candidate.source === 'relay' ? candidate.profile : pin.profile,
+        profile: relayProfile(pin, candidate, now),
       }),
       outcome: 'unchanged',
     };
