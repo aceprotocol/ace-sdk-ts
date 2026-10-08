@@ -12,12 +12,17 @@ import {
 import type { ACEStore } from './store.js';
 import type { ACEMessage, MessageType } from './types.js';
 
-/** A staged outbound message awaiting acknowledgement. */
+/**
+ * A staged outbound message awaiting acknowledgement. `requestTtl` is the body `ttl` of a principal `request` (the
+ * body is encrypted to the recipient, so the Outbox keeps it to write the `requests/` record after delivery);
+ * persisted as `requestTtl` only when present (06 Appendix A).
+ */
 export interface PendingSend {
   requestId: string;
   status: 'pending' | 'expired';
   stagedAt: number;
   message: ACEMessage;
+  requestTtl?: number;
 }
 
 /** Internal: a thread record (`threads/<sha256(c ‖ 0 ‖ t)>.json`). */
@@ -63,17 +68,27 @@ export function decodePendingSend(v: unknown, what: string): PendingSend {
   const p = v as Record<string, unknown>;
   const stagedAt = wireInt(p.stagedAt);
   if (!isRequestId(p.requestId) || (p.status !== 'pending' && p.status !== 'expired') || stagedAt === null) throw bad();
+  const rawTtl = p.requestTtl;
+  const requestTtl = rawTtl === undefined || rawTtl === null ? null : wireInt(rawTtl);
+  if (rawTtl !== undefined && rawTtl !== null && requestTtl === null) throw bad();
   let message: ACEMessage;
   try {
     message = decodeEnvelope(p.message);
   } catch {
     throw bad();
   }
-  return { requestId: p.requestId, status: p.status, stagedAt, message };
+  if (requestTtl !== null && message.type !== 'request') throw bad(); // requestTtl belongs to a principal request only
+  const out: PendingSend = { requestId: p.requestId, status: p.status, stagedAt, message };
+  if (requestTtl !== null) out.requestTtl = requestTtl;
+  return out;
 }
 
 export function encodePendingSend(p: PendingSend): Record<string, unknown> {
-  return { message: envelopeKnownFields(p.message), requestId: p.requestId, stagedAt: p.stagedAt, status: p.status };
+  const d: Record<string, unknown> = {
+    message: envelopeKnownFields(p.message), requestId: p.requestId, stagedAt: p.stagedAt, status: p.status,
+  };
+  if (p.requestTtl !== undefined) d.requestTtl = p.requestTtl;
+  return d;
 }
 
 /** Internal: derive the state reached by a history (no validation beyond the table). */

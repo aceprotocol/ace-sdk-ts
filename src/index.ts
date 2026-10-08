@@ -5,13 +5,14 @@ export type {
   PricingInfo, ChainInfo, AgentProfile, ProfilePricing, DiscoverQuery, PeerRecord, ACEMessage, MessageType,
   EncryptionEnvelope, SignatureEnvelope, RfqBody, OfferBody, AcceptBody, RejectBody, InvoiceBody, ReceiptBody,
   DeliverBody, ConfirmBody, InfoBody, TextBody, MessageRef, RequestBody, DecisionBody, ReportBody, JSONValue, JSONObject, ParsedMessage, ReplayState,
-  RegistrationRequest, Intent,
+  RegistrationRequest, Intent, PrincipalKey, PrincipalRecord, PrincipalRole,
 } from './types.js';
+export type { PrincipalSigner, PrincipalContext, OpenRequestTo, RefreshSender, RequestRecord } from './principal.js';
 export type { ThreadState, ThreadSnapshot, ThreadHistoryEntry, ThreadEvent } from './state-machine.js';
 export type { RelayAuthRequest, WebhookMethod } from './auth.js';
 export type { Webhook, ListenEvent, InboxPage } from './relay.js';
 export type { WebhookNotification, WebhookNotificationInput } from './webhook.js';
-export type { ReceiveSource, ReceiveOutcome, DirectReply } from './inbox.js';
+export type { ReceiveSource, ReceiveOutcome, DirectReply, InboxPrincipal } from './inbox.js';
 export type { PendingSend } from './outbox.js';
 export type { ACEStore } from './store.js';
 export type { ACEErrorCode, ACEErrorCategory } from './errors.js';
@@ -29,6 +30,10 @@ export { toBase64, fromBase64, isACEId, isMessageId, isThreadId, isConversationI
 export { computeConversationId, decryptWithSeed, kemPublicKeyFromSeed, generateKemSeed } from './encryption.js';
 export { decodeEnvelope, verifyEnvelopeSignature, envelopeFingerprint } from './envelope.js';
 export { createMessage, parseMessage, validateBody } from './messages.js';
+export {
+  PRINCIPAL_ROLES, isCaip10, principalSignerFromIdentity, principalPayload, principalSignData, createPrincipalRecord,
+  validatePrincipalRecord, parsePrincipalRecord, checkPrincipalRules, requestKey, loadRequestRecord, recordRequest, fillDecision,
+} from './principal.js';
 export {
   VerifiedPeer, verifyPeerRecord, verifyRegistrationFile, fetchRegistrationFile, validateProfile, isBlockedAddress,
 } from './discovery.js';

@@ -23,7 +23,21 @@ interface PinRecord {
   fetchedAt: number;
 }
 
+let refreshImpl: (peers: PeerStore, aceId: string) => Promise<VerifiedPeer | null>;
+
+/**
+ * Internal (Inbox, 09 R-P20): look `aceId` up on the relay now and adopt it under the rollback barrier, regardless of
+ * the pin's age; null without a relay. Errors propagate.
+ */
+export function refreshPeer(peers: PeerStore, aceId: string): Promise<VerifiedPeer | null> {
+  return refreshImpl(peers, aceId);
+}
+
 export class PeerStore {
+  static {
+    refreshImpl = (peers, aceId) => peers.#refresh(aceId);
+  }
+
   readonly #store: ACEStore;
   readonly #relay: RelayClient | null;
   readonly #ttl: number;
@@ -80,6 +94,12 @@ export class PeerStore {
       if (e instanceof ACEError && e.code === 'stale_peer_binding' && maxAge > 0 && pin !== null) return pin.peer;
       throw e;
     }
+  }
+
+  async #refresh(aceId: string): Promise<VerifiedPeer | null> {
+    if (!isACEId(aceId)) throw new ACEError('invalid_argument', 'aceId must be an ACE ID');
+    if (this.#relay === null) return null;
+    return (await this.adopt(await this.#relay.lookupPeer(aceId))).peer;
   }
 
   /** Adopt a verified binding under the rollback barrier (lock `peers`). */

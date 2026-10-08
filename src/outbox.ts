@@ -2,13 +2,14 @@
 
 import { ACEError } from './errors.js';
 import {
-  canonicalStateBytes, encodeSignature, isACEId, parseStateBytes, sha256Hex,
+  canonicalStateBytes, encodeSignature, isACEId, parseStateBytes, sha256Hex, wireInt,
 } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { computeConversationId } from './encryption.js';
 import { messageSignData } from './envelope.js';
 import { buildMessage } from './messages.js';
 import { repairThreadsFromDeliveries } from './inbox.js';
+import { recordRequest } from './principal.js';
 import { ThreadStateMachine } from './state-machine.js';
 import type { ACEStore } from './store.js';
 import {
@@ -86,6 +87,9 @@ export class Outbox {
         threads: new ThreadStateMachine({ localAceId: local }), threadId: o.threadId, timestamp: this.#now(),
       });
       const pending: PendingSend = { requestId, status: 'pending', stagedAt: this.#now(), message };
+      // a principal request keeps its body ttl: the retry needs it for the requests/ record (06 Appendix A)
+      const ttl = o.type === 'request' ? wireInt(o.body.ttl) : null;
+      if (ttl !== null) pending.requestTtl = ttl;
       await this.#writeOutbox(pending);
       return pending;
     }
@@ -117,7 +121,9 @@ export class Outbox {
    * is acknowledged (economic: the thread's pending is cleared; otherwise the outbox file is
    * deleted). An `expired` send is refused with `envelope_expired` before any transport call;
    * `envelope_expired` from the transport marks it `expired` (then `resign`); any other error
-   * leaves it unchanged.
+   * leaves it unchanged. After a successful transport a principal `request` is recorded in
+   * `requests/` (lock `requests`) before the send is cleared; if that write fails the send stays
+   * pending and a retry writes it (06 § Durable Delivery, Sender).
    */
   async deliver<T>(requestId: string, transport: (env: ACEMessage) => Promise<T>): Promise<T> {
     if (typeof transport !== 'function') throw new ACEError('invalid_argument', 'transport must be a function');
@@ -130,6 +136,14 @@ export class Outbox {
     } catch (e) {
       if (e instanceof ACEError && e.code === 'envelope_expired') await this.#markExpired(requestId, message.messageId);
       throw e;
+    }
+    if (message.type === 'request') {
+      const release = await this.#store.lock('requests');
+      try {
+        await recordRequest(this.#store, message, this.#now(), found.pending.requestTtl);
+      } finally {
+        await release();
+      }
     }
     await this.#acknowledge(requestId, message.messageId);
     return result;

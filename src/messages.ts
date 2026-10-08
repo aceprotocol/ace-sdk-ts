@@ -2,17 +2,18 @@
 
 import { ACEError } from './errors.js';
 import {
-  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isConversationId, isMessageId, isObj, isThreadId, loadsBody, toBase64, wireInt,
+  bytesEqual, checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isConversationId, isMessageId, isObj, isThreadId, loadsBody, toBase64, wireInt,
 } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { computeConversationId, encrypt } from './encryption.js';
 import { decodeEnvelope, decodeKemCiphertext, decodePayload, messageSignData } from './envelope.js';
 import { MAX_PLAINTEXT_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import { checkPrincipalRules, senderPrincipalUsable, type PrincipalContext } from './principal.js';
 import { ReplayDetector } from './replay.js';
 import { verifySignature } from './signing.js';
 import { ThreadStateMachine, type ThreadEvent } from './state-machine.js';
 import type { ACEIdentity, ACEMessage, JSONObject, MessageType, ParsedMessage } from './types.js';
-import { isEconomicType, isMessageType } from './types.js';
+import { isEconomicType, isMessageType, isPrincipalType } from './types.js';
 
 // --- body schema --------------------------------------------------------------------
 
@@ -169,13 +170,24 @@ export interface ParseMessageOptions {
   /** Acceptance floor in [0, now]; default now - 300. */
   floor?: number;
   clock?: () => number;
+  /** The receiver's principal context (09); without it principal types are `wrong_principal`. */
+  principal?: PrincipalContext;
+}
+
+function isPrincipalContext(v: unknown): v is PrincipalContext {
+  if (typeof v !== 'object' || v === null) return false;
+  const c = v as Record<string, unknown>;
+  return typeof c.account === 'string' && typeof c.openRequestTo === 'function'
+    && (c.refreshSender === undefined || typeof c.refreshSender === 'function')
+    && (c.trustedSigners === undefined || Array.isArray(c.trustedSigners));
 }
 
 /**
  * Verify, decrypt and validate an inbound message. The first failure wins:
  * decode → wrong_recipient → from (invalid_envelope) → scheme_mismatch →
  * conversationId (invalid_envelope) → floor / timestamp (stale_timestamp) → replay →
- * invalid_signature → replay commit → decrypt → invalid_body → state machine.
+ * invalid_signature → replay commit → decrypt → invalid_body → state machine / principal rules.
+ * Principal types (`request`, `decision`, `report`) need `opts.principal`; without it they are `wrong_principal`.
  */
 export async function parseMessage(
   envelope: ACEMessage, receiver: ACEIdentity, sender: VerifiedPeer, opts: ParseMessageOptions,
@@ -183,6 +195,9 @@ export async function parseMessage(
   if (!isVerifiedPeer(sender)) throw new ACEError('invalid_argument', 'sender must be a VerifiedPeer');
   if (typeof opts !== 'object' || opts === null || !(opts.threads instanceof ThreadStateMachine) || !(opts.replay instanceof ReplayDetector)) {
     throw new ACEError('invalid_argument', 'threads and replay are required');
+  }
+  if (opts.principal !== undefined && !isPrincipalContext(opts.principal)) {
+    throw new ACEError('invalid_argument', 'principal must be a PrincipalContext');
   }
   const { threads, replay } = opts;
   const receiverId = receiver.getACEId();
@@ -231,8 +246,30 @@ export async function parseMessage(
   const body = decodeBody(env.type, plaintext);
   // 13
   if (isEconomicType(env.type)) threads.apply(eventOf(env), body);
+  else if (isPrincipalType(env.type)) await checkPrincipal(env, body, sender, opts.principal, now);
   return {
     messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, type: env.type,
     threadId: env.threadId ?? null, timestamp: env.timestamp, body,
   };
 }
+
+/**
+ * 06 step 7 for principal types (09 § Same-Account Rules). With `ctx.refreshSender`, a sender whose pinned principal
+ * fails steps 2-5 is refreshed once (R-P20) before the rules run; a refresh that returns null or another binding
+ * leaves the pinned binding to decide. (The Inbox refreshes before parsing instead, outside any store lock.)
+ */
+async function checkPrincipal(
+  env: ACEMessage, body: JSONObject, sender: VerifiedPeer, ctx: PrincipalContext | undefined, now: number,
+): Promise<void> {
+  let peer = sender;
+  if (ctx?.refreshSender !== undefined && !senderPrincipalUsable(peer.principal, peer.signingPublicKey, ctx, now)) {
+    const fresh = await ctx.refreshSender(peer.aceId);
+    if (isVerifiedPeer(fresh) && fresh.aceId === peer.aceId && bytesEqual(fresh.signingPublicKey, peer.signingPublicKey)) peer = fresh;
+  }
+  await checkPrincipalRules(env.type, body, {
+    conversationId: env.conversationId, senderPrincipal: peer.principal ?? null, senderSigningPublicKey: peer.signingPublicKey,
+    selfAccount: ctx?.account ?? null, openRequestTo: ctx?.openRequestTo, now, selfSigner: ctx?.selfSigner,
+    trustedSigners: ctx?.trustedSigners,
+  });
+}
+
