@@ -262,7 +262,20 @@ export async function parseMessage(
   if (opts.principal !== undefined && !isPrincipalContext(opts.principal)) {
     throw new ACEError('invalid_argument', 'principal must be a PrincipalContext');
   }
-  const { threads, replay } = opts;
+  return parseWithGate(envelope, receiver, sender, opts, opts.replay);
+}
+
+/** Internal: the seen store as the pipeline reads it (step 7) and records into it (step 9). */
+export interface ReplayGate {
+  accepts(messageId: string, from: string, timestamp: number): boolean;
+  commit(messageId: string, from: string, timestamp: number, floor: number): boolean;
+}
+
+/** Internal: `parseMessage` on validated options, with `replay` as a gate (the Inbox commits later). */
+export async function parseWithGate(
+  envelope: ACEMessage, receiver: ACEIdentity, sender: VerifiedPeer, opts: Omit<ParseMessageOptions, 'replay'>, replay: ReplayGate,
+): Promise<ParsedMessage> {
+  const { threads } = opts;
   const receiverId = receiver.getACEId();
   if (threads !== undefined && threads.localAceId !== receiverId) throw new ACEError('invalid_argument', 'threads.localAceId must be the receiver');
   // 1

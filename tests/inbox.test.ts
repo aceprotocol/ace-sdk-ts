@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   ACEError, Inbox, MemoryStore, Outbox, PeerStore, ReplayDetector, ThreadStateMachine, ThreadStore, createMessage,
-  envelopeFingerprint, type ACEMessage,
+  envelopeFingerprint, type ACEMessage, type ACEStore,
 } from '../src/index.js';
 import { FileStore } from '../src/node.js';
 import { pairKey, stringifySorted } from '../src/encoding.js';
@@ -70,7 +70,8 @@ describe('Inbox', () => {
     const dkey = deliveryKey(alice.id, env.messageId);
     const tkey = threadKey(env.conversationId, 'deal-1');
     // a new open thread is indexed before its record is written
-    expect(counting.writes).toEqual([dkey, threadIndexKey(alice.id), tkey, 'replay.json', dkey]);
+    // the delivery record journals the seen-store commit; replay.json follows at close (or every 1024)
+    expect(counting.writes).toEqual([dkey, threadIndexKey(alice.id), tkey, dkey]);
     expect(bob.host.calls).toEqual([[alice.id, env.messageId]]);
     const rec = json(await bob.store.read(dkey));
     expect(Object.keys(rec).sort()).toEqual(['fingerprint', 'message', 'receivedAt', 'status', 'thread', 'version']);
@@ -88,6 +89,33 @@ describe('Inbox', () => {
     expect(counting.writes).toEqual([]);
     expect((await new ThreadStore({ store: bob.store, localAceId: bob.id }).get(env.conversationId, 'deal-1'))!.state).toBe('rfq');
     expect(bob.host.calls).toEqual([[alice.id, env.messageId]]);
+    await inbox.close();
+    expect(counting.writes).toEqual(['replay.json']);
+  });
+
+  it('delivery records journal the seen store between writes of replay.json', async () => {
+    const { clock, alice, bob } = await pair();
+    // quota 1: the second message evicts the first and raises H[alice] over it, in memory only
+    const send = async (message: string) => (await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'text', body: { message } })).message;
+    const first = await send('one');
+    clock.t += 1;
+    const second = await send('two');
+    const inbox = await bob.open({ capacity: 16 });
+    expect((await inbox.receive(wire(first))).kind).toBe('delivered');
+    expect((await inbox.receive(wire(second))).kind).toBe('delivered');
+    expect(await bob.store.list('deliveries/')).toHaveLength(2);
+    const crashed = await cloneStore(bob.store); // the process dies: replay.json was never rewritten
+    await inbox.close();
+    const replayOf = async (store: ACEStore) => ReplayDetector.fromState(json(await store.read('replay.json')), { capacity: 16 });
+    expect((await replayOf(crashed)).accepts(first.messageId, first.from, first.timestamp)).toBe(true);
+    const reopened = await bob.open({ store: crashed, capacity: 16 });
+    expect((await reopened.receive(wire(first))).kind).toBe('duplicate');
+    expect((await reopened.receive(wire(second))).kind).toBe('duplicate');
+    expect(bob.host.calls).toHaveLength(2);
+    await reopened.close();
+    // written: the first message's covered record is pruned, the second kept
+    expect((await replayOf(crashed)).accepts(first.messageId, first.from, first.timestamp)).toBe(false);
+    expect(await crashed.list('deliveries/')).toHaveLength(1);
   });
 
   it('non-economic: no thread snapshot; no freshness window beyond the replay floor (that is the MLS handshake\'s job)', async () => {
@@ -317,7 +345,7 @@ async function scenario(clock: Clock) {
   return { bob, offer };
 }
 
-const COMMIT_STEPS = [1, 2, 3, 4, 5]; // delivery, operation archive, thread, replay, ack
+const COMMIT_STEPS = [1, 2, 3, 4]; // delivery, operation archive, thread, ack (replay.json follows at close)
 
 describe('crash injection', () => {
   for (const backend of ['memory', 'file'] as const) {
@@ -360,13 +388,13 @@ describe('crash injection', () => {
       expect((await threads.get(conv, 'd'))!.state).toBe('offered');
       expect([...bob.host.effects.keys()]).toEqual([`${offer.from}|${offer.messageId}`]); // nothing lost, no duplicate effect
       // onMessage runs twice only when the crash hit the ack write after the hand-over
-      expect(bob.host.calls.length).toBe(failAt === 5 ? 2 : 1);
+      expect(bob.host.calls.length).toBe(failAt === 4 ? 2 : 1);
+      await recovered.close();
       const replay = ReplayDetector.fromState(json(await base.read('replay.json')), { capacity: 100000 });
       expect(replay.accepts(offer.messageId, offer.from, offer.timestamp)).toBe(false);
-      await recovered.close();
       const third = await bob.open({ store: base });
       expect((await third.receive(wire(offer))).kind).toBe('duplicate');
-      expect(bob.host.calls.length).toBe(failAt === 5 ? 2 : 1);
+      expect(bob.host.calls.length).toBe(failAt === 4 ? 2 : 1);
       await third.close();
     });
   }

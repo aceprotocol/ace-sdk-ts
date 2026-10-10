@@ -9,7 +9,7 @@ import { computeConversationId } from './encryption.js';
 import { decodeSigningKey, type VerifiedPeer } from './discovery.js';
 import { decodeEnvelope, envelopeFingerprint, envelopeKnownFields } from './envelope.js';
 import { DEFAULT_REPLAY_CAPACITY, MAX_ENVELOPE_BYTES, OFFLINE_WINDOW_SECONDS } from './limits.js';
-import { applySchema, checkPrincipal, eventOf, installedSchemas, parseMessage, type SchemaValidator } from './messages.js';
+import { applySchema, checkPrincipal, eventOf, installedSchemas, parseWithGate, type SchemaValidator } from './messages.js';
 import { refreshPeer, type PeerStore } from './peer-store.js';
 import {
   fillDecision, isCaip10, openRequestTo, senderPrincipalUsable, validatePrincipalRecord, type PrincipalContext,
@@ -137,7 +137,8 @@ interface DeliveryRecord {
 const REPLAY_KEY = 'replay.json';
 const QUARANTINE_CAP = 1000;
 const QUARANTINE_FLOOR = 900;
-const SWEEP_EVERY = 1024;
+/** Commits between writes of replay.json; the delivery records journal them in between. */
+const REPLAY_SNAPSHOT_EVERY = 1024;
 const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
 
 function deliveryKey(from: string, messageId: string): string {
@@ -166,7 +167,9 @@ function encodeSnapshot(s: ThreadSnapshot): Record<string, unknown> {
  * (the only network receive boundary) feeds it authenticated MLS plaintext; in-process code
  * and tests call `receive` directly. One open Inbox per store (lock `receive`). Commit order
  * per message: delivery record, `requests/` decision fill (`decision` only), thread state,
- * replay state, `onMessage`, ack.
+ * `onMessage`, ack. The delivery record journals the seen-store commit: replay.json is
+ * rewritten every 1024 commits and at `close()`, `open` re-commits the records written since,
+ * and a record is deleted only once a written replay.json covers it.
  */
 export class Inbox {
   readonly #identity: ACEIdentity;
@@ -188,7 +191,10 @@ export class Inbox {
   /** `threads` or `requests`, kept after a failure past the commit point until close(). */
   #heldLock: (() => Promise<void>) | null = null;
   #closed = false;
-  #sinceSweep = 0;
+  /** Commits since replay.json was last written (journaled by their delivery records). */
+  #replayDirty = 0;
+  /** `acked` delivery records the written replay.json does not cover yet: key → [from, timestamp]. */
+  readonly #acked = new Map<string, [string, number]>();
   /** `quarantine/` keys: listed once, then maintained (this instance holds `receive`). */
   #quarantined: Set<string> | null = null;
 
@@ -298,11 +304,12 @@ export class Inbox {
     if (this.#closed) throw new ACEError('invalid_argument', 'inbox is closed');
   }
 
-  /** Release the `receive` lock. */
+  /** Write pending seen-store commits (best effort: the delivery records journal them) and release the `receive` lock. */
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
     await this.#queue.run(async () => undefined);
+    if (this.#failed === null && this.#replayDirty > 0) await this.#persistReplay().catch(() => {});
     const held = this.#heldLock;
     this.#heldLock = null;
     try {
@@ -343,16 +350,7 @@ export class Inbox {
   async #receive(raw: Uint8Array): Promise<ReceiveOutcome> {
     this.#checkOpen();
     if (this.#failed) return { kind: 'retryable', error: new ACEError('storage_failed', 'inbox is in a failed state; close and reopen to recover') };
-    const outcome = await this.#process(raw);
-    if (outcome.kind === 'delivered' && ++this.#sinceSweep >= SWEEP_EVERY) {
-      this.#sinceSweep = 0;
-      try {
-        await this.#sweep();
-      } catch {
-        // best effort; the next sweep or recovery retries
-      }
-    }
-    return outcome;
+    return this.#process(raw);
   }
 
   #fail(e: unknown): ReceiveOutcome {
@@ -416,27 +414,36 @@ export class Inbox {
       }
       return { kind: 'delivered', message: existing.message };
     }
-    const tr = this.#replay.clone();
+    // Steps 7 and 9 read the live seen store; it is written only at the commit point below.
+    let verified = false;
+    const gate = {
+      accepts: (id: string, from: string, ts: number) => this.#replay.accepts(id, from, ts),
+      commit: (id: string, from: string, ts: number) => { verified = true; return this.#replay.accepts(id, from, ts); },
+    };
     const rejected = async (e: unknown): Promise<ReceiveOutcome> => {
         const err = e instanceof ACEError ? e : new ACEError('identity_unavailable', 'receive failed', { cause: e });
         if (err.code === 'replay') return { kind: 'duplicate', from: env.from, messageId: env.messageId };
         if (err.isTransient) return { kind: 'retryable', error: err };
         const out = await quarantine(err);
-        if (out.kind === 'retryable') return out;
-        // a verified message stays one-shot: persist the tentative replay state if it changed
-        if (!tr.accepts(env.messageId, env.from, env.timestamp) && this.#replay.accepts(env.messageId, env.from, env.timestamp)) {
+        if (out.kind === 'retryable' || !verified) return out;
+        // An authenticated message stays one-shot. No delivery record journals it, so its commit
+        // is written now, on a copy swapped in only once written.
+        const tr = this.#replay.clone();
+        if (tr.commit(env.messageId, env.from, env.timestamp, this.#floor())) {
           try {
             await this.#store.write(REPLAY_KEY, canonicalStateBytes(tr.exportState()));
           } catch (e2) {
             return { kind: 'retryable', error: asError(e2, 'storage_failed', 'replay write failed') };
           }
           this.#replay = tr;
+          this.#replayDirty = 0;
+          await this.#pruneAcked().catch(() => {});
         }
         return out;
     };
     let parsed: ParsedMessage;
     try {
-      parsed = await parseMessage(env, this.#identity, peer, { replay: tr, floor: this.#floor(), clock: this.#clock });
+      parsed = await parseWithGate(env, this.#identity, peer, { floor: this.#floor(), clock: this.#clock }, gate);
     } catch (e) { return rejected(e); }
     // 6. installed schema (deterministic; the bundled validation already ran inside parseMessage)
     const validator = this.#schemas.get(parsed.schemaDigest);
@@ -481,13 +488,16 @@ export class Inbox {
         return { kind: 'retryable', error: asError(e, 'storage_failed', 'delivery write failed') };
       }
       try {
+        // 7.3 in memory; the record just written journals it until the next replay.json
+        this.#replay.commit(env.messageId, env.from, env.timestamp, this.#floor());
+        this.#replayDirty++;
         if (principal !== undefined && parsed.type === 'decision') await fillDecision(this.#store, parsed); // 7.1a: mark the request decided
         if (snapshot !== null) await this.#threads.saveRecord({ snapshot, pending: clearedPending(record, snapshot) }, record); // 7.2
-        await this.#store.write(REPLAY_KEY, canonicalStateBytes(tr.exportState())); // 7.3
-        this.#replay = tr;
       } catch (e) {
         return this.#fail(e);
       }
+      // a failed snapshot only delays pruning: the records still journal every commit
+      if (this.#replayDirty >= REPLAY_SNAPSHOT_EVERY) await this.#persistReplay().catch(() => {});
       return delivery;
     };
     // The lock covers steps 5-7.3 only: onMessage runs unlocked, so a handler may stage a reply.
@@ -550,9 +560,30 @@ export class Inbox {
     return replayCovers(this.#replay, from, ts);
   }
 
+  /** Drop the record once the written replay state covers it, else mark it `acked` (pruned after a later write). */
   async #ack(key: string, d: DeliveryRecord): Promise<void> {
-    if (this.#covered(d.message.from, d.message.timestamp)) await this.#store.delete(key);
-    else await this.#writeDelivery(key, { ...d, status: 'acked' });
+    if (this.#replayDirty === 0 && this.#covered(d.message.from, d.message.timestamp)) {
+      await this.#store.delete(key);
+      return;
+    }
+    await this.#writeDelivery(key, { ...d, status: 'acked' });
+    this.#acked.set(key, [d.message.from, d.message.timestamp]);
+  }
+
+  /** Write the seen store, then delete the acked records it now covers. */
+  async #persistReplay(): Promise<void> {
+    await this.#store.write(REPLAY_KEY, canonicalStateBytes(this.#replay.exportState()));
+    this.#replayDirty = 0;
+    await this.#pruneAcked();
+  }
+
+  /** Delete the acked records covered by the seen store; call only while it equals replay.json. */
+  async #pruneAcked(): Promise<void> {
+    for (const [key, [from, ts]] of [...this.#acked]) {
+      if (!this.#covered(from, ts)) continue;
+      await this.#store.delete(key);
+      this.#acked.delete(key);
+    }
   }
 
   async #writeQuarantine(env: ACEMessage, error: ACEError): Promise<string> {
@@ -592,13 +623,6 @@ export class Inbox {
     return fingerprint;
   }
 
-  async #sweep(): Promise<void> {
-    for (const key of await this.#store.list('deliveries/')) {
-      const d = await this.#readDelivery(key);
-      if (d !== null && d.status === 'acked' && this.#covered(d.message.from, d.message.timestamp)) await this.#store.delete(key);
-    }
-  }
-
   // --- recovery ---
 
   async #recover(): Promise<void> {
@@ -634,26 +658,24 @@ export class Inbox {
     }
     let replayChanged = false;
     const floor = this.#floor();
-    for (const [, d] of records) {
+    for (const [key, d] of records) {
       const m = d.message;
       if (this.#replay.accepts(m.messageId, m.from, m.timestamp)) {
         this.#replay.commit(m.messageId, m.from, m.timestamp, floor);
         replayChanged = true;
       }
+      if (d.status === 'acked') this.#acked.set(key, [m.from, m.timestamp]);
     }
-    if (replayChanged) await this.#store.write(REPLAY_KEY, canonicalStateBytes(this.#replay.exportState()));
+    if (replayChanged) await this.#persistReplay();
     for (const [key, d] of records) {
-      if (d.status === 'pending') {
-        try {
-          await this.#onMessage(d.message);
-        } catch (e) {
-          // the record stays pending and is retried at the next open (or on redelivery)
-          throw new ACEError('handler_failed', 'onMessage failed during recovery', { cause: e });
-        }
-        await this.#ack(key, d);
-      } else if (this.#covered(d.message.from, d.message.timestamp)) {
-        await this.#store.delete(key);
+      if (d.status !== 'pending') continue;
+      try {
+        await this.#onMessage(d.message);
+      } catch (e) {
+        // the record stays pending and is retried at the next open (or on redelivery)
+        throw new ACEError('handler_failed', 'onMessage failed during recovery', { cause: e });
       }
+      await this.#ack(key, d);
     }
   }
 }
