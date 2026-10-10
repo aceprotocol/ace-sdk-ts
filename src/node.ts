@@ -296,10 +296,16 @@ async function syncDir(dir: string): Promise<void> {
   }
 }
 
+type SessionCore = { SessionEngine: new () => import('./session.js').MLSEngine & { free(): void } };
+/** The initialized WASM core, once per process (a failed load is retried on the next call). */
+let sessionCore: Promise<SessionCore> | undefined;
+
 /** Load the source-built, packaged WASM core. Missing artifacts are a hard error; never downgrade. */
 export async function loadMLSEngine(): Promise<import('./session.js').MLSEngine & { free(): void }> {
-  const url = new URL('./session-core/ace_session_core.js', import.meta.url);
-  const core = await import(url.href);
-  await core.default({ module_or_path: await fs.readFile(new URL('./session-core/ace_session_core_bg.wasm', import.meta.url)) });
-  return new core.SessionEngine();
+  sessionCore ??= (async () => {
+    const core = await import(new URL('./session-core/ace_session_core.js', import.meta.url).href);
+    await core.default({ module_or_path: await fs.readFile(new URL('./session-core/ace_session_core_bg.wasm', import.meta.url)) });
+    return core as SessionCore;
+  })().catch((e: unknown) => { sessionCore = undefined; throw e; });
+  return new (await sessionCore).SessionEngine();
 }

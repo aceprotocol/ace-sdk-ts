@@ -27,12 +27,12 @@ const VALUE_EXPORTS = [
   'createRegistrationRequest', 'verifyRegistrationRequest', 'createAuthHeaders', 'parseAuthHeaders', 'verifyAuthHeaders',
   'isHttpsUrl', 'isWebhookSecret', 'signWebhookNotification', 'verifyWebhookNotification',
   'ReplayDetector', 'ThreadStateMachine', 'ThreadStore', 'PeerStore', 'Inbox', 'inboxPrincipalFromOwnRecord', 'Outbox', 'RelayClient', 'MemoryStore',
-  'checkKey', 'checkLockName',
+  'checkKey', 'checkLockName', 'checkValue', 'checkTimeout', 'lockTimeoutError',
   'executionIntentDigest', 'executionGrantDigest', 'createExecutionGrant', 'verifyExecutionGrantChain', 'isExecutionUnits', 'ExecutionAuthority',
   'EXECUTION_REQUEST_TYPE', 'EXECUTION_REQUEST_SCHEMA', 'EXECUTION_REQUEST_SCHEMA_DIGEST', 'parseExecutionRequest',
   'knownSchemaDigest', 'AuditTree', 'auditCommitment', 'createAuditOpening', 'createAuditCheckpoint', 'verifyAuditInclusion', 'verifyAuditConsistency', 'verifyAuditCheckpoint',
   'auditCheckpointDigest', 'createAuditWitnessReceipt', 'verifyAuditWitnessReceipt', 'verifyAuditWitnessQuorum', 'AuditLog', 'AuditWitness',
-  'PRINCIPAL_ROLES', 'isCaip10', 'principalSignerFromIdentity', 'principalPayload', 'principalSignData', 'createPrincipalRecord',
+  'PRINCIPAL_ROLES', 'CAIP10_RE', 'isCaip10', 'principalSignerFromIdentity', 'principalPayload', 'principalSignData', 'createPrincipalRecord',
   'validatePrincipalRecord', 'parsePrincipalRecord', 'checkPrincipalRules', 'loadRequestRecord',
 ];
 

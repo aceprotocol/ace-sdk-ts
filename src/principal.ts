@@ -24,7 +24,8 @@ export function samePrincipalClaims(a: PrincipalRecord, b: PrincipalRecord): boo
 
 /** Canonical order: `controller` (approves) before `delegate` (acts). */
 export const PRINCIPAL_ROLES: readonly PrincipalRole[] = ['controller', 'delegate'];
-const CAIP10_RE = /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}$/;
+/** CAIP-10 account id; `isCaip10` is the check (exported so schemas can show the same pattern). */
+export const CAIP10_RE = /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}$/;
 const ALLOWED_ROLES: ReadonlyArray<readonly string[]> = [['controller'], ['delegate'], ['controller', 'delegate']];
 const EIP155_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const WRONG_DECIDER = 'decision from a different controller than the request was sent to';

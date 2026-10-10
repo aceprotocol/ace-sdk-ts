@@ -59,7 +59,7 @@ export function lockTimeoutError(name: string): ACEError {
   return new ACEError(name === 'receive' ? 'receiver_busy' : 'lock_busy', `lock '${name}' is held`);
 }
 
-/** Internal: a write value must be bytes of at most MAX_VALUE_BYTES. */
+/** A write value must be bytes of at most MAX_VALUE_BYTES (64 MiB, the ACEStore contract). */
 export function checkValue(value: unknown): Uint8Array {
   if (!(value instanceof Uint8Array)) throw new ACEError('invalid_argument', 'value must be bytes');
   if (value.length > MAX_VALUE_BYTES) throw new ACEError('invalid_argument', 'value exceeds 64 MiB');

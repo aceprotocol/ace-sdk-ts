@@ -34,7 +34,7 @@ export { computeConversationId, decryptWithSeed, kemPublicKeyFromSeed, generateK
 export { decodeEnvelope, verifyEnvelopeSignature, envelopeFingerprint } from './envelope.js';
 export { createMessage, parseMessage, validateBody, knownSchemaDigest } from './messages.js';
 export {
-  PRINCIPAL_ROLES, isCaip10, principalSignerFromIdentity, principalPayload, principalSignData, createPrincipalRecord,
+  PRINCIPAL_ROLES, CAIP10_RE, isCaip10, principalSignerFromIdentity, principalPayload, principalSignData, createPrincipalRecord,
   validatePrincipalRecord, parsePrincipalRecord, checkPrincipalRules, loadRequestRecord,
 } from './principal.js';
 export {
@@ -51,7 +51,8 @@ export { PeerStore } from './peer-store.js';
 export { Inbox, inboxPrincipalFromOwnRecord } from './inbox.js';
 export { Outbox } from './outbox.js';
 export { RelayClient } from './relay.js';
-export { MemoryStore, checkKey, checkLockName } from './store.js';
+// The ACEStore contract checks, for third-party store implementations.
+export { MemoryStore, checkKey, checkLockName, checkValue, checkTimeout, lockTimeoutError } from './store.js';
 
 export { AuditTree, auditCommitment, createAuditOpening, createAuditCheckpoint, verifyAuditInclusion, verifyAuditConsistency, verifyAuditCheckpoint,
   auditCheckpointDigest, createAuditWitnessReceipt, verifyAuditWitnessReceipt, verifyAuditWitnessQuorum } from './audit.js';
