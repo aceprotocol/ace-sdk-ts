@@ -62,7 +62,7 @@ export async function createRegistrationFile(identity: ACEIdentity, opts: {
   if (opts.ext !== undefined) reg.ext = opts.ext;
   if (opts.principal !== undefined) reg.principal = opts.principal;
   // R-P44: the principal is validated at the real now (no allow-expired, no issuedAt-relative clock)
-  const now = Math.floor(Date.now() / 1000);
+  const now = nowOf();
   if (opts.principal !== undefined) validatePrincipalRecord(opts.principal, signingPublicKey, now);
   verifyRegistrationFile(reg, { clock: () => now });
   return reg;

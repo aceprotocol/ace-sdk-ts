@@ -1,5 +1,6 @@
 /** Optional application schema; neither parsing nor its message label grants execution rights. */
-import { sha256Hex, hasExactKeys, isObj } from './encoding.js';
+import { sha256Hex, hasExactKeys, isObj, utf8 } from './encoding.js';
+import { MAX_EXECUTION_JSON_BYTES } from './limits.js';
 import { ACEError } from './errors.js';
 import { executionIntentDigest, type ExecutionGrant, type ExecutionIntent } from './grants.js';
 
@@ -14,7 +15,7 @@ export function parseExecutionRequest(body: unknown): ExecutionRequest {
       || body.grants.length < 1 || body.grants.length > 8 || !body.grants.every(isObj)) throw new Error();
     executionIntentDigest(body.intent as ExecutionIntent);
     const bytes = JSON.stringify(body);
-    if (new TextEncoder().encode(bytes).length > 60_000) throw new Error();
+    if (utf8(bytes).length > MAX_EXECUTION_JSON_BYTES) throw new Error();
     return JSON.parse(bytes) as ExecutionRequest;
   } catch { throw new ACEError('invalid_authorization', 'invalid execution request'); }
 }

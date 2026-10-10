@@ -1,7 +1,7 @@
 /** Optional private commitments and RFC 9162 Merkle proofs. No publication or execution side effects. */
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, hexToBytes, randomBytes, concatBytes } from '@noble/hashes/utils.js';
-import { decodeSignature, encodeSignature, hasExactKeys, isACEId, isConversationId, isMessageId, wireInt } from './encoding.js';
+import { decodeSignature, encodeSignature, hasExactKeys, utf8, isACEId, isConversationId, isMessageId, wireInt } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { buildSignData, encodePayload, verifySignature } from './signing.js';
 import { ACEError } from './errors.js';
@@ -22,7 +22,7 @@ export const merkle = { empty, leaf, node, split } as const;
 /** The salt must stay private until intentional disclosure. Use a fresh opening per publication. */
 export function auditCommitment(statement: Uint8Array, salt: Uint8Array): string {
   if (!(statement instanceof Uint8Array) || !(salt instanceof Uint8Array) || salt.length !== 32) throw fail();
-  return hash(new TextEncoder().encode('ace.audit.commitment.v1\0'), salt, statement);
+  return hash(utf8('ace.audit.commitment.v1\0'), salt, statement);
 }
 export function createAuditOpening(statement: Uint8Array): { salt: Uint8Array; commitment: string } {
   const salt = randomBytes(32);
@@ -32,6 +32,8 @@ export function createAuditOpening(statement: Uint8Array): { salt: Uint8Array; c
 /** Reference tree builder; inputs are commitments, never plaintext or salts. */
 export class AuditTree {
   readonly #leaves: string[];
+  /** Perfect (power-of-two) subtree hashes by `start:count`; proofs reuse them instead of rehashing leaves. */
+  readonly #perfect = new Map<string, string>();
   constructor(commitments: readonly string[] = []) {
     if (!Array.isArray(commitments) || commitments.length > 65_536 || !commitments.every(digest)) throw fail();
     this.#leaves = commitments.map(leaf);
@@ -40,8 +42,13 @@ export class AuditTree {
   #root(start: number, count: number): string {
     if (!count) return empty;
     if (count === 1) return this.#leaves[start];
+    const perfect = (count & (count - 1)) === 0, key = `${start}:${count}`;
+    const cached = perfect ? this.#perfect.get(key) : undefined;
+    if (cached !== undefined) return cached;
     const k = split(count);
-    return node(this.#root(start, k), this.#root(start + k, count - k));
+    const h = node(this.#root(start, k), this.#root(start + k, count - k));
+    if (perfect) this.#perfect.set(key, h);
+    return h;
   }
   root(count = this.size): string {
     if (!size(count) || count > this.size) throw fail();

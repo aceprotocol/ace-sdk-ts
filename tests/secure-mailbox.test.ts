@@ -120,7 +120,7 @@ describe.skipIf(!path)('secure network boundary', () => {
       expect(live).toBe(0);
     } finally { await s.close(); }
   });
-  it('receiveDirect: a handshake answers 200 per frame and commits once; a static envelope is 400 invalid_body; an Inbox rejection is an accepted frame whose receipt rejects', async () => {
+  it('receiveDirect: a handshake answers 200 per frame and commits once; a static envelope is 400 secure_delivery_required; an Inbox rejection is an accepted frame whose receipt rejects', async () => {
     const s = await setup();
     try {
       const peer = await s.a.peer(s.b), replies: DirectReply[] = [];
@@ -130,9 +130,11 @@ describe.skipIf(!path)('secure network boundary', () => {
       await s.a.outbox.deliver(pending.requestId, p => s.ta.deliver(p, peer, (p, r) => da.exchange(p, r)));
       expect(replies.map(r => [r.status, r.body.ok, r.outcome?.kind])).toEqual([[200, true, undefined], [200, true, 'delivered']]);
       expect(s.b.host.calls).toHaveLength(1);
-      // a static application envelope never reaches the Inbox: refused at the boundary, nothing persisted
+      // a static application envelope never reaches the Inbox: refused at the boundary with the session-core code
+      // (08 § Receiver), nothing persisted; the pull/quarantine outcome keeps invalid_body
       const stale = await s.mb.receiveDirect(wire({ message: pending.message }));
-      expect(stale).toMatchObject({ status: 400, body: { ok: false, error: 'invalid_body' }, outcome: { kind: 'quarantined' } });
+      expect(stale).toMatchObject({ status: 400, body: { ok: false, error: 'secure_delivery_required' },
+        outcome: { kind: 'quarantined', error: { code: 'invalid_body', message: 'invalid_body: secure_delivery_required' } } });
       expect(await s.b.store.list('quarantine/')).toEqual([]);
       // a commerce message without a thread passes the handshake and is rejected by the Inbox: the frame is accepted (200),
       // the record is persisted under quarantine/ and the sender learns the code from the receipt
@@ -146,6 +148,17 @@ describe.skipIf(!path)('secure network boundary', () => {
       expect(s.b.host.calls).toHaveLength(1);
     } finally { await s.close(); }
   }, 15_000);
+  it('SecureRelayReplies waits no longer than the attempt is valid: an expired route sends nothing', async () => {
+    const s = await setup();
+    try {
+      const sent: unknown[] = [];
+      const replies = new SecureRelayReplies(s.a.identity, s.ta, s.relayA, await s.a.peer(s.b), async p => { sent.push(p); });
+      const packet = await createMessage({ sender: s.a.identity, recipient: await s.a.peer(s.b), type: 'text', body: { message: 'x' }, timestamp: s.a.clock.t });
+      const route = { attempt: 'a'.repeat(64), kind: 'offer', expiresAt: s.a.clock.t };
+      await expect(replies.exchange(packet, route)).rejects.toMatchObject({ code: 'delivery_expired' });
+      expect(sent).toEqual([]);
+    } finally { await s.close(); }
+  });
   it('an unadmitted stranger is refused before any peer resolution: no relay lookup, no pin', async () => {
     const s = await setup();
     try {
@@ -159,7 +172,7 @@ describe.skipIf(!path)('secure network boundary', () => {
       const pulled = await s.mb.pull(s.relayB);
       expect(pulled.blocked).toBeNull();
       expect(pulled.outcomes).toMatchObject([{ kind: 'quarantined', error: { code: 'invalid_body', message: 'invalid_body: delivery_peer_disabled' }, fingerprint: expect.any(String) }]);
-      expect(await s.mb.receiveDirect(wire({ message: stranger }))).toMatchObject({ status: 400, body: { ok: false, error: 'invalid_body' } });
+      expect(await s.mb.receiveDirect(wire({ message: stranger }))).toMatchObject({ status: 400, body: { ok: false, error: 'delivery_peer_disabled' } });
       expect(resolve).not.toHaveBeenCalled();
       expect(lookups()).toBe(before);
       expect(await s.b.store.list('peers/')).toEqual(pinned);

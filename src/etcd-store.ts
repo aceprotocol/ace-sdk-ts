@@ -1,7 +1,7 @@
 /** Private replicated state, never the public audit log. Requires a trusted etcd v3 quorum. */
 import { randomBytes } from 'node:crypto';
 import { ACEError } from './errors.js';
-import { isObj } from './encoding.js';
+import { decodeB64, isObj, toBase64, utf8 } from './encoding.js';
 import { readLimited } from './discovery.js';
 import { checkKey, checkLockName, checkValue, DEFAULT_LOCK_TIMEOUT_MS, lockTimeoutError, MAX_VALUE_BYTES, Mutex, type CoordinatedStore, type StoreData } from './store.js';
 
@@ -19,14 +19,11 @@ export interface EtcdStoreOptions {
 }
 const fail = () => new ACEError('storage_failed', 'replicated store unavailable, changed or lock ownership lost');
 const RESPONSE_LIMIT = Math.floor(MAX_VALUE_BYTES * 1.4 + 1_048_576);
-const b64 = (v: string | Uint8Array) => Buffer.from(v).toString('base64');
+const b64 = (v: string | Uint8Array) => toBase64(typeof v === 'string' ? utf8(v) : v);
 const isU64Decimal = (v: unknown): v is string => typeof v === 'string' && /^[1-9][0-9]{0,19}$/.test(v) && BigInt(v).toString() === v && BigInt(v) <= 18_446_744_073_709_551_615n;
-function bytes(v: unknown): Buffer {
-  if (v === undefined) return Buffer.alloc(0); // protobuf omits empty bytes
-  if (typeof v !== 'string' || v.length > Math.ceil(MAX_VALUE_BYTES / 3) * 4) throw fail();
-  const out = Buffer.from(v, 'base64');
-  if (out.toString('base64') !== v || out.length > MAX_VALUE_BYTES) throw fail();
-  return out;
+function bytes(v: unknown): Uint8Array {
+  if (v === undefined) return new Uint8Array(0); // protobuf omits empty bytes
+  return decodeB64(v, 'storage_failed', 'replicated store bytes', MAX_VALUE_BYTES);
 }
 interface Held { key: string; value: string; lease: string }
 
@@ -92,7 +89,7 @@ export class EtcdStore implements CoordinatedStore {
     const rows = r.kvs as unknown[] | undefined;
     if (!rows?.length) return null;
     if (rows.length !== 1 || !isObj(rows[0]) || rows[0].key !== encoded) { this.#broken = true; throw fail(); }
-    return new Uint8Array(bytes(rows[0].value));
+    return bytes(rows[0].value);
   }
   async #write(held: Held, key: string, value: Uint8Array): Promise<void> {
     await this.#txn(held, { request_put: { key: b64(this.#prefix + checkKey(key)), value: b64(checkValue(value)) } });
@@ -113,7 +110,7 @@ export class EtcdStore implements CoordinatedStore {
       if (rows.length > 1024 || (r.more === true && !rows.length)) throw fail();
       let last: Buffer | undefined;
       for (const row of rows) {
-        if (!isObj(row)) throw fail(); const raw = bytes(row.key), key = raw.toString('utf8');
+        if (!isObj(row)) throw fail(); const raw = Buffer.from(bytes(row.key)), key = raw.toString('utf8');
         if (!key.startsWith(this.#prefix + prefix) || raw.compare(start) < 0 || (last && raw.compare(last) <= 0)) throw fail();
         result.push(checkKey(key.slice(this.#prefix.length))); last = raw;
       }

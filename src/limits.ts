@@ -24,3 +24,12 @@ export const KEM_SEED_SIZE = 32;
 export const KEM_PUBLIC_KEY_SIZE = 1216;
 export const KEM_CIPHERTEXT_SIZE = 1120;
 export const DEFAULT_REPLAY_CAPACITY = 100000;
+
+/** Pairwise MLS wire limits (13-secure-delivery): key packages, Welcome/ciphertext strings, raw engine responses. */
+export const MLS_MAX_KEY_PACKAGE_CHARS = 10_924;
+export const MLS_MAX_MESSAGE_CHARS = 64_000;
+export const MLS_MAX_ENGINE_IO_BYTES = 140_000;
+/** Lifetime of one secure-delivery attempt. */
+export const SECURE_DELIVERY_TTL_SECONDS = 120;
+/** Compact JSON of an execution intent / request body. */
+export const MAX_EXECUTION_JSON_BYTES = 60_000;

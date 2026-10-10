@@ -1,6 +1,6 @@
 /** Durable optional audit infrastructure. Storage must honor ACEStore's atomic, durable writes and exclusive locks. */
 import { ACEError } from './errors.js';
-import { canonicalStateBytes, nowOf, isConversationId, hasExactKeys, isMessageId, wireInt } from './encoding.js';
+import { canonicalStateBytes, nowOf, isConversationId, hasExactKeys, isMessageId, parseStateBytes, wireInt } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import type { ACEIdentity } from './types.js';
 import { withLock, type ACEStore } from './store.js';
@@ -11,7 +11,7 @@ const invalid = (message: string) => new ACEError('invalid_argument', message);
 const corrupt = () => new ACEError('storage_failed', 'audit state is missing, inconsistent or corrupt');
 function decode(b: Uint8Array | null): any {
   if (!b || b.length > 65_536) throw corrupt();
-  try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(b)); } catch { throw corrupt(); }
+  try { return parseStateBytes(b, ''); } catch { throw corrupt(); }
 }
 const { empty, leaf, node, split } = merkle;
 const same = (a: AuditCheckpoint, b: AuditCheckpoint) => auditCheckpointDigest(a) === auditCheckpointDigest(b);
@@ -61,7 +61,8 @@ export class AuditLog {
     if (count === 0) return empty;
     const k = split(count);
     if (count === 1 || count === k * 2) return this.#node(Math.log2(count), start / count);
-    return node(await this.#root(start, k), await this.#root(start + k, count - k));
+    const [left, right] = await Promise.all([this.#root(start, k), this.#root(start + k, count - k)]);
+    return node(left, right);
   }
   async #head(): Promise<AuditCheckpoint> {
     const c = await this.#get('head'); this.#verify(c);
@@ -76,13 +77,14 @@ export class AuditLog {
       nodes.push({ level, index, hash: h });
     }
     let remaining = count + 1, start = 0;
-    const peaks: string[] = [];
+    const reads: Array<Promise<string>> = [];
     while (remaining > 0) {
       let width = 1; while (width * 2 <= remaining) width *= 2;
-      const l = Math.log2(width), i = start / width;
-      peaks.push(nodes.find(n => n.level === l && n.index === i)?.hash ?? await this.#node(l, i));
+      const l = Math.log2(width), i = start / width, own = nodes.find(n => n.level === l && n.index === i);
+      reads.push(own ? Promise.resolve(own.hash) : this.#node(l, i));
       start += width; remaining -= width;
     }
+    const peaks = await Promise.all(reads);
     let root = peaks.pop()!;
     while (peaks.length) root = node(peaks.pop()!, root);
     return { root, nodes };
@@ -130,7 +132,8 @@ export class AuditLog {
   }
   async #checkpoint(size: number, head: AuditCheckpoint): Promise<AuditCheckpoint> {
     if (wireInt(size) === null || size > head.size) throw invalid('invalid checkpoint size');
-    const c = size === head.size ? head : await this.#get(`checkpoints/${size}`);
+    if (size === head.size) return head; // `#recover` verified the head and its root
+    const c = await this.#get(`checkpoints/${size}`);
     this.#verify(c);
     if (c.size !== size || await this.#root(0, size) !== c.root) throw corrupt();
     return c;

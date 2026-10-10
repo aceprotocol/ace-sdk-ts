@@ -4,6 +4,7 @@
 import { bytesToHex, randomBytes } from '@noble/hashes/utils.js';
 import { ACEError } from './errors.js';
 import { bytesEqual, canonicalStateBytes, decodeB64, isACEId, isObj, toBase64 } from './encoding.js';
+import { MLS_MAX_ENGINE_IO_BYTES, MLS_MAX_KEY_PACKAGE_CHARS, MLS_MAX_MESSAGE_CHARS } from './limits.js';
 import { SerialQueue, type CoordinatedStore, type StoreData } from './store.js';
 
 /** The common Rust engine, normally the generated WASM SessionEngine. Trusted local code. */
@@ -59,14 +60,14 @@ export class PairwiseMLS {
   }
   get state(): Readonly<MLSState> { return { ...this.#state }; }
   /** The peer key package must come from a fresh, authenticated ACE handshake. */
-  create(keyPackage: string): Promise<MLSEvent> { return this.#wireStep('create', 'key_package', keyPackage, 10_924); }
+  create(keyPackage: string): Promise<MLSEvent> { return this.#wireStep('create', 'key_package', keyPackage, MLS_MAX_KEY_PACKAGE_CHARS); }
   /** The Welcome must come from the pinned peer in the same authenticated handshake. */
-  join(welcome: string): Promise<MLSEvent> { return this.#wireStep('join', 'welcome', welcome, 64_000); }
+  join(welcome: string): Promise<MLSEvent> { return this.#wireStep('join', 'welcome', welcome, MLS_MAX_MESSAGE_CHARS); }
   send(plaintext: Uint8Array): Promise<MLSEvent> {
     if (!(plaintext instanceof Uint8Array) || plaintext.length > 40_000) return Promise.reject(new MLSError('session_limit'));
     return this.#step({ op: 'send', plaintext: toBase64(plaintext) });
   }
-  receive(message: string): Promise<MLSEvent> { return this.#wireStep('receive', 'message', message, 64_000); }
+  receive(message: string): Promise<MLSEvent> { return this.#wireStep('receive', 'message', message, MLS_MAX_MESSAGE_CHARS); }
   /** Coordinate epoch changes with delivery: past epochs are erased immediately. */
   update(): Promise<MLSEvent> { return this.#step({ op: 'update' }); }
   static plaintext(event: MLSEvent): Uint8Array {
@@ -137,7 +138,7 @@ export class PairwiseMLS {
   }
   static #call(engine: MLSEngine, command: Record<string, unknown>): CoreResponse {
     const raw = engine.execute(encoder.encode(JSON.stringify(command)));
-    if (!(raw instanceof Uint8Array) || raw.length > 140_000) throw new MLSError('invalid_engine_response');
+    if (!(raw instanceof Uint8Array) || raw.length > MLS_MAX_ENGINE_IO_BYTES) throw new MLSError('invalid_engine_response');
     const value: unknown = JSON.parse(text.decode(raw));
     if (!isObj(value) || typeof value.ok !== 'boolean' || !('result' in value)
       || !(value.error === null || typeof value.error === 'string')) throw new MLSError('invalid_engine_response');

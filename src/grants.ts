@@ -4,6 +4,7 @@ import { decodeB64, decodeSignature, encodeSignature, isACEId, isConversationId,
 import { buildSignData, computeACEId, encodePayload, isValidSigningPublicKey, verifySignature } from './signing.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { ACEError } from './errors.js';
+import { MAX_EXECUTION_JSON_BYTES } from './limits.js';
 import { isMessageType, isSigningScheme, type ACEIdentity, type JSONObject, type SignatureEnvelope } from './types.js';
 
 export interface ExecutionIntent {
@@ -40,7 +41,7 @@ export function executionIntentDigest(intent: ExecutionIntent): string {
     }
   }
   depth(intent, 0);
-  if (utf8(JSON.stringify(intent)).length > 60_000) throw bad();
+  if (utf8(JSON.stringify(intent)).length > MAX_EXECUTION_JSON_BYTES) throw bad();
   return intentDigest(intent as unknown as JSONObject);
 }
 function claimsDigest(c: GrantClaims): string {

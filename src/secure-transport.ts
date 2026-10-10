@@ -1,8 +1,8 @@
 /** Authenticated, one-use MLS delivery. Network input always enters through parseMessage. */
 import { bytesToHex, randomBytes } from '@noble/hashes/utils.js';
 import { ACEError } from './errors.js';
-import { OFFLINE_WINDOW_SECONDS } from './limits.js';
-import { canonicalStateBytes, isACEId, hasExactKeys, isMessageId, isObj, nowOf, parseStateBytes, sha256Hex, utf8, wireInt } from './encoding.js';
+import { MLS_MAX_KEY_PACKAGE_CHARS, MLS_MAX_MESSAGE_CHARS, OFFLINE_WINDOW_SECONDS, SECURE_DELIVERY_TTL_SECONDS } from './limits.js';
+import { canonicalStateBytes, isACEId, isConversationId, hasExactKeys, isMessageId, isObj, nowOf, parseEnvelopeJSON, parseStateBytes, sha256Hex, utf8, wireInt } from './encoding.js';
 import { decodeEnvelope, envelopeFingerprint, verifyEnvelopeSignature } from './envelope.js';
 import { createMessage, parseMessage } from './messages.js';
 import { ReplayDetector } from './replay.js';
@@ -13,7 +13,7 @@ import type { ACEIdentity, ACEMessage, JSONObject } from './types.js';
 
 export const SECURE_DELIVERY_TYPE = 'urn:ace:secure-delivery:2';
 export const SECURE_DELIVERY_SCHEMA = sha256Hex('ace.secure-delivery.v2:hello,offer,data,ack;fresh-pairwise-mls;exact-envelope;outcome-receipt;120s');
-const TTL = 120;
+const TTL = SECURE_DELIVERY_TTL_SECONDS;
 const MAX_ACTIVE = 32;
 const MAX_INBOUND_ROWS = 1024;
 /** Expired `secure/in/` rows are never consulted (expired frames fail `#read`), so they are swept lazily. */
@@ -36,15 +36,14 @@ export type SecureAccept = (envelope: Uint8Array) => Promise<SecureOutcome>;
 const REMOTE_CODE = /^[a-z0-9_]{1,64}$/;
 
 function fail(code = 'invalid_delivery_frame'): never { throw new MLSError(code); }
-function hex(value: unknown): value is string { return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value); }
 function frame(value: JSONObject): Frame {
   const extra: Record<string, string[]> = { hello: [], offer: ['nonce', 'keyPackage'], data: ['nonce', 'welcome', 'ciphertext'], ack: ['nonce', 'ciphertext'] };
   if (typeof value.kind !== 'string' || !Object.hasOwn(extra, value.kind)) fail();
-  if (!hasExactKeys(value, ['kind', 'attempt', 'expiresAt', 'messageId', 'digest', ...extra[value.kind]]) || !hex(value.attempt) || !hex(value.digest)
+  if (!hasExactKeys(value, ['kind', 'attempt', 'expiresAt', 'messageId', 'digest', ...extra[value.kind]]) || !isConversationId(value.attempt) || !isConversationId(value.digest)
     || !isMessageId(value.messageId) || wireInt(value.expiresAt) === null) fail();
-  if (value.kind !== 'hello' && !hex(value.nonce)) fail();
+  if (value.kind !== 'hello' && !isConversationId(value.nonce)) fail();
   for (const field of ['keyPackage', 'welcome', 'ciphertext']) {
-    if (field in value && (typeof value[field] !== 'string' || value[field].length > (field === 'keyPackage' ? 10_924 : 64_000))) fail();
+    if (field in value && (typeof value[field] !== 'string' || value[field].length > (field === 'keyPackage' ? MLS_MAX_KEY_PACKAGE_CHARS : MLS_MAX_MESSAGE_CHARS))) fail();
   }
   return value as Frame;
 }
@@ -259,7 +258,7 @@ export class SecureTransport {
         try {
           await active.session.join(f.welcome as string);
           const decoded = PairwiseMLS.plaintext(await active.session.receive(f.ciphertext as string));
-          const envelope = decodeEnvelope(JSON.parse(text.decode(decoded)));
+          const envelope = decodeEnvelope(parseEnvelopeJSON(decoded));
           if (envelope.from !== peer.aceId || envelope.to !== this.identity.getACEId()
             || envelope.messageId !== f.messageId || envelopeFingerprint(envelope) !== f.digest) fail();
           const received: Received = { version: 1, generation, expiresAt: f.expiresAt, peer: peer.aceId, input, envelope, response: null, outcome: null };

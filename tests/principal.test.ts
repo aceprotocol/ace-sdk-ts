@@ -189,6 +189,9 @@ describe('principal records', () => {
     expect(codeOf(() => validatePrincipalRecord(r, other.getSigningPublicKey(), NOW))).toBe('invalid_principal');
     expect(codeOf(() => validatePrincipalRecord(r, subject.getSigningPublicKey(), NOW + 10))).toBe('invalid_principal');
     expect(codeOf(() => validatePrincipalRecord(r, subject.getSigningPublicKey(), NOW + 9))).toBe('ok');
+    // allowExpired skips only rule 10: an expired record passes, a wrong subject still fails
+    expect(codeOf(() => validatePrincipalRecord(r, subject.getSigningPublicKey(), NOW + 10, { allowExpired: true }))).toBe('ok');
+    expect(codeOf(() => validatePrincipalRecord(r, other.getSigningPublicKey(), NOW + 10, { allowExpired: true }))).toBe('invalid_principal');
     const future = await rec(owner, subject, { issuedAt: NOW + 300, expiresAt: NOW + 600 });
     expect(codeOf(() => validatePrincipalRecord(future, subject.getSigningPublicKey(), NOW))).toBe('ok');
     expect(codeOf(() => validatePrincipalRecord(future, subject.getSigningPublicKey(), NOW - 1))).toBe('invalid_principal');

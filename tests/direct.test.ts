@@ -85,7 +85,7 @@ describe('postDirect', () => {
     expect(JSON.parse(seen[0].body)).toEqual({ message: env });
   });
 
-  it('a SecureMailbox answering through receiveDirect refuses a static application envelope: 400 invalid_body, direct_rejected', async () => {
+  it('a SecureMailbox answering through receiveDirect refuses a static application envelope: 400 secure_delivery_required, direct_rejected', async () => {
     const { alice, bob, env } = await envelope();
     await SecureTransport.setPeerAllowed(bob.store, alice.id, true);
     // the engine is never reached: a static packet fails before any MLS work
@@ -100,7 +100,7 @@ describe('postDirect', () => {
       });
     };
     const e = await expectCode(postDirectWith('https://bob.example.com/ace', env, {}, deps()), 'direct_rejected');
-    expect([e.status, e.remoteCode]).toEqual([400, 'invalid_body']);
+    expect([e.status, e.remoteCode]).toEqual([400, 'secure_delivery_required']);
     expect(bob.host.calls).toHaveLength(0);
     expect(await bob.store.list('quarantine/')).toEqual([]); // refused at the boundary, before the Inbox
     await mailbox.close();

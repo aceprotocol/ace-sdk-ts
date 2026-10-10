@@ -1,8 +1,8 @@
 import { ACEError } from './errors.js';
-import { canonicalStateBytes, isObj, isStreamId, parseStateBytes, sha256Hex, utf8 } from './encoding.js';
+import { canonicalStateBytes, isObj, isStreamId, parseEnvelopeJSON, parseStateBytes, sha256Hex, utf8 } from './encoding.js';
 import { decodeEnvelope, envelopeFingerprint } from './envelope.js';
 import { Inbox, type InboxOptions, type ReceiveOutcome } from './inbox.js';
-import { MAX_DIRECT_BODY_BYTES, MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE } from './limits.js';
+import { MAX_DIRECT_BODY_BYTES, MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE, SECURE_DELIVERY_TTL_SECONDS } from './limits.js';
 import type { Outbox } from './outbox.js';
 import { PeerStore } from './peer-store.js';
 import { compareStreamIds, type RelayClient } from './relay.js';
@@ -12,11 +12,6 @@ import { SerialQueue, type ACEStore } from './store.js';
 import type { ACEIdentity, ACEMessage, ParsedMessage } from './types.js';
 import type { VerifiedPeer } from './discovery.js';
 
-const decoder = new TextDecoder('utf-8', { fatal: true });
-function networkJSON(raw: Uint8Array): unknown {
-  try { return JSON.parse(decoder.decode(raw)); }
-  catch (cause) { throw new ACEError('invalid_envelope', 'invalid UTF-8 or JSON envelope', { cause }); }
-}
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 function errorOf(error: unknown): ACEError {
   if (error instanceof ACEError) return error;
@@ -26,6 +21,10 @@ function errorOf(error: unknown): ACEError {
     return new ACEError(permanent.includes(error.code) ? 'invalid_body' : 'storage_failed', error.code);
   }
   return new ACEError('storage_failed', 'secure delivery failed', { cause: error });
+}
+/** The direct-delivery `error` of a permanent frame refusal: the session-core code itself (08 § Receiver). */
+function wireCode(error: unknown, e: ACEError): string {
+  return error instanceof MLSError ? error.code : e.code;
 }
 /**
  * The HTTP answer to a direct-delivery request (08-relay § Direct Delivery). `outcome` is set
@@ -119,10 +118,8 @@ export class SecureMailbox {
     await this.options.store.write(this.#key, canonicalStateBytes({ version: 1, identity: this.options.identity.getACEId(), cursor: streamId }));
     this.#cursor = streamId;
   }
-  async #ingest(raw: Uint8Array): Promise<ReceiveOutcome[]> {
+  async #ingest(envelope: ACEMessage): Promise<ReceiveOutcome[]> {
     this.#check();
-    if (raw.length > MAX_ENVELOPE_BYTES) throw new ACEError('invalid_envelope', 'envelope too large');
-    const envelope = decodeEnvelope(networkJSON(raw));
     // Admission precedes any peer resolution: an unadmitted stranger costs no relay lookup and is never pinned.
     if (!await SecureTransport.isPeerAllowed(this.options.secure.store, envelope.from)) throw new MLSError('delivery_peer_disabled');
     const peer = await this.options.peers.resolve(envelope.from);
@@ -139,21 +136,29 @@ export class SecureMailbox {
     await this.options.relay.send(reply);
     return outcomes;
   }
-  /** `frame` is the permanent frame-level failure (the frame itself was refused), as opposed to an Inbox outcome. */
-  async #receive(raw: Uint8Array, streamId?: string): Promise<{ outcomes: ReceiveOutcome[]; frame: ACEError | null }> {
+  /**
+   * `frame` is the wire code of a permanent frame-level failure (the frame itself was refused), as opposed
+   * to an Inbox outcome. `input` is the relay entry's raw bytes, or an envelope the caller already decoded.
+   */
+  async #receive(input: Uint8Array | ACEMessage, streamId?: string): Promise<{ outcomes: ReceiveOutcome[]; frame: string | null }> {
     return this.#queue.run(async () => {
       this.#check();
       if (streamId && this.#cursor && compareStreamIds(streamId, this.#cursor) <= 0) return { outcomes: [], frame: null };
       let outcomes: ReceiveOutcome[];
-      let frame: ACEError | null = null;
-      try { outcomes = await this.#ingest(raw); }
-      catch (error) {
+      let frame: string | null = null;
+      let envelope: ACEMessage | null = input instanceof Uint8Array ? null : input;
+      try {
+        if (envelope === null) {
+          const raw = input as Uint8Array;
+          if (raw.length > MAX_ENVELOPE_BYTES) throw new ACEError('invalid_envelope', 'envelope too large');
+          envelope = decodeEnvelope(parseEnvelopeJSON(raw));
+        } else if (canonicalStateBytes(envelope).length > MAX_ENVELOPE_BYTES) throw new ACEError('invalid_envelope', 'envelope too large');
+        outcomes = await this.#ingest(envelope);
+      } catch (error) {
         const e = errorOf(error);
         if (e.category !== 'permanent') throw e;
-        let fingerprint: string | null = null;
-        try { fingerprint = envelopeFingerprint(decodeEnvelope(networkJSON(raw))); } catch { /* malformed */ }
-        outcomes = [{ kind: 'quarantined', error: e, fingerprint }];
-        frame = e;
+        outcomes = [{ kind: 'quarantined', error: e, fingerprint: envelope && envelopeFingerprint(envelope) }];
+        frame = wireCode(error, e);
       }
       if (streamId) await this.#advance(streamId);
       return { outcomes, frame };
@@ -166,7 +171,7 @@ export class SecureMailbox {
       const limit = o.limit ?? MAX_INBOX_PAGE;
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_INBOX_PAGE ||
         (o.maxPages !== undefined && (!Number.isSafeInteger(o.maxPages) || o.maxPages < 1))) throw new ACEError('invalid_argument', 'invalid page bounds');
-      const deadline = Date.now() + 120_000;
+      const deadline = Date.now() + SECURE_DELIVERY_TTL_SECONDS * 1000;
       let pages = 0;
       while (!o.signal?.aborted && Date.now() < deadline) {
         // Finish offers already issued before a short-lived tool invocation releases its keys.
@@ -201,17 +206,17 @@ export class SecureMailbox {
     if (body.length > MAX_DIRECT_BODY_BYTES) return fail(413, 'payload_too_large');
     try {
       let wrapper: unknown;
-      try { wrapper = networkJSON(body); } catch { return fail(400, 'invalid_argument'); }
+      try { wrapper = parseEnvelopeJSON(body); } catch { return fail(400, 'invalid_argument'); }
       if (!isObj(wrapper) || !('message' in wrapper)) return fail(400, 'invalid_argument');
       const env = decodeEnvelope(wrapper.message);
-      const { outcomes, frame } = await this.#receive(canonicalStateBytes(env));
+      const { outcomes, frame } = await this.#receive(env);
       // A rejected inner envelope is an accepted frame: the Inbox code reaches the sender inside the receipt.
-      if (frame !== null && outcomes[0]) return { ...fail(400, frame.code), outcome: outcomes[0] };
+      if (frame !== null && outcomes[0]) return { ...fail(400, frame), outcome: outcomes[0] };
       return { status: 200, body: { ok: true, messageId: env.messageId }, ...(outcomes[0] ? { outcome: outcomes[0] } : {}) };
     } catch (error) {
       if (this.#closed) return fail(503, 'internal_error'); // closed meanwhile
       const e = errorOf(error);
-      return e.category === 'permanent' ? fail(400, e.code) : { ...fail(503, e.code), outcome: { kind: 'retryable', error: e } };
+      return e.category === 'permanent' ? fail(400, wireCode(error, e)) : { ...fail(503, e.code), outcome: { kind: 'retryable', error: e } };
     }
   }
   async close(): Promise<void> {
@@ -229,7 +234,10 @@ export class SecureRelayReplies {
   constructor(readonly identity: ACEIdentity, readonly secure: SecureTransport, readonly relay: RelayClient,
     readonly peer: VerifiedPeer, readonly send: (packet: ACEMessage) => Promise<unknown>, since?: string) { this.#cursor = since; }
   async exchange(packet: ACEMessage, expected: SecureRoute): Promise<ACEMessage> {
-    const deadline = Date.now() + 120_000;
+    // Wait no longer than the attempt itself stays valid.
+    const remaining = Math.min(SECURE_DELIVERY_TTL_SECONDS, expected.expiresAt - this.secure.clock());
+    const deadline = Date.now() + Math.max(0, remaining) * 1000;
+    if (Date.now() >= deadline) throw new MLSError('delivery_expired');
     await this.send(packet);
     while (Date.now() < deadline) {
       const page = await this.relay.fetchInbox(this.identity, { since: this.#cursor });
@@ -242,7 +250,7 @@ export class SecureRelayReplies {
           if (route.attempt === expected.attempt && route.kind === expected.kind) return candidate;
         } catch { /* Unrelated/unverified frames cannot select this local pending attempt. */ }
       }
-      if (page.entries.length < MAX_INBOX_PAGE) await pause(1000);
+      if (page.entries.length < MAX_INBOX_PAGE) await pause(Math.min(1000, Math.max(0, deadline - Date.now())));
     }
     throw new MLSError('delivery_expired');
   }

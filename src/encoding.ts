@@ -336,6 +336,15 @@ export function stringifySorted(value: unknown): string {
 
 const stateDecoder = new TextDecoder('utf-8', { fatal: true });
 
+/** Parse untrusted envelope bytes (network or MLS plaintext); any UTF-8 or JSON failure is `invalid_envelope`. */
+export function parseEnvelopeJSON(raw: Uint8Array): unknown {
+  try {
+    return JSON.parse(stateDecoder.decode(raw));
+  } catch (cause) {
+    throw new ACEError('invalid_envelope', 'envelope is not UTF-8 JSON', { cause });
+  }
+}
+
 /** Parse a persisted JSON document; any failure is `storage_failed`. */
 export function parseStateBytes(raw: Uint8Array, what: string): unknown {
   try {

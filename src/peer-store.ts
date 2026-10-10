@@ -1,7 +1,7 @@
 /** Pinned peer bindings with the rollback barrier (02-discovery § Rollback Barrier). */
 
 import { ACEError } from './errors.js';
-import { canonicalStateBytes, isACEId, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
+import { canonicalStateBytes, isACEId, nowOf, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import {
   adoptDecision, isVerifiedPeer, mintPeer,
   verifyPeerRecord, verifyRegistrationFile, type AdoptOutcome, type VerifiedPeer,
@@ -9,7 +9,7 @@ import {
 import { parsePrincipalRecord, samePrincipalClaims, validatePrincipalRecord } from './principal.js';
 import type { RelayClient } from './relay.js';
 import type { ACEStore } from './store.js';
-import type { RegistrationFile } from './types.js';
+import type { PrincipalRecord, RegistrationFile } from './types.js';
 
 export const DEFAULT_PEER_TTL_SECONDS = 86400;
 
@@ -42,6 +42,8 @@ export class PeerStore {
 
   readonly #store: ACEStore;
   readonly #verified = new Map<string, PinRecord>();
+  /** Verified principal horizons, keyed like `#verified` by the stored bytes. */
+  readonly #horizons = new Map<string, PrincipalRecord>();
   readonly #relay: RelayClient | null;
   readonly #ttl: number;
   readonly #clock?: () => number;
@@ -59,7 +61,7 @@ export class PeerStore {
   }
 
   #now(): number {
-    return Math.floor(this.#clock ? this.#clock() : Date.now() / 1000);
+    return nowOf(this.#clock);
   }
 
   /** The pinned binding regardless of TTL, or null. A corrupt record is `storage_failed` (never overwritten). */
@@ -147,15 +149,22 @@ export class PeerStore {
     if (next === undefined) return;
     const key = `principal-horizons/${sha256Hex([peer.aceId, next.account, next.signer.scheme, next.signer.publicKey].join('\0'))}.json`;
     const raw = await this.#store.read(key);
-    let high = null;
+    let high: PrincipalRecord | null = null;
     if (raw !== null) {
-      try {
-        const d = parseStateBytes(raw, key) as Record<string, unknown>;
-        if (d.version !== 1 || d.aceId !== peer.aceId) throw new Error('wrong record');
-        high = parsePrincipalRecord(d.principal);
-        if (high.account !== next.account || high.signer.scheme !== next.signer.scheme || high.signer.publicKey !== next.signer.publicKey) throw new Error('wrong authority');
-        validatePrincipalRecord(high, peer.signingPublicKey, high.issuedAt);
-      } catch { throw new ACEError('storage_failed', `${key}: invalid principal horizon`); }
+      // The key binds aceId, account and signer, so a verified horizon is a pure function of its bytes.
+      const memo = `${key}:${sha256Hex(raw)}`;
+      high = this.#horizons.get(memo) ?? null;
+      if (high === null) {
+        try {
+          const d = parseStateBytes(raw, key) as Record<string, unknown>;
+          if (d.version !== 1 || d.aceId !== peer.aceId) throw new Error('wrong record');
+          high = parsePrincipalRecord(d.principal);
+          if (high.account !== next.account || high.signer.scheme !== next.signer.scheme || high.signer.publicKey !== next.signer.publicKey) throw new Error('wrong authority');
+          validatePrincipalRecord(high, peer.signingPublicKey, high.issuedAt);
+        } catch { throw new ACEError('storage_failed', `${key}: invalid principal horizon`); }
+        if (this.#horizons.size >= VERIFIED_PINS) this.#horizons.delete(this.#horizons.keys().next().value!);
+        this.#horizons.set(memo, high);
+      }
     }
     if (high !== null && (next.issuedAt < high.issuedAt ||
       (next.issuedAt === high.issuedAt && !samePrincipalClaims(next, high)))) {

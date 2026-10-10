@@ -3,7 +3,7 @@
 import bs58 from 'bs58';
 import { ACEError, type ACEErrorCode } from './errors.js';
 import {
-  toBase64, bytesEqual, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, isObj, wireInt,
+  toBase64, bytesEqual, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, isObj, nowOf, wireInt,
 } from './encoding.js';
 import { KEM_PUBLIC_KEY_SIZE, MAX_REGISTRATION_FILE_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import {
@@ -12,7 +12,7 @@ import {
 import { loadHttps, loadLookup, pinnedRequest, type LookupFn } from './pinned-https.js';
 import type { AgentProfile, Capability, PeerRecord, PrincipalRecord, RegistrationFile, SigningScheme } from './types.js';
 import { validateExt } from './ext.js';
-import { isExpiredOnly, parsePrincipalRecord, samePrincipalClaims, validatePrincipalRecord } from './principal.js';
+import { parsePrincipalRecord, samePrincipalClaims, validatePrincipalRecord } from './principal.js';
 import { isSigningScheme } from './types.js';
 
 // --- VerifiedPeer ------------------------------------------------------------------------
@@ -107,6 +107,11 @@ function deepFreeze<T>(v: T): T {
 /** Internal: construct a VerifiedPeer from already-verified fields. */
 export function mintPeer(f: PeerFields): VerifiedPeer {
   return new (VerifiedPeer as unknown as new (t: symbol, f: PeerFields) => VerifiedPeer)(MINT, f);
+}
+
+/** Internal: `peer` with another profile. */
+export function withProfile(peer: VerifiedPeer, profile: AgentProfile | null): VerifiedPeer {
+  return mintPeer({ ...peer, signingPublicKey: peer.signingPublicKey, encryptionPublicKey: peer.encryptionPublicKey, profile });
 }
 
 /** Internal: true for genuine VerifiedPeer instances (not structural look-alikes). */
@@ -221,12 +226,10 @@ export function checkProfilePrincipal(profile: AgentProfile | null, subjectKey: 
  */
 export function dropExpiredPrincipal(profile: AgentProfile | null, subjectKey: Uint8Array, now: number): AgentProfile | null {
   if (profile?.principal === undefined) return profile;
-  if (isExpiredOnly(profile.principal, subjectKey, now)) {
-    const { principal: _p, ...rest } = profile;
-    return Object.keys(rest).length === 0 ? null : rest;
-  }
-  validatePrincipalRecord(profile.principal, subjectKey, now);
-  return profile;
+  // Rules 1-9 fail as `invalid_principal`; a record failing only rule 10 is dropped.
+  if (validatePrincipalRecord(profile.principal, subjectKey, now, { allowExpired: true }).expiresAt > now) return profile;
+  const { principal: _p, ...rest } = profile;
+  return Object.keys(rest).length === 0 ? null : rest;
 }
 
 /**
@@ -258,7 +261,7 @@ export function verifyPeerRecord(record: unknown, opts: { clock?: () => number }
       throw new ACEError(code, e instanceof ACEError ? e.message : 'invalid profile');
     }
   }
-  profile = dropExpiredPrincipal(profile, signingKey, Math.floor(opts.clock ? opts.clock() : Date.now() / 1000));
+  profile = dropExpiredPrincipal(profile, signingKey, nowOf(opts.clock));
   return mintPeer({
     aceId, scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey, registeredAt,
     registrationSignature: signature as string, source: 'relay', profile,
@@ -361,7 +364,7 @@ export function verifyRegistrationFile(
   if (!verifySignature(bindingSignData(r.id, registeredAt, s.encryptionPublicKey, toBase64(signingKey)), sig, s.scheme, signingKey)) {
     throw new ACEError(code, 'registrationSignature does not verify');
   }
-  const now = Math.floor(opts.clock ? opts.clock() : Date.now() / 1000);
+  const now = nowOf(opts.clock);
   // The file supplies `profile.ext` and `profile.principal` (02 § Rollback Barrier, registration-file merge).
   const supplied: AgentProfile = {};
   if (r.ext !== undefined) supplied.ext = r.ext;
@@ -380,19 +383,21 @@ export type AdoptOutcome = 'adopted' | 'unchanged' | 'rotated';
 const sameAuthorityDomain = (a: PrincipalRecord, b: PrincipalRecord) =>
   a.account === b.account && a.signer.scheme === b.signer.scheme && a.signer.publicKey === b.signer.publicKey;
 
+/** An expired cached principal is dropped (R-P35). */
+const livePrincipal = (p: PrincipalRecord | undefined, now: number) => (p !== undefined && p.expiresAt > now ? p : undefined);
+
 /**
- * Principal monotonicity (R-P36): within one (subject, account, signer) authority domain, `next` replaces the unexpired
- * cached principal only when it is strictly newer (`issuedAt`) or claim-identical at the same `issuedAt`. Another
- * domain's `next` replaces it only when `crossDomain` (a relay record; never a registration file, 02). Expired cached
- * ones are dropped first (R-P35).
+ * Principal monotonicity (R-P36): within one (subject, account, signer) authority domain, `next` replaces the live
+ * cached principal only when it is strictly newer (`issuedAt`) or claim-identical at the same `issuedAt`. A relay
+ * record also clears it when absent and replaces it from another domain; a registration file never does (02).
  */
 function pickPrincipal(
-  cached: PrincipalRecord | undefined, next: PrincipalRecord | undefined, now: number, o: { absentClears?: boolean; crossDomain: boolean },
+  cached: PrincipalRecord | undefined, next: PrincipalRecord | undefined, now: number, relay: boolean,
 ): PrincipalRecord | undefined {
-  const old = cached !== undefined && cached.expiresAt > now ? cached : undefined;
-  if (next === undefined) return o.absentClears ? undefined : old;
+  const old = livePrincipal(cached, now);
+  if (next === undefined) return relay ? undefined : old;
   if (old === undefined) return next;
-  if (!sameAuthorityDomain(old, next)) return o.crossDomain ? next : old;
+  if (!sameAuthorityDomain(old, next)) return relay ? next : old;
   if (next.issuedAt > old.issuedAt || (next.issuedAt === old.issuedAt && samePrincipalClaims(next, old))) return next;
   return old;
 }
@@ -408,13 +413,13 @@ function fileProfile(cached: AgentProfile | null, cand: AgentProfile | null, now
   const { principal: _a, ...base } = cached ?? {};
   const { principal: _b, ...supplied } = cand ?? {};
   const merged = cached === null && cand === null ? null : { ...base, ...supplied };
-  return withPrincipal(merged, pickPrincipal(cached?.principal, cand?.principal, now, { crossDomain: false }));
+  return withPrincipal(merged, pickPrincipal(cached?.principal, cand?.principal, now, false));
 }
 
 /** Relay (signed) merge: replaces the profile only when not older than the pin; an older record keeps it (R-P36). */
 function relayProfile(pin: VerifiedPeer, candidate: VerifiedPeer, now: number): AgentProfile | null {
-  if (candidate.registeredAt < pin.registeredAt) return withPrincipal(pin.profile, pickPrincipal(pin.profile?.principal, undefined, now, { crossDomain: true }));
-  return withPrincipal(candidate.profile, pickPrincipal(pin.profile?.principal, candidate.profile?.principal, now, { absentClears: true, crossDomain: true }));
+  if (candidate.registeredAt < pin.registeredAt) return withPrincipal(pin.profile, livePrincipal(pin.profile?.principal, now));
+  return withPrincipal(candidate.profile, pickPrincipal(pin.profile?.principal, candidate.profile?.principal, now, true));
 }
 
 /**
@@ -431,26 +436,10 @@ export function adoptDecision(pin: VerifiedPeer | null, candidate: VerifiedPeer,
   // A rotation merges the profile like any kept binding: a registration file never removes a principal (02).
   const profile = candidate.source === 'registration' ? fileProfile(pin.profile, candidate.profile, now) : relayProfile(pin, candidate, now);
   if (bytesEqual(pin.encryptionPublicKey, candidate.encryptionPublicKey)) {
-    const newer = candidate.registeredAt > pin.registeredAt ? candidate : pin;
-    return {
-      peer: mintPeer({
-        aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
-        encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
-        registrationSignature: newer.registrationSignature, source: newer.source, profile,
-      }),
-      outcome: 'unchanged',
-    };
+    // Same binding keys: the newer record's registration fields with the merged profile.
+    return { peer: withProfile(candidate.registeredAt > pin.registeredAt ? candidate : pin, profile), outcome: 'unchanged' };
   }
-  if (candidate.registeredAt > pin.registeredAt) {
-    return {
-      peer: mintPeer({
-        aceId: candidate.aceId, scheme: candidate.scheme, signingPublicKey: candidate.signingPublicKey,
-        encryptionPublicKey: candidate.encryptionPublicKey, registeredAt: candidate.registeredAt,
-        registrationSignature: candidate.registrationSignature, source: candidate.source, profile,
-      }),
-      outcome: 'rotated',
-    };
-  }
+  if (candidate.registeredAt > pin.registeredAt) return { peer: withProfile(candidate, profile), outcome: 'rotated' };
   throw new ACEError('stale_peer_binding', 'a different encryption key requires a newer registeredAt');
 }
 

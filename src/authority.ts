@@ -1,7 +1,7 @@
 /** All executors for a resource must reach the SAME durable authority state. */
 import { ACEError } from './errors.js';
 import { intentDigest } from './intent.js';
-import { canonicalStateBytes, nowOf, isACEId, isConversationId, hasExactKeys, isMessageId, isObj, sha256Hex, toBase64, wireInt } from './encoding.js';
+import { canonicalStateBytes, nowOf, isACEId, isConversationId, hasExactKeys, isMessageId, isObj, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { isMessageType, type JSONObject } from './types.js';
 import type { CoordinatedStore, StoreData } from './store.js';
@@ -29,7 +29,7 @@ function usage(value: unknown): asserts value is ResourceUsage {
 const same = (a: unknown, b: unknown) => intentDigest(a as JSONObject) === intentDigest(b as JSONObject);
 function decode(b: Uint8Array | null): unknown {
   if (!b || b.length > 1_048_576) throw corrupt();
-  try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(b)); } catch { throw corrupt(); }
+  try { return parseStateBytes(b, ''); } catch { throw corrupt(); }
 }
 function subtract(budget: ResourceUsage, charges: ResourceUsage): ResourceUsage {
   const next = { ...budget };

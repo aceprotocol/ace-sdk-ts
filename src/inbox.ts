@@ -2,8 +2,8 @@
 
 import { ACEError, errorDetail } from './errors.js';
 import {
-  bytesEqual, canonicalStateBytes, codePointLength, isACEId, isConversationId, isMessageId, isObj, isThreadId, pairKey,
-  parseStateBytes, wireInt,
+  bytesEqual, canonicalStateBytes, codePointLength, isACEId, isConversationId, isMessageId, isObj, isThreadId, nowOf, pairKey,
+  parseEnvelopeJSON, parseStateBytes, wireInt,
 } from './encoding.js';
 import { computeConversationId } from './encryption.js';
 import { decodeSigningKey, type VerifiedPeer } from './discovery.js';
@@ -81,7 +81,7 @@ export function inboxPrincipalFromOwnRecord(
   if (record === undefined || record === null) return { principal: undefined };
   let own: PrincipalRecord;
   try {
-    own = validatePrincipalRecord(record, identity.getSigningPublicKey(), opts.now ?? Math.floor(Date.now() / 1000));
+    own = validatePrincipalRecord(record, identity.getSigningPublicKey(), opts.now ?? nowOf());
   } catch (err) {
     // An ACEError message is already `<code>: <detail>`.
     const warning = err instanceof ACEError ? err.message : `invalid_principal: ${err instanceof Error ? err.message : String(err)}`;
@@ -139,14 +139,13 @@ const QUARANTINE_CAP = 1000;
 const QUARANTINE_FLOOR = 900;
 /** Commits between writes of replay.json; the delivery records journal them in between. */
 const REPLAY_SNAPSHOT_EVERY = 1024;
-const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
 
 function deliveryKey(from: string, messageId: string): string {
   return `deliveries/${pairKey(from, messageId)}.json`;
 }
 
-function asError(e: unknown, code: 'storage_failed' | 'identity_unavailable', msg: string): ACEError {
-  return e instanceof ACEError ? e : new ACEError(code, msg, { cause: e });
+function asError(e: unknown, msg: string): ACEError {
+  return e instanceof ACEError ? e : new ACEError('storage_failed', msg, { cause: e });
 }
 
 function encodeSnapshot(s: ThreadSnapshot): Record<string, unknown> {
@@ -182,7 +181,6 @@ export class Inbox {
   readonly #queue = new SerialQueue();
   readonly #releaseReceive: () => Promise<void>;
   #replay: ReplayDetector;
-  readonly #principal: PrincipalOption | null;
   /** The step-7 context, without `refreshSender`: the Inbox refreshes the sender itself (`#refreshPrincipalSender`). */
   readonly #principalCtx: PrincipalContext | undefined;
   readonly #commerce: boolean;
@@ -203,7 +201,6 @@ export class Inbox {
     schemas: ReadonlyMap<string, SchemaValidator>,
   ) {
     this.#identity = o.identity;
-    this.#principal = principal;
     this.#commerce = o.commerce === true;
     this.#schemas = schemas;
     this.#store = o.store;
@@ -241,7 +238,7 @@ export class Inbox {
     const schemas = installedSchemas(o.schemas);
     const release = await o.store.lock('receive', { timeoutMs: 0 });
     try {
-      const now = Math.floor(o.clock ? o.clock() : Date.now() / 1000);
+      const now = nowOf(o.clock);
       const threads = new ThreadRecords({ store: o.store, localAceId: local, clock: o.clock });
       const replay = await Inbox.#loadReplay(o.store, threads, capacity, now, offline, o.clock);
       const inbox = new Inbox(o, release, replay, principal, schemas);
@@ -281,7 +278,7 @@ export class Inbox {
   }
 
   #now(): number {
-    return Math.floor(this.#clock ? this.#clock() : Date.now() / 1000);
+    return nowOf(this.#clock);
   }
 
   #floor(): number {
@@ -347,29 +344,19 @@ export class Inbox {
 
   // --- receive ---
 
-  async #receive(raw: Uint8Array): Promise<ReceiveOutcome> {
-    this.#checkOpen();
-    if (this.#failed) return { kind: 'retryable', error: new ACEError('storage_failed', 'inbox is in a failed state; close and reopen to recover') };
-    return this.#process(raw);
-  }
-
   #fail(e: unknown): ReceiveOutcome {
-    this.#failed = asError(e, 'storage_failed', 'storage failed');
+    this.#failed = asError(e, 'storage failed');
     return { kind: 'retryable', error: this.#failed };
   }
 
-  async #process(raw: Uint8Array): Promise<ReceiveOutcome> {
+  async #receive(raw: Uint8Array): Promise<ReceiveOutcome> {
+    this.#checkOpen();
+    if (this.#failed) return { kind: 'retryable', error: new ACEError('storage_failed', 'inbox is in a failed state; close and reopen to recover') };
     // 1. decode
     let env: ACEMessage;
     try {
       if (raw.length > MAX_ENVELOPE_BYTES) throw new ACEError('invalid_envelope', `message exceeds ${MAX_ENVELOPE_BYTES} bytes`);
-      let json: unknown;
-      try {
-        json = JSON.parse(strictUtf8.decode(raw));
-      } catch {
-        throw new ACEError('invalid_envelope', 'message is not UTF-8 JSON');
-      }
-      env = decodeEnvelope(json);
+      env = decodeEnvelope(parseEnvelopeJSON(raw));
     } catch (e) {
       return { kind: 'quarantined', error: e as ACEError, fingerprint: null };
     }
@@ -377,7 +364,7 @@ export class Inbox {
       try {
         return { kind: 'quarantined', error, fingerprint: await this.#writeQuarantine(env, error) };
       } catch (e) {
-        return { kind: 'retryable', error: asError(e, 'storage_failed', 'quarantine write failed') };
+        return { kind: 'retryable', error: asError(e, 'quarantine write failed') };
       }
     };
     // 2. resolve the sender (before taking `threads`)
@@ -398,21 +385,11 @@ export class Inbox {
     try {
       existing = await this.#readDelivery(dkey);
     } catch (e) {
-      return { kind: 'retryable', error: asError(e, 'storage_failed', 'delivery read failed') };
+      return { kind: 'retryable', error: asError(e, 'delivery read failed') };
     }
     if (existing !== null) {
       if (existing.status !== 'pending') return { kind: 'duplicate', from: env.from, messageId: env.messageId };
-      try {
-        await this.#onMessage(existing.message);
-      } catch (e) {
-        return { kind: 'retryable', error: new ACEError('handler_failed', 'onMessage failed', { cause: e }) };
-      }
-      try {
-        await this.#ack(dkey, existing);
-      } catch (e) {
-        return this.#fail(e);
-      }
-      return { kind: 'delivered', message: existing.message };
+      return this.#handOver(dkey, existing);
     }
     // Steps 7 and 9 read the live seen store; it is written only at the commit point below.
     let verified = false;
@@ -433,7 +410,7 @@ export class Inbox {
           try {
             await this.#store.write(REPLAY_KEY, canonicalStateBytes(tr.exportState()));
           } catch (e2) {
-            return { kind: 'retryable', error: asError(e2, 'storage_failed', 'replay write failed') };
+            return { kind: 'retryable', error: asError(e2, 'replay write failed') };
           }
           this.#replay = tr;
           this.#replayDirty = 0;
@@ -451,7 +428,7 @@ export class Inbox {
       try { applySchema(validator, parsed); } catch (e) { return rejected(e); }
     }
     // Authentication/decryption precedes profile selection. No application metadata is public.
-    if (this.#principal !== null && isPrincipalType(parsed.type)) {
+    if (this.#principalCtx !== undefined && isPrincipalType(parsed.type)) {
       try { peer = await this.#refreshPrincipalSender(peer, this.#now()); }
       catch (e) {
         const err = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'peer refresh failed', { cause: e });
@@ -468,7 +445,7 @@ export class Inbox {
         if (economic) record = await this.#threads.loadRecord(env.conversationId, parsed.threadId!);
         machine = restoreMachine(this.#identity.getACEId(), record?.snapshot ?? null);
       } catch (e) {
-        return { kind: 'retryable', error: asError(e, 'storage_failed', 'thread load failed') };
+        return { kind: 'retryable', error: asError(e, 'thread load failed') };
       }
       try {
         if (economic) {
@@ -485,7 +462,7 @@ export class Inbox {
       try {
         await this.#writeDelivery(dkey, delivery); // 7.1 commit point
       } catch (e) {
-        return { kind: 'retryable', error: asError(e, 'storage_failed', 'delivery write failed') };
+        return { kind: 'retryable', error: asError(e, 'delivery write failed') };
       }
       try {
         // 7.3 in memory; the record just written journals it until the next replay.json
@@ -510,7 +487,7 @@ export class Inbox {
       try {
         release = await this.#store.lock(lockName);
       } catch (e) {
-        return { kind: 'retryable', error: asError(e, 'storage_failed', `${lockName} lock failed`) };
+        return { kind: 'retryable', error: asError(e, `${lockName} lock failed`) };
       }
       try {
         committed = await run();
@@ -522,17 +499,22 @@ export class Inbox {
       }
     }
     if ('kind' in committed) return committed;
+    return this.#handOver(dkey, committed);
+  }
+
+  /** 7.4 hand over, then 7.5 ack. */
+  async #handOver(dkey: string, d: DeliveryRecord): Promise<ReceiveOutcome> {
     try {
-      await this.#onMessage(committed.message); // 7.4
+      await this.#onMessage(d.message);
     } catch (e) {
       return { kind: 'retryable', error: new ACEError('handler_failed', 'onMessage failed', { cause: e }) };
     }
     try {
-      await this.#ack(dkey, committed); // 7.5
+      await this.#ack(dkey, d);
     } catch (e) {
       return this.#fail(e);
     }
-    return { kind: 'delivered', message: committed.message };
+    return { kind: 'delivered', message: d.message };
   }
 
   // --- records ---

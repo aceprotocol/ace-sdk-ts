@@ -2,7 +2,7 @@
 
 import {
   CONTROL_CHAR_RE, MAX_SAFE_INTEGER, canonicalStateBytes, codePointLength, decodeB64, decodeSignature, encodeSignature, isACEId,
-  isConversationId, isMessageId, isObj, pairKey, parseStateBytes, toBase64, wireInt,
+  isConversationId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, toBase64, wireInt,
 } from './encoding.js';
 import { ACEError } from './errors.js';
 
@@ -125,39 +125,21 @@ function checkFields(r: PrincipalRecord, now: number): Uint8Array {
 }
 
 /**
- * 09 § Validation, rules 1-10 in order; every failure is `invalid_principal`. `subjectSigningPublicKey` is the key
- * the caller has verified, never the record's.
+ * 09 § Validation, rules 1-10 in order; every failure is `invalid_principal`. `allowExpired` skips only rule 10
+ * (expiry), so a caller can tell an expired-only record from an invalid one (R-P40). `subjectSigningPublicKey` is
+ * the key the caller has verified, never the record's.
  */
-export function validatePrincipalRecord(record: unknown, subjectSigningPublicKey: Uint8Array, now: number): PrincipalRecord {
+export function validatePrincipalRecord(
+  record: unknown, subjectSigningPublicKey: Uint8Array, now: number, o: { allowExpired?: boolean } = {},
+): PrincipalRecord {
   const r = parsePrincipalRecord(record); // 1
   const signerKey = checkFields(r, now); // 2-7
   const sig = decodeSignature(r.signature, r.signer.scheme, 'invalid_principal'); // 8
   if (!verifySignature(principalSignData(r, subjectSigningPublicKey), sig, r.signer.scheme, signerKey)) { // 9
     throw bad('principal.signature does not verify for this subject');
   }
-  if (r.expiresAt <= now) throw bad('principal record has expired'); // 10
+  if (r.expiresAt <= now && !o.allowExpired) throw bad('principal record has expired'); // 10
   return r;
-}
-
-/**
- * R-P40: true when `record` fails `validatePrincipalRecord` at `now` only at the expiry step (rule 10): rules 1-9 pass
- * (evaluated at `expiresAt - 1`, which no rule other than 10 and the future-`issuedAt` check depends on) and
- * `expiresAt <= now`. Any other failure, or a valid record, is false.
- */
-export function isExpiredOnly(record: unknown, subjectSigningPublicKey: Uint8Array, now: number): boolean {
-  let r: PrincipalRecord;
-  try {
-    r = parsePrincipalRecord(record);
-  } catch {
-    return false;
-  }
-  if (!(r.expiresAt <= now)) return false;
-  try {
-    validatePrincipalRecord(r, subjectSigningPublicKey, r.expiresAt - 1);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -176,7 +158,7 @@ export async function createPrincipalRecord(signer: PrincipalSigner, o: {
   if (!Array.isArray(o.roles) || o.roles.some((r) => !(PRINCIPAL_ROLES as readonly unknown[]).includes(r))) {
     throw new ACEError('invalid_argument', "roles must contain only 'controller' and 'delegate'");
   }
-  const issuedAt = o.issuedAt ?? Math.floor(Date.now() / 1000);
+  const issuedAt = o.issuedAt ?? nowOf();
   const draft: PrincipalRecord = {
     account: o.account,
     roles: PRINCIPAL_ROLES.filter((r) => o.roles.includes(r)),
