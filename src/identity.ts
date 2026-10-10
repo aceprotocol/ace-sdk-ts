@@ -58,12 +58,13 @@ export class SoftwareIdentity implements ACEIdentity {
     return new SoftwareIdentity(scheme, signing, generateKemSeed());
   }
 
-  static fromExport(data: SoftwareIdentityExport): SoftwareIdentity {
+  static fromExport(data: unknown): SoftwareIdentity {
     if (typeof data !== 'object' || data === null) throw new ACEError('invalid_argument', 'export must be an object');
+    const e = data as { [K in keyof SoftwareIdentityExport]?: unknown };
     return new SoftwareIdentity(
-      data.scheme,
-      decodeB64(data.signingPrivateKey, 'invalid_key', 'signingPrivateKey'),
-      decodeB64(data.encryptionPrivateKey, 'invalid_key', 'encryptionPrivateKey'),
+      e.scheme as SigningScheme, // checked by the constructor
+      decodeB64(e.signingPrivateKey, 'invalid_key', 'signingPrivateKey'),
+      decodeB64(e.encryptionPrivateKey, 'invalid_key', 'encryptionPrivateKey'),
     );
   }
 
