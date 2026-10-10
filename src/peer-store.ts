@@ -111,6 +111,8 @@ export class PeerStore {
     const release = await this.#store.lock('peers');
     try {
       const pin = await this.#load(peer.aceId, false);
+      // Backfill the horizon of a pin cached before horizons existed, so a later strip cannot erase it.
+      if (pin?.peer.principal !== undefined) await this.#checkPrincipalHorizon(pin.peer);
       const now = this.#now();
       const decision = adoptDecision(pin?.peer ?? null, peer, now);
       await this.#checkPrincipalHorizon(decision.peer);

@@ -421,19 +421,29 @@ export function adoptDecision(pin: VerifiedPeer | null, candidate: VerifiedPeer,
   if (pin.aceId !== candidate.aceId || !bytesEqual(pin.signingPublicKey, candidate.signingPublicKey) || pin.scheme !== candidate.scheme) {
     throw new ACEError('invalid_peer', 'signing key or scheme differs from the pinned binding');
   }
+  // A rotation merges the profile like any kept binding: a registration file never removes a principal (02).
+  const profile = candidate.source === 'registration' ? fileProfile(pin.profile, candidate.profile, now) : relayProfile(pin, candidate, now);
   if (bytesEqual(pin.encryptionPublicKey, candidate.encryptionPublicKey)) {
     const newer = candidate.registeredAt > pin.registeredAt ? candidate : pin;
     return {
       peer: mintPeer({
         aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
         encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
-        registrationSignature: newer.registrationSignature, source: newer.source,
-        profile: candidate.source === 'registration' ? fileProfile(pin.profile, candidate.profile, now) : relayProfile(pin, candidate, now),
+        registrationSignature: newer.registrationSignature, source: newer.source, profile,
       }),
       outcome: 'unchanged',
     };
   }
-  if (candidate.registeredAt > pin.registeredAt) return { peer: candidate, outcome: 'rotated' };
+  if (candidate.registeredAt > pin.registeredAt) {
+    return {
+      peer: mintPeer({
+        aceId: candidate.aceId, scheme: candidate.scheme, signingPublicKey: candidate.signingPublicKey,
+        encryptionPublicKey: candidate.encryptionPublicKey, registeredAt: candidate.registeredAt,
+        registrationSignature: candidate.registrationSignature, source: candidate.source, profile,
+      }),
+      outcome: 'rotated',
+    };
+  }
   throw new ACEError('stale_peer_binding', 'a different encryption key requires a newer registeredAt');
 }
 

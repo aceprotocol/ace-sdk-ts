@@ -1148,3 +1148,33 @@ describe('principal pipeline', () => {
     expect(heldAtLookup).toEqual([0]);
   });
 });
+
+describe('principal recovery replays the account rules', () => {
+  it('a decision delivered as data never fills requests/ when the Inbox reopens with a principal', async () => {
+    const { owner, a, b } = await pairP(); // b is a delegate, not a controller
+    const ib = await openP(b, { principal: undefined });
+    const ia0 = await openP(a, { principal: undefined });
+    const { p: req } = await sendP(a, ib, b, 'request', { action: 'pay', summary: 's' }, 1);
+    const d = await sendP(b, ia0, a, 'decision', { requestId: req.message.messageId, outcome: 'approve' }, 1);
+    expect(d.out.kind).toBe('delivered');
+    await ia0.close();
+    const ia1 = await openP(a, { owner });
+    expect((await loadRequestRecord(a.store, req.message.conversationId, req.message.messageId))!.decision).toBeNull();
+    await ia1.close(); await ib.close();
+  });
+
+  it('two data-only decisions for one request do not make open() with a principal fail', async () => {
+    const { owner, a, b } = await pairP({ rolesB: ['controller'] });
+    const ib = await openP(b, { principal: undefined });
+    const ia0 = await openP(a, { principal: undefined });
+    const { p: req } = await sendP(a, ib, b, 'request', { action: 'pay', summary: 's' }, 1);
+    await sendP(b, ia0, a, 'decision', { requestId: req.message.messageId, outcome: 'deny' }, 1);
+    b.clock.t += 1;
+    await sendP(b, ia0, a, 'decision', { requestId: req.message.messageId, outcome: 'approve' }, 2);
+    await ia0.close();
+    const ia1 = await openP(a, { owner });
+    // the first decision passes the rules at the replayed processing; the second finds the request decided
+    expect((await loadRequestRecord(a.store, req.message.conversationId, req.message.messageId))!.decision!.outcome).toBe('deny');
+    await ia1.close(); await ib.close();
+  });
+});

@@ -609,13 +609,25 @@ export class Inbox {
       else records.push([key, d]);
     }
     await this.#threads.withLock(() => repairThreads(this.#threads, records));
-    // 1a: a decision's requests/ fill (no-op when already filled). A fill that throws bad_reference or
-    // wrong_principal (only possible with a corrupted store: step 7 and the fill run under one lock) fails open().
-    const decisions = records.filter(([, d]) => this.#principal !== null && d.message.type === 'decision');
+    // 1a: a decision's requests/ fill is a replayed processing (09 step 7 "at receipt"): the same-account rules run
+    // again on the pinned sender. A record that fails them was never accepted under this policy (e.g. it was
+    // delivered as data while no principal was installed, or the request is already decided) and changes nothing.
+    const ctx = this.#principalCtx;
+    const decisions = ctx === undefined ? [] : records.filter(([, d]) => d.message.type === 'decision');
     if (decisions.length > 0) {
       const release = await this.#store.lock('requests');
       try {
-        for (const [, d] of decisions) await fillDecision(this.#store, d.message);
+        for (const [, d] of decisions) {
+          const sender = await this.#peers.get(d.message.from);
+          if (sender === null) continue;
+          try {
+            await checkPrincipal(d.message, sender, ctx!, this.#now());
+          } catch (e) {
+            if (e instanceof ACEError && (e.code === 'wrong_principal' || e.code === 'bad_reference')) continue;
+            throw e;
+          }
+          await fillDecision(this.#store, d.message);
+        }
       } finally {
         await release();
       }
