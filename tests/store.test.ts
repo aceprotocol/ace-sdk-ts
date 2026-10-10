@@ -1,6 +1,8 @@
 // ACEStore: MemoryStore and FileStore semantics, lock protocol.
-import { mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { tmpdir, hostname } from 'node:os';
+import { mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MemoryStore, type ACEStore } from '../src/index.js';
@@ -45,7 +47,7 @@ describe.each(backends)('%s store', (_name, make) => {
 
   it('rejects invalid keys', async () => {
     const s = make();
-    for (const k of ['', '/a', 'a/', 'A.json', '../x', 'a//b', '.hidden', 'x'.repeat(201), 'a b']) {
+    for (const k of ['', '/a', 'a/', 'A.json', '../x', 'a//b', '.hidden', 'x'.repeat(201), 'a b', 'a\n', 'a\r', 'a\u2028', 'a\u2029']) {
       await expectCode(s.write(k, enc('x')), 'invalid_argument');
       await expectCode(s.read(k), 'invalid_argument');
     }
@@ -55,7 +57,7 @@ describe.each(backends)('%s store', (_name, make) => {
     const s = make();
     await expectCode(s.write('big.json', new Uint8Array(64 * 1024 * 1024 + 1)), 'invalid_argument');
     expect(await s.read('big.json')).toBeNull();
-    for (const name of ['', 'a.b', 'a/b', 'A', '-a', '_a', 'a'.repeat(65), 'a b']) await expectCode(s.lock(name), 'invalid_argument');
+    for (const name of ['', 'a.b', 'a/b', 'A', '-a', '_a', 'a'.repeat(65), 'a b', 'a\n', 'a\r', 'a\u2028', 'a\u2029']) await expectCode(s.lock(name), 'invalid_argument');
     for (const name of ['a', 'a-b_c', '0', 'a'.repeat(64)]) await (await s.lock(name, { timeoutMs: 0 }))();
   });
 
@@ -94,23 +96,38 @@ describe('FileStore', () => {
     expect((await s.list('')).filter((k) => k.includes('.tmp-'))).toEqual([]);
   });
 
-  it('lock files: content, release, stale takeover, cross-instance exclusion', async () => {
-    const root = join(tmp(), 'root');
-    const a = new FileStore(root);
-    const b = new FileStore(root);
-    const release = await a.lock('peers');
-    const info = JSON.parse(readFileSync(join(root, 'locks/peers.lock'), 'utf8'));
-    expect(Object.keys(info).sort()).toEqual(['createdAt', 'host', 'pid']);
-    expect(info.pid).toBe(process.pid);
+  it('keeps permanent lock inodes and serializes instances', async () => {
+    const root = join(tmp(), 'root'), a = new FileStore(root), b = new FileStore(root);
+    const release = await a.lock('peers'), path = join(root, 'locks/peers.lock');
+    const inode = statSync(path).ino;
     await expectCode(b.lock('peers', { timeoutMs: 80 }), 'lock_busy');
     await release();
-    expect(() => statSync(join(root, 'locks/peers.lock'))).toThrow();
-    // a lock left by a dead process on this host is taken over
-    writeFileSync(join(root, 'locks/receive.lock'), JSON.stringify({ createdAt: 1, host: hostname(), pid: 2 ** 22 + 12345 }));
-    await (await b.lock('receive', { timeoutMs: 0 }))();
-    // a live foreign lock is respected
-    writeFileSync(join(root, 'locks/receive.lock'), JSON.stringify({ createdAt: 1, host: 'other-host', pid: 1 }));
-    await expectCode(b.lock('receive', { timeoutMs: 0 }), 'receiver_busy');
+    await (await b.lock('peers', { timeoutMs: 0 }))();
+    expect(statSync(path).ino).toBe(inode);
+    expect(await a.list('')).toEqual([]);
+  });
+
+  it('releases a kernel lock on SIGKILL without deleting its inode', async () => {
+    const root = join(tmp(), 'root'), store = new FileStore(root);
+    await (await store.lock('receive'))();
+    const path = join(root, 'locks/receive.lock'), inode = statSync(path).ino;
+    const child = spawn(process.execPath, ['-e', `
+      const fs = require('node:fs'), ext = require('fs-ext');
+      const fd = fs.openSync(process.argv[1], 'r+');
+      ext.flockSync(fd, 'exnb'); process.stdout.write('ready'); setInterval(() => {}, 1000);
+    `, path], { stdio: ['ignore', 'pipe', 'inherit'] });
+    try {
+      await once(child.stdout!, 'data');
+      await expectCode(store.lock('receive', { timeoutMs: 80 }), 'receiver_busy');
+      const exit = once(child, 'exit'); child.kill('SIGKILL'); await exit;
+      // Several waiters recover the same inode; there is no stale-file deletion race.
+      let active = 0;
+      await Promise.all(Array.from({ length: 8 }, async () => {
+        const release = await new FileStore(root).lock('receive');
+        expect(++active).toBe(1); await new Promise(r => setTimeout(r, 2)); active--; await release();
+      }));
+      expect(statSync(path).ino).toBe(inode);
+    } finally { child.kill('SIGKILL'); }
   });
 
   it('persisted files are portable across instances', async () => {

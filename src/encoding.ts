@@ -44,22 +44,22 @@ export function pairKey(a: string, b: string): string {
 
 /** Relay stream ID `<ms>-<seq>`, each a u64 in decimal (08-relay). */
 export function isStreamId(value: unknown): value is string {
-  return typeof value === 'string' && STREAM_ID_RE.test(value);
+  return typeof value === 'string' && STREAM_ID_RE.exec(value)?.[0] === value;
 }
 
 /** `ace:sha256:<64 lowercase hex>`. */
 export function isACEId(value: unknown): value is string {
-  return typeof value === 'string' && ACE_ID_RE.test(value);
+  return typeof value === 'string' && ACE_ID_RE.exec(value)?.[0] === value;
 }
 
 /** Lowercase UUIDv4. */
 export function isMessageId(value: unknown): value is string {
-  return typeof value === 'string' && MESSAGE_ID_RE.test(value);
+  return typeof value === 'string' && MESSAGE_ID_RE.exec(value)?.[0] === value;
 }
 
 /** 64 lowercase hex characters. */
 export function isConversationId(value: unknown): value is string {
-  return typeof value === 'string' && CONVERSATION_ID_RE.test(value);
+  return typeof value === 'string' && CONVERSATION_ID_RE.exec(value)?.[0] === value;
 }
 
 /** Length in Unicode code points. */
@@ -80,7 +80,7 @@ export function isThreadId(value: unknown): value is string {
 export function isHttpsUrl(value: unknown): value is string {
   if (typeof value !== 'string' || value.length > 2048) return false;
   const m = HTTPS_URL_RE.exec(value);
-  if (m === null || m[1].length > 253) return false;
+  if (m === null || m[0] !== value || m[1].length > 253) return false;
   if (m[2] !== undefined) {
     const port = Number(m[2]);
     if (port < 1 || port > 65535) return false;
@@ -206,13 +206,25 @@ export function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+/** Internal: the injected clock or the wall clock, in whole Unix seconds. */
+export function nowOf(clock?: () => number): number {
+  return Math.floor(clock ? clock() : Date.now() / 1000);
+}
+
+/** Internal: a parsed JSON object whose own keys are exactly `names` (any order). */
+export function hasExactKeys(v: unknown, names: readonly string[]): boolean {
+  if (!isObj(v)) return false;
+  const keys = Object.keys(v);
+  return keys.length === names.length && names.every((n) => Object.hasOwn(v, n));
+}
+
 function isPlainObject(v: object): boolean {
   const proto = Object.getPrototypeOf(v);
   return proto === Object.prototype || proto === null;
 }
 
-/** Sender-side JSON-value rules: plain JSON types, finite numbers, depth <= 32. */
-export function checkJsonValue(value: unknown, code: ACEErrorCode = 'invalid_body'): void {
+/** Sender-side JSON-value rules: plain JSON types, finite numbers, depth <= `maxDepth` (32; the root is depth 0). */
+export function checkJsonValue(value: unknown, code: ACEErrorCode = 'invalid_body', maxDepth: number = MAX_JSON_DEPTH): void {
   const stack: Array<[unknown, number]> = [[value, 0]];
   while (stack.length > 0) {
     const [v, depth] = stack.pop()!;
@@ -222,7 +234,7 @@ export function checkJsonValue(value: unknown, code: ACEErrorCode = 'invalid_bod
       continue;
     }
     if (typeof v === 'object') {
-      if (depth > MAX_JSON_DEPTH) throw new ACEError(code, `JSON nesting exceeds depth ${MAX_JSON_DEPTH}`);
+      if (depth > maxDepth) throw new ACEError(code, `JSON nesting exceeds depth ${maxDepth}`);
       if (Array.isArray(v)) {
         for (let i = 0; i < v.length; i++) {
           if (!(i in v)) throw new ACEError(code, 'sparse arrays are not JSON');

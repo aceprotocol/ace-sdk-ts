@@ -7,6 +7,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ACEError, type ACEMessage } from '../src/index.js';
 import { directOrRelayWith, postDirectWith, type DirectDeps } from '../src/direct.js';
 import { postDirect } from '../src/node.js';
+import { RelayClient } from '../src/relay.js';
+import { SecureMailbox } from '../src/secure-mailbox.js';
+import { SecureTransport } from '../src/secure-transport.js';
 import { expectCode } from './helpers.js';
 import { Agent, Clock } from './pipeline.js';
 
@@ -82,19 +85,25 @@ describe('postDirect', () => {
     expect(JSON.parse(seen[0].body)).toEqual({ message: env });
   });
 
-  it('an inbox answering through receiveDirect: delivered once, then a duplicate (both succeed)', async () => {
-    const { bob, env } = await envelope();
-    const inbox = await bob.open();
+  it('a SecureMailbox answering through receiveDirect refuses a static application envelope: 400 invalid_body, direct_rejected', async () => {
+    const { alice, bob, env } = await envelope();
+    await SecureTransport.setPeerAllowed(bob.store, alice.id, true);
+    // the engine is never reached: a static packet fails before any MLS work
+    const secure = new SecureTransport(bob.identity, null as never, bob.store, bob.clock.fn);
+    const mailbox = await SecureMailbox.open({
+      identity: bob.identity, store: bob.store, peers: bob.peers, relay: new RelayClient('https://relay.example'), secure, inbox: await bob.open(),
+    });
     handler = (body, _req, res) => {
-      void inbox.receiveDirect(new TextEncoder().encode(body)).then((r) => {
+      void mailbox.receiveDirect(new TextEncoder().encode(body)).then((r) => {
         res.writeHead(r.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(r.body));
       });
     };
-    await postDirectWith('https://bob.example.com/ace', env, {}, deps());
-    await postDirectWith('https://bob.example.com/ace', env, {}, deps());
-    expect(bob.host.calls).toHaveLength(1);
-    await inbox.close();
+    const e = await expectCode(postDirectWith('https://bob.example.com/ace', env, {}, deps()), 'direct_rejected');
+    expect([e.status, e.remoteCode]).toEqual([400, 'invalid_body']);
+    expect(bob.host.calls).toHaveLength(0);
+    expect(await bob.store.list('quarantine/')).toEqual([]); // refused at the boundary, before the Inbox
+    await mailbox.close();
   });
 
   it('400 / 413 are direct_rejected carrying the receiver error; everything else is direct_unavailable', async () => {
@@ -146,7 +155,7 @@ describe('postDirect', () => {
     for (const url of ['http://a.example.com/', 'ftp://a.example.com', 'https://user@a.example.com/', 'not a url']) {
       await expectCode(postDirectWith(url, env, {}, deps()), 'invalid_argument');
     }
-    await expectCode(postDirectWith('https://a.example.com/', { ...env, ace: '2.0' } as never, {}, deps()), 'invalid_argument');
+    await expectCode(postDirectWith('https://a.example.com/', { ...env, ace: '1.0' } as never, {}, deps()), 'invalid_argument');
     await expectCode(postDirectWith('https://a.example.com/', env, { timeoutMs: 0 }, deps()), 'invalid_argument');
     expect(seen).toEqual([]);
     // the real (Node) entry point applies the same checks

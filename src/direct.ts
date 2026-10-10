@@ -1,7 +1,8 @@
 /**
- * Internal: the sending side of direct delivery (08-relay § Direct Delivery, Sender). The
- * public entry points (`postDirect`, `deliverDirectOrRelay`) live in the `./node` entry, which
- * supplies the Node network modules.
+ * Internal: the sending side of direct delivery (08-relay § Direct Delivery, Sender), a
+ * transport for `SecureRelayReplies` / secure delivery frames: direct endpoint first, relay
+ * fallback. The public entry points (`postDirect`, `deliverDirectOrRelay`) live in the `./node`
+ * entry, which supplies the Node network modules.
  */
 
 import { ACEError } from './errors.js';
@@ -86,10 +87,10 @@ export async function postDirectWith(endpoint: string, envelope: ACEMessage, opt
   throw new ACEError('direct_unavailable', `HTTP ${s}`, { status: s });
 }
 
-/** Which path delivered an envelope. */
+/** Which path delivered a frame. */
 export type DeliveryPath = 'direct' | 'relay';
 
-/** `deliverDirectOrRelay` with an injected direct sender. */
+/** `deliverDirectOrRelay` with an injected direct sender (a `SecureRelayReplies` `send`). */
 export function directOrRelayWith(
   relay: { send(env: ACEMessage): Promise<void> },
   endpoint: string | null | undefined,

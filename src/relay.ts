@@ -6,7 +6,8 @@ import { createAuthHeaders, type RelayAuthRequest } from './auth.js';
 import { readLimited, verifyPeerRecord, type VerifiedPeer } from './discovery.js';
 import { MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE } from './limits.js';
 import { createRegistrationRequest } from './registration.js';
-import type { ACEIdentity, ACEMessage, AgentProfile, DiscoverQuery, Intent } from './types.js';
+import { validateExt } from './ext.js';
+import type { ACEIdentity, ACEMessage, AgentProfile, DiscoverQuery, ExtMap, Intent } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -302,7 +303,7 @@ export class RelayClient {
   /** `GET /v1/discover`; unverifiable entries are dropped and counted in `rejected`. */
   async discover(q: DiscoverQuery = {}): Promise<{ agents: VerifiedPeer[]; rejected: number; cursor: string | null }> {
     const res = await this.#request('GET', this.#url('/v1/discover', {
-      q: q.q, tags: tagsParam(q.tags), chain: q.chain, scheme: q.scheme, account: q.account,
+      q: q.q, tags: tagsParam(q.tags), scheme: q.scheme, account: q.account,
       online: q.online === undefined ? undefined : String(q.online),
       limit: q.limit === undefined ? undefined : String(q.limit), cursor: q.cursor,
     }));
@@ -475,17 +476,19 @@ export class RelayClient {
     }
   }
 
+  /**
+   * `POST /v1/intents`. `ext` follows the profile `ext` rules (`invalid_argument`); put `maxPrice` / `currency` under
+   * `ext['urn:ace:commerce:1']`. An empty `ext` is not sent.
+   */
   async postIntent(
-    identity: ACEIdentity, i: { need: string; tags?: string[]; maxPrice?: string; currency?: string; ttl: number },
+    identity: ACEIdentity, i: { need: string; tags?: string[]; ext?: ExtMap | null; ttl: number },
   ): Promise<{ intentId: string; expiresAt: number }> {
     const tags = i.tags ?? [];
-    const req: RelayAuthRequest = {
-      action: 'intent', need: i.need, tags, maxPrice: i.maxPrice ?? null, currency: i.currency ?? null, ttl: i.ttl,
-    };
-    // the body mirrors the signed payload: tags is always sent (possibly empty)
+    const ext = validateExt(i.ext, 'intent');
+    const req: RelayAuthRequest = { action: 'intent', need: i.need, tags, ext: ext ?? null, ttl: i.ttl };
+    // the body mirrors the signed payload: tags is always sent (possibly empty), ext only when non-empty
     const body: Record<string, unknown> = { need: i.need, tags, ttl: i.ttl };
-    if (i.maxPrice !== undefined) body.maxPrice = i.maxPrice;
-    if (i.currency !== undefined) body.currency = i.currency;
+    if (ext !== undefined) body.ext = ext;
     const res = await this.#authed(identity, req, 'POST', this.#url('/v1/intents'), body);
     if (!isObj(res) || typeof res.intentId !== 'string' || wireInt(res.expiresAt) === null) throw protocolError('unexpected intent response');
     return { intentId: res.intentId, expiresAt: res.expiresAt as number };
@@ -508,14 +511,15 @@ export class RelayClient {
         intentId: x.intentId, from: x.from, need: x.need, tags: x.tags as string[], ttl: x.ttl as number,
         createdAt: x.createdAt as number, expiresAt: x.expiresAt as number,
       };
-      // optional fields: absent is fine; present but malformed is a protocol error
-      if (x.maxPrice !== undefined) {
-        if (typeof x.maxPrice !== 'string') throw protocolError('invalid intent maxPrice');
-        out.maxPrice = x.maxPrice;
-      }
-      if (x.currency !== undefined) {
-        if (typeof x.currency !== 'string') throw protocolError('invalid intent currency');
-        out.currency = x.currency;
+      // optional ext: absent is fine; present but malformed (02 § Profile Fields rules) is a protocol error
+      if (x.ext !== undefined) {
+        let ext: ExtMap | undefined;
+        try {
+          ext = validateExt(x.ext, 'intent');
+        } catch (e) {
+          throw protocolError(`invalid intent ext: ${e instanceof ACEError ? e.message : 'malformed'}`);
+        }
+        if (ext !== undefined) out.ext = ext;
       }
       return out;
     });

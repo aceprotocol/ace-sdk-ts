@@ -2,85 +2,30 @@
 
 import { ACEError, errorDetail } from './errors.js';
 import {
-  bytesEqual, canonicalStateBytes, codePointLength, decodeSignature, isACEId, isConversationId, isMessageId, isObj, isStreamId, isThreadId, pairKey,
-  parseStateBytes, utf8, wireInt,
+  bytesEqual, canonicalStateBytes, codePointLength, isACEId, isConversationId, isMessageId, isObj, isThreadId, pairKey,
+  parseStateBytes, wireInt,
 } from './encoding.js';
 import { computeConversationId } from './encryption.js';
 import { decodeSigningKey, type VerifiedPeer } from './discovery.js';
-import { decodeEnvelope, envelopeFingerprint, envelopeKnownFields, messageSignData } from './envelope.js';
-import {
-  DEFAULT_REPLAY_CAPACITY, MAX_DIRECT_BODY_BYTES, MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE, OFFLINE_WINDOW_SECONDS, TIMESTAMP_WINDOW_SECONDS,
-} from './limits.js';
-import { eventOf, parseMessage } from './messages.js';
+import { decodeEnvelope, envelopeFingerprint, envelopeKnownFields } from './envelope.js';
+import { DEFAULT_REPLAY_CAPACITY, MAX_ENVELOPE_BYTES, OFFLINE_WINDOW_SECONDS } from './limits.js';
+import { applySchema, checkPrincipal, eventOf, installedSchemas, parseMessage, type SchemaValidator } from './messages.js';
 import { refreshPeer, type PeerStore } from './peer-store.js';
 import {
-  fillDecision, isCaip10, openRequestTo, senderPrincipalUsable, type PrincipalContext,
+  fillDecision, isCaip10, openRequestTo, senderPrincipalUsable, validatePrincipalRecord, type PrincipalContext,
 } from './principal.js';
-import { compareStreamIds, normalizeRelayUrl, type RelayClient } from './relay.js';
 import { ReplayDetector, replayCovers } from './replay.js';
 import { ThreadStateMachine, type ThreadSnapshot } from './state-machine.js';
-import { verifySignature } from './signing.js';
 import { SerialQueue, type ACEStore } from './store.js';
 import { compareHistories, restoreMachine, ThreadRecords, type ThreadRecord } from './thread-store.js';
-import type { ACEIdentity, ACEMessage, JSONObject, ParsedMessage, PrincipalKey, ReplayState } from './types.js';
+import type { ACEIdentity, ACEMessage, JSONObject, ParsedMessage, PrincipalKey, PrincipalRecord, ReplayState } from './types.js';
 import { isEconomicType, isMessageType, isPrincipalType } from './types.js';
-
-export type ReceiveSource = { kind: 'relay'; relayUrl: string; streamId?: string } | { kind: 'direct' };
 
 export type ReceiveOutcome =
   | { kind: 'delivered'; message: ParsedMessage }
   | { kind: 'duplicate'; from: string; messageId: string }
   | { kind: 'quarantined'; error: ACEError; fingerprint: string | null }
   | { kind: 'retryable'; error: ACEError };
-
-/**
- * The HTTP answer to a direct-delivery request (08-relay § Direct Delivery). `outcome` is set
- * when the `message` member reached the pipeline.
- */
-export interface DirectReply {
-  status: 200 | 400 | 413 | 503;
-  body: { ok: true; messageId: string } | { ok: false; error: string };
-  outcome?: ReceiveOutcome;
-}
-
-/**
- * The result of `Inbox.pull`: every non-retryable outcome in relay order, the error that
- * stopped the drain (a retryable outcome, a fetch error or an invalid argument), or null, and
- * `hasMore` when `maxPages` or an abort stopped it before the inbox was drained.
- */
-export class PullResult {
-  readonly outcomes: ReceiveOutcome[];
-  readonly blocked: ACEError | null;
-  /** `maxPages` or `signal` stopped the pull early; more entries may be waiting. */
-  readonly hasMore: boolean;
-
-  constructor(outcomes: ReceiveOutcome[], blocked: ACEError | null, hasMore = false) {
-    this.outcomes = outcomes;
-    this.blocked = blocked;
-    this.hasMore = hasMore;
-  }
-
-  /** The delivered messages, in order. */
-  get messages(): ParsedMessage[] {
-    return this.outcomes.flatMap((o) => (o.kind === 'delivered' ? [o.message] : []));
-  }
-
-  get delivered(): number {
-    return countKind(this.outcomes, 'delivered');
-  }
-
-  get duplicates(): number {
-    return countKind(this.outcomes, 'duplicate');
-  }
-
-  get quarantined(): number {
-    return countKind(this.outcomes, 'quarantined');
-  }
-}
-
-function countKind(outcomes: ReceiveOutcome[], kind: ReceiveOutcome['kind']): number {
-  return outcomes.reduce((n, o) => n + (o.kind === kind ? 1 : 0), 0);
-}
 
 export interface InboxOptions {
   identity: ACEIdentity;
@@ -99,6 +44,14 @@ export interface InboxOptions {
    * `wrong_principal`.
    */
   principal?: InboxPrincipal;
+  /** Explicit opt-in to the economic application state machine. */
+  commerce?: boolean;
+  /**
+   * Installed deterministic validators keyed by `schemaDigest` (64 lowercase hex). One runs at the
+   * body-validation step (06 § pipeline step 6) for every message carrying its digest, in addition to
+   * the bundled validation; a rejection is quarantined. Without one a custom type stays authenticated data.
+   */
+  schemas?: Record<string, SchemaValidator>;
 }
 
 /**
@@ -110,6 +63,30 @@ export interface InboxPrincipal {
   account: string;
   selfSigner?: PrincipalKey | null;
   trustedSigners?: readonly PrincipalKey[];
+}
+
+/**
+ * The `InboxOptions.principal` for a host's own saved principal record (09, R-B12a): the record is P_self only
+ * while it validates for `identity`'s signing key at `now` (default: the wall clock). A missing record is
+ * `{ principal: undefined }`; an invalid or expired one never throws but is `{ principal: undefined, warning }`
+ * (`'<code>: <detail>'`) so the host decides how to surface it; a valid one binds its `account` with the record's
+ * `signer` as `selfSigner` and `opts.trustedSigners` (default none).
+ */
+export function inboxPrincipalFromOwnRecord(
+  record: PrincipalRecord | null | undefined,
+  identity: ACEIdentity,
+  opts: { now?: number; trustedSigners?: PrincipalKey[] } = {},
+): { principal: InboxPrincipal | undefined; warning?: string } {
+  if (record === undefined || record === null) return { principal: undefined };
+  let own: PrincipalRecord;
+  try {
+    own = validatePrincipalRecord(record, identity.getSigningPublicKey(), opts.now ?? Math.floor(Date.now() / 1000));
+  } catch (err) {
+    // An ACEError message is already `<code>: <detail>`.
+    const warning = err instanceof ACEError ? err.message : `invalid_principal: ${err instanceof Error ? err.message : String(err)}`;
+    return { principal: undefined, warning };
+  }
+  return { principal: { account: own.account, selfSigner: own.signer, trustedSigners: opts.trustedSigners ?? [] } };
 }
 
 interface PrincipalOption {
@@ -148,32 +125,15 @@ function principalOption(v: unknown): PrincipalOption | null {
   return out;
 }
 
-/**
- * The envelope signature verifies under `peer`'s pinned key and scheme (the same checks as parse steps 2-4 and 8);
- * a malformed signature is false.
- */
-function authenticatedBy(env: ACEMessage, peer: VerifiedPeer): boolean {
-  if (env.from !== peer.aceId || env.signature.scheme !== peer.scheme) return false;
-  let sig: Uint8Array;
-  try {
-    sig = decodeSignature(env.signature.value, env.signature.scheme, 'invalid_envelope');
-  } catch {
-    return false;
-  }
-  return verifySignature(messageSignData(env), sig, peer.scheme, peer.signingPublicKey);
-}
-
 interface DeliveryRecord {
   fingerprint: string;
   message: ParsedMessage;
   receivedAt: number;
-  source: 'relay' | 'direct';
   status: 'pending' | 'acked';
   thread: ThreadSnapshot | null;
 }
 
 const REPLAY_KEY = 'replay.json';
-const CURSORS_KEY = 'cursors.json';
 const QUARANTINE_CAP = 1000;
 const QUARANTINE_FLOOR = 900;
 const SWEEP_EVERY = 1024;
@@ -199,11 +159,13 @@ function encodeSnapshot(s: ThreadSnapshot): Record<string, unknown> {
 }
 
 /**
- * Receives envelopes from a relay (pull / follow) or directly, verifies them, commits them
- * durably in the normative order and hands each message to `onMessage` exactly once (at least
- * once across a crash between hand-over and acknowledgement). One open Inbox per store
- * (lock `receive`). Commit order per message: delivery record, `requests/` decision fill (`decision`
- * only), thread state, replay state, `onMessage`, ack, cursor.
+ * The application receive engine: verifies envelopes, commits them durably in the normative
+ * order and hands each message to `onMessage` exactly once (at least once across a crash
+ * between hand-over and acknowledgement). It knows nothing about transport: `SecureMailbox`
+ * (the only network receive boundary) feeds it authenticated MLS plaintext; in-process code
+ * and tests call `receive` directly. One open Inbox per store (lock `receive`). Commit order
+ * per message: delivery record, `requests/` decision fill (`decision` only), thread state,
+ * replay state, `onMessage`, ack.
  */
 export class Inbox {
   readonly #identity: ACEIdentity;
@@ -216,8 +178,11 @@ export class Inbox {
   readonly #queue = new SerialQueue();
   readonly #releaseReceive: () => Promise<void>;
   #replay: ReplayDetector;
-  #cursors: Record<string, string>;
   readonly #principal: PrincipalOption | null;
+  /** The step-7 context, without `refreshSender`: the Inbox refreshes the sender itself (`#refreshPrincipalSender`). */
+  readonly #principalCtx: PrincipalContext | undefined;
+  readonly #commerce: boolean;
+  readonly #schemas: ReadonlyMap<string, SchemaValidator>;
   #failed: ACEError | null = null;
   /** `threads` or `requests`, kept after a failure past the commit point until close(). */
   #heldLock: (() => Promise<void>) | null = null;
@@ -227,19 +192,29 @@ export class Inbox {
   #quarantined: Set<string> | null = null;
 
   private constructor(
-    o: InboxOptions, release: () => Promise<void>, replay: ReplayDetector, cursors: Record<string, string>,
-    principal: PrincipalOption | null,
+    o: InboxOptions, release: () => Promise<void>, replay: ReplayDetector, principal: PrincipalOption | null,
+    schemas: ReadonlyMap<string, SchemaValidator>,
   ) {
     this.#identity = o.identity;
     this.#principal = principal;
+    this.#commerce = o.commerce === true;
+    this.#schemas = schemas;
     this.#store = o.store;
+    if (principal !== null) {
+      const store = o.store;
+      this.#principalCtx = {
+        account: principal.account,
+        openRequestTo: (conversationId, requestId, now) => openRequestTo(store, conversationId, requestId, now),
+        trustedSigners: principal.trustedSigners,
+        ...(principal.selfSigner !== undefined ? { selfSigner: principal.selfSigner } : {}),
+      };
+    }
     this.#peers = o.peers;
     this.#onMessage = o.onMessage;
     this.#offline = o.offlineWindowSeconds ?? OFFLINE_WINDOW_SECONDS;
     this.#clock = o.clock;
     this.#releaseReceive = release;
     this.#replay = replay;
-    this.#cursors = cursors;
     this.#threads = new ThreadRecords({ store: o.store, localAceId: o.identity.getACEId(), clock: o.clock });
   }
 
@@ -256,13 +231,13 @@ export class Inbox {
     const capacity = o.capacity ?? DEFAULT_REPLAY_CAPACITY;
     if (wireInt(capacity) === null || capacity < 1) throw new ACEError('invalid_argument', 'capacity must be an integer >= 1');
     const principal = principalOption(o.principal);
+    const schemas = installedSchemas(o.schemas);
     const release = await o.store.lock('receive', { timeoutMs: 0 });
     try {
       const now = Math.floor(o.clock ? o.clock() : Date.now() / 1000);
       const threads = new ThreadRecords({ store: o.store, localAceId: local, clock: o.clock });
       const replay = await Inbox.#loadReplay(o.store, threads, capacity, now, offline, o.clock);
-      const cursors = await Inbox.#loadCursors(o.store);
-      const inbox = new Inbox(o, release, replay, cursors, principal);
+      const inbox = new Inbox(o, release, replay, principal, schemas);
       await inbox.#recover();
       return inbox;
     } catch (e) {
@@ -298,21 +273,6 @@ export class Inbox {
     return replay;
   }
 
-  static async #loadCursors(store: ACEStore): Promise<Record<string, string>> {
-    const raw = await store.read(CURSORS_KEY);
-    if (raw === null) return {};
-    const doc = parseStateBytes(raw, CURSORS_KEY) as Record<string, unknown>;
-    if (typeof doc !== 'object' || doc === null || doc.version !== 1) throw new ACEError('storage_failed', 'cursors.json: unknown version');
-    const c = doc.cursors;
-    if (typeof c !== 'object' || c === null || Array.isArray(c)) throw new ACEError('storage_failed', 'cursors.json: invalid cursors');
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(c)) {
-      if (!isStreamId(v)) throw new ACEError('storage_failed', 'cursors.json: invalid stream id');
-      out[k] = v;
-    }
-    return out;
-  }
-
   #now(): number {
     return Math.floor(this.#clock ? this.#clock() : Date.now() / 1000);
   }
@@ -321,152 +281,20 @@ export class Inbox {
     return Math.max(0, this.#now() - this.#offline);
   }
 
-  /** The persisted cursor for `relay` (keyed by its normalized `baseUrl`), or null. */
-  cursor(relay: RelayClient): string | null {
-    return this.#cursors[relay.baseUrl] ?? null;
-  }
-
   /**
    * Verify and commit one message given as its raw bytes (UTF-8 JSON of an envelope). Bytes
    * that are oversize, not JSON or not an envelope are a `quarantined` outcome
-   * (`invalid_envelope`). Calls are serialized. A closed inbox, non-bytes `message` or an
-   * invalid `source` throws `invalid_argument`.
+   * (`invalid_envelope`). Calls are serialized. A closed inbox or a non-bytes `message`
+   * throws `invalid_argument`.
    */
-  async receive(message: Uint8Array, source: ReceiveSource): Promise<ReceiveOutcome> {
+  async receive(message: Uint8Array): Promise<ReceiveOutcome> {
     this.#checkOpen();
     if (!(message instanceof Uint8Array)) throw new ACEError('invalid_argument', 'message must be bytes');
-    const relayUrl = checkSource(source);
-    return this.#queue.run(() => this.#receive(message, source, relayUrl));
-  }
-
-  /**
-   * Answer one direct-delivery request body (`POST <endpoint>` with `{"message": Envelope}`),
-   * exactly as 08-relay § Direct Delivery specifies: 413 when larger than
-   * `MAX_DIRECT_BODY_BYTES`, 400 `invalid_argument` unless it is UTF-8 JSON whose top level is
-   * an object with a `message` member, otherwise the outcome of receiving `message` as a
-   * direct-sourced message. HTTP serving, routing and rate limiting stay with the application.
-   * A closed inbox answers 503 `internal_error`: not a fault of the request, so the sender
-   * falls back to the relay.
-   */
-  async receiveDirect(body: Uint8Array): Promise<DirectReply> {
-    if (!(body instanceof Uint8Array)) throw new ACEError('invalid_argument', 'body must be bytes');
-    const fail = (status: 400 | 413 | 503, error: string, outcome?: ReceiveOutcome): DirectReply =>
-      outcome === undefined ? { status, body: { ok: false, error } } : { status, body: { ok: false, error }, outcome };
-    if (this.#closed) return fail(503, 'internal_error');
-    if (body.length > MAX_DIRECT_BODY_BYTES) return fail(413, 'payload_too_large');
-    let request: unknown;
-    try {
-      request = JSON.parse(strictUtf8.decode(body));
-    } catch {
-      return fail(400, 'invalid_argument');
-    }
-    if (!isObj(request) || !Object.hasOwn(request, 'message')) {
-      return fail(400, 'invalid_argument');
-    }
-    let outcome: ReceiveOutcome;
-    try {
-      const message = request.message;
-      outcome = await this.receive(utf8(JSON.stringify(message)), { kind: 'direct' });
-    } catch (e) {
-      if (this.#closed) return fail(503, 'internal_error'); // closed meanwhile
-      if (e instanceof ACEError) return fail(e.isTransient ? 503 : 400, e.code);
-      return fail(503, 'internal_error');
-    }
-    switch (outcome.kind) {
-      case 'delivered':
-        return { status: 200, body: { ok: true, messageId: outcome.message.messageId }, outcome };
-      case 'duplicate':
-        return { status: 200, body: { ok: true, messageId: outcome.messageId }, outcome };
-      case 'quarantined':
-        return fail(400, outcome.error.code, outcome);
-      case 'retryable':
-        return fail(503, outcome.error.code, outcome);
-    }
+    return this.#queue.run(() => this.#receive(message));
   }
 
   #checkOpen(): void {
     if (this.#closed) throw new ACEError('invalid_argument', 'inbox is closed');
-  }
-
-  /**
-   * Drain the relay inbox from the persisted cursor, page by page. Stops at the first retryable
-   * outcome (or fetch error) and returns its error as `blocked`; `outcomes` holds every other
-   * outcome. `maxPages` bounds the pages fetched and `signal` stops before the next entry; both
-   * set `hasMore`. Never throws: an invalid `limit` (1–100) or `maxPages` (>= 1) is `blocked`
-   * with `invalid_argument`. `outcomes` grows with the backlog; use `maxPages` or `follow` to
-   * bound memory.
-   */
-  async pull(relay: RelayClient, o: { limit?: number; maxPages?: number; signal?: AbortSignal } = {}): Promise<PullResult> {
-    if (o.maxPages !== undefined && (wireInt(o.maxPages) === null || o.maxPages < 1)) {
-      return new PullResult([], new ACEError('invalid_argument', 'maxPages must be an integer >= 1'));
-    }
-    const outcomes: ReceiveOutcome[] = [];
-    const drain = this.#drain(relay, o.limit ?? MAX_INBOX_PAGE, o.maxPages, o.signal);
-    for (;;) {
-      const next = await drain.next();
-      if (next.done) {
-        const end = next.value;
-        return end === 'stopped' ? new PullResult(outcomes, null, true) : new PullResult(outcomes, end);
-      }
-      if (next.value.kind !== 'retryable') outcomes.push(next.value);
-    }
-  }
-
-  /**
-   * Yield each outcome of a drain (a retryable one last); return the blocking error, null when
-   * drained, or 'stopped' when `maxPages` or `signal` ended it early.
-   */
-  async *#drain(
-    relay: RelayClient, limit: number, maxPages?: number, signal?: AbortSignal,
-  ): AsyncGenerator<ReceiveOutcome, ACEError | null | 'stopped', undefined> {
-    let since = this.cursor(relay) ?? '-';
-    for (let pages = 0; ; pages++) {
-      if ((maxPages !== undefined && pages >= maxPages) || signal?.aborted) return 'stopped';
-      let page;
-      try {
-        page = await relay.fetchInbox(this.#identity, { since, limit });
-      } catch (e) {
-        return e instanceof ACEError ? e : new ACEError('relay_unavailable', 'inbox fetch failed', { cause: e });
-      }
-      for (const entry of page.entries) {
-        // an aborted caller stops before the next entry; the cursor marks the spot
-        if (signal?.aborted) return 'stopped';
-        // the page carries parsed JSON; the pipeline takes the message's bytes
-        const out = await this.receive(utf8(JSON.stringify(entry.message)), { kind: 'relay', relayUrl: relay.baseUrl, streamId: entry.streamId });
-        yield out;
-        if (out.kind === 'retryable') return out.error;
-        since = entry.streamId;
-      }
-      if (page.entries.length < limit) return null;
-    }
-  }
-
-  /**
-   * Yield the outcomes of an initial `pull`, then of live events. `onLive` runs once the initial
-   * pull is done and the event stream is connected, and again after each reconnect. A retryable
-   * outcome is yielded, then its error thrown; a failed inbox fetch is thrown. Outcomes are
-   * streamed, not retained: the consumer's pace is the backpressure (nothing is read ahead).
-   */
-  async *follow(
-    relay: RelayClient, o: { signal?: AbortSignal; onLive?: () => void } = {},
-  ): AsyncGenerator<ReceiveOutcome, void, undefined> {
-    const drain = this.#drain(relay, MAX_INBOX_PAGE, undefined, o.signal);
-    for (;;) {
-      const next = await drain.next();
-      if (next.done) {
-        if (next.value === 'stopped') return; // aborted (follow sets no maxPages)
-        if (next.value !== null) throw next.value;
-        break;
-      }
-      yield next.value;
-      if (o.signal?.aborted) return;
-    }
-    const since = this.cursor(relay) ?? undefined;
-    for await (const ev of relay.listen(this.#identity, { since, signal: o.signal, onOpen: o.onLive })) {
-      const out = await this.receive(utf8(ev.data), { kind: 'relay', relayUrl: relay.baseUrl, streamId: ev.streamId });
-      yield out;
-      if (out.kind === 'retryable') throw out.error;
-    }
   }
 
   /** Release the `receive` lock. */
@@ -486,39 +314,15 @@ export class Inbox {
   // --- principal (09) ---
 
   /**
-   * The step-7 context. No `refreshSender`: the Inbox refreshes the sender before parsing
-   * (`#refreshPrincipalSender`), outside every store lock.
-   */
-  #principalContext(): PrincipalContext | undefined {
-    const p = this.#principal;
-    if (p === null) return undefined;
-    const store = this.#store;
-    const ctx: PrincipalContext = {
-      account: p.account,
-      openRequestTo: (conversationId, requestId, now) => openRequestTo(store, conversationId, requestId, now),
-      trustedSigners: p.trustedSigners,
-    };
-    if (p.selfSigner !== undefined) ctx.selfSigner = p.selfSigner;
-    return ctx;
-  }
-
-  /**
    * R-P20 (09 § Same-Account Rules, SDK note): when the pinned sender principal fails steps 2-5, refresh the sender's
-   * binding from the relay once (rollback barrier) and return the binding the rules run on. Only an envelope that
-   * passes the recipient, timestamp-window and replay checks and verifies under the pinned key and scheme triggers a
-   * refresh (R-P30); otherwise the pipeline rejects it. Runs before
-   * any store lock (R-P29). A transient failure throws (the message is retryable, the cursor stays); a non-ACE error is
-   * `relay_unavailable`; a permanent error, no relay or a different binding leaves the pinned binding to decide.
+   * binding from the relay once (rollback barrier) and return the binding the rules run on. Called only after
+   * `parseMessage` accepted the envelope, so recipient, timestamp window, replay and the pinned-key signature already
+   * hold (R-P30). Runs before any store lock (R-P29). A transient failure throws (the message is retryable); a non-ACE
+   * error is `relay_unavailable`; a permanent error, no relay or a different binding leaves the pinned binding to decide.
    */
-  async #refreshPrincipalSender(env: ACEMessage, peer: VerifiedPeer, now: number): Promise<VerifiedPeer> {
-    const ctx = this.#principalContext();
+  async #refreshPrincipalSender(peer: VerifiedPeer, now: number): Promise<VerifiedPeer> {
+    const ctx = this.#principalCtx;
     if (ctx === undefined || senderPrincipalUsable(peer.principal, peer.signingPublicKey, ctx, now)) return peer;
-    // the cheap parse checks first (recipient, timestamp window, replay): a misaddressed, stale or replayed
-    // envelope never costs a relay lookup; the pipeline rejects it
-    if (env.to !== this.#identity.getACEId()) return peer;
-    if (env.timestamp < this.#floor() || env.timestamp > now + TIMESTAMP_WINDOW_SECONDS) return peer;
-    if (!this.#replay.accepts(env.messageId, env.from, env.timestamp)) return peer;
-    if (!authenticatedBy(env, peer)) return peer;
     let fresh: VerifiedPeer | null;
     try {
       fresh = await refreshPeer(this.#peers, peer.aceId);
@@ -535,22 +339,10 @@ export class Inbox {
 
   // --- receive ---
 
-  async #receive(raw: Uint8Array, source: ReceiveSource, relayUrl: string | null): Promise<ReceiveOutcome> {
+  async #receive(raw: Uint8Array): Promise<ReceiveOutcome> {
     this.#checkOpen();
     if (this.#failed) return { kind: 'retryable', error: new ACEError('storage_failed', 'inbox is in a failed state; close and reopen to recover') };
-    const outcome = await this.#process(raw, source);
-    if (relayUrl !== null && source.kind === 'relay' && source.streamId !== undefined && outcome.kind !== 'retryable') {
-      const cur = this.#cursors[relayUrl];
-      if (cur === undefined || compareStreamIds(source.streamId, cur) > 0) {
-        const next = { ...this.#cursors, [relayUrl]: source.streamId };
-        try {
-          await this.#store.write(CURSORS_KEY, canonicalStateBytes({ cursors: next, version: 1 }));
-          this.#cursors = next;
-        } catch (e) {
-          return this.#fail(e);
-        }
-      }
-    }
+    const outcome = await this.#process(raw);
     if (outcome.kind === 'delivered' && ++this.#sinceSweep >= SWEEP_EVERY) {
       this.#sinceSweep = 0;
       try {
@@ -567,8 +359,7 @@ export class Inbox {
     return { kind: 'retryable', error: this.#failed };
   }
 
-  async #process(raw: Uint8Array, source: ReceiveSource): Promise<ReceiveOutcome> {
-    const relaySourced = source.kind === 'relay';
+  async #process(raw: Uint8Array): Promise<ReceiveOutcome> {
     // 1. decode
     let env: ACEMessage;
     try {
@@ -583,19 +374,14 @@ export class Inbox {
     } catch (e) {
       return { kind: 'quarantined', error: e as ACEError, fingerprint: null };
     }
-    // 2. direct freshness
-    if (!relaySourced && Math.abs(this.#now() - env.timestamp) > TIMESTAMP_WINDOW_SECONDS) {
-      return { kind: 'quarantined', error: new ACEError('stale_timestamp', 'direct message outside the freshness window'), fingerprint: envelopeFingerprint(env) };
-    }
     const quarantine = async (error: ACEError): Promise<ReceiveOutcome> => {
-      if (!relaySourced) return { kind: 'quarantined', error, fingerprint: envelopeFingerprint(env) }; // not persisted
       try {
         return { kind: 'quarantined', error, fingerprint: await this.#writeQuarantine(env, error) };
       } catch (e) {
         return { kind: 'retryable', error: asError(e, 'storage_failed', 'quarantine write failed') };
       }
     };
-    // 3. resolve the sender (before taking `threads`)
+    // 2. resolve the sender (before taking `threads`)
     let peer;
     try {
       peer = await this.#peers.resolve(env.from);
@@ -607,7 +393,7 @@ export class Inbox {
       const err = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'peer resolution failed', { cause: e });
       return err.isTransient ? { kind: 'retryable', error: err } : quarantine(err);
     }
-    // 4. known delivery
+    // 3. known delivery
     const dkey = deliveryKey(env.from, env.messageId);
     let existing: DeliveryRecord | null;
     try {
@@ -629,38 +415,8 @@ export class Inbox {
       }
       return { kind: 'delivered', message: existing.message };
     }
-    // 5 (principal types): refresh a sender whose pinned principal fails 09 steps 2-5, before any lock
-    if (isPrincipalType(env.type)) {
-      try {
-        peer = await this.#refreshPrincipalSender(env, peer, this.#now());
-      } catch (e) {
-        const err = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'peer refresh failed', { cause: e });
-        return err.isTransient ? { kind: 'retryable', error: err } : quarantine(err);
-      }
-    }
-    // 5-7: economic types under `threads`; a decision under `requests` from the open-request check through the
-    // requests/ fill (R-P25)
-    const economic = isEconomicType(env.type);
-    const principal = this.#principalContext();
-    const run = async (): Promise<ReceiveOutcome | DeliveryRecord> => {
-      const tr = this.#replay.clone();
-      let record: ThreadRecord | null = null;
-      let machine: ThreadStateMachine;
-      try {
-        if (economic) record = await this.#threads.loadRecord(env.conversationId, env.threadId!);
-        machine = restoreMachine(this.#identity.getACEId(), record?.snapshot ?? null);
-      } catch (e) {
-        return { kind: 'retryable', error: asError(e, 'storage_failed', 'thread load failed') };
-      }
-      // 6. pipeline
-      let parsed: ParsedMessage;
-      try {
-        parsed = await parseMessage(env, this.#identity, peer, {
-          threads: machine, replay: tr, floor: this.#floor(), clock: this.#clock, principal,
-        });
-        // a verified message that opens a thread is bounded per peer (04 § Open-thread bound)
-        if (economic && record === null) await this.#threads.checkCanOpen(env.from);
-      } catch (e) {
+    const tr = this.#replay.clone();
+    const rejected = async (e: unknown): Promise<ReceiveOutcome> => {
         const err = e instanceof ACEError ? e : new ACEError('identity_unavailable', 'receive failed', { cause: e });
         if (err.code === 'replay') return { kind: 'duplicate', from: env.from, messageId: env.messageId };
         if (err.isTransient) return { kind: 'retryable', error: err };
@@ -676,12 +432,47 @@ export class Inbox {
           this.#replay = tr;
         }
         return out;
+    };
+    let parsed: ParsedMessage;
+    try {
+      parsed = await parseMessage(env, this.#identity, peer, { replay: tr, floor: this.#floor(), clock: this.#clock });
+    } catch (e) { return rejected(e); }
+    // 6. installed schema (deterministic; the bundled validation already ran inside parseMessage)
+    const validator = this.#schemas.get(parsed.schemaDigest);
+    if (validator !== undefined) {
+      try { applySchema(validator, parsed); } catch (e) { return rejected(e); }
+    }
+    // Authentication/decryption precedes profile selection. No application metadata is public.
+    if (this.#principal !== null && isPrincipalType(parsed.type)) {
+      try { peer = await this.#refreshPrincipalSender(peer, this.#now()); }
+      catch (e) {
+        const err = e instanceof ACEError ? e : new ACEError('relay_unavailable', 'peer refresh failed', { cause: e });
+        return err.isTransient ? { kind: 'retryable', error: err } : rejected(err);
       }
+    }
+    const economic = this.#commerce && isEconomicType(parsed.type);
+    if (economic && parsed.threadId === null) return rejected(new ACEError('invalid_envelope', 'commerce messages require a private threadId'));
+    const principal = this.#principalCtx;
+    const run = async (): Promise<ReceiveOutcome | DeliveryRecord> => {
+      let record: ThreadRecord | null = null;
+      let machine: ThreadStateMachine;
+      try {
+        if (economic) record = await this.#threads.loadRecord(env.conversationId, parsed.threadId!);
+        machine = restoreMachine(this.#identity.getACEId(), record?.snapshot ?? null);
+      } catch (e) {
+        return { kind: 'retryable', error: asError(e, 'storage_failed', 'thread load failed') };
+      }
+      try {
+        if (economic) {
+          machine.apply(eventOf(parsed), parsed.body);
+          if (record === null) await this.#threads.checkCanOpen(env.from);
+        }
+        if (principal !== undefined && isPrincipalType(parsed.type)) await checkPrincipal(parsed, peer, principal, this.#now());
+      } catch (e) { return rejected(e); }
       // 7. durable commit
-      const snapshot = economic ? machine.getSnapshot(env.conversationId, env.threadId!) : null;
+      const snapshot = economic ? machine.getSnapshot(env.conversationId, parsed.threadId!) : null;
       const delivery: DeliveryRecord = {
-        fingerprint: envelopeFingerprint(env), message: parsed, receivedAt: this.#now(),
-        source: relaySourced ? 'relay' : 'direct', status: 'pending', thread: snapshot,
+        fingerprint: envelopeFingerprint(env), message: parsed, receivedAt: this.#now(), status: 'pending', thread: snapshot,
       };
       try {
         await this.#writeDelivery(dkey, delivery); // 7.1 commit point
@@ -689,8 +480,8 @@ export class Inbox {
         return { kind: 'retryable', error: asError(e, 'storage_failed', 'delivery write failed') };
       }
       try {
-        if (parsed.type === 'decision') await fillDecision(this.#store, parsed); // 7.1a: mark the request decided
-        if (snapshot !== null) await this.#threads.saveRecord({ snapshot, pending: clearedPending(record, snapshot) }); // 7.2
+        if (principal !== undefined && parsed.type === 'decision') await fillDecision(this.#store, parsed); // 7.1a: mark the request decided
+        if (snapshot !== null) await this.#threads.saveRecord({ snapshot, pending: clearedPending(record, snapshot) }, record); // 7.2
         await this.#store.write(REPLAY_KEY, canonicalStateBytes(tr.exportState())); // 7.3
         this.#replay = tr;
       } catch (e) {
@@ -699,7 +490,7 @@ export class Inbox {
       return delivery;
     };
     // The lock covers steps 5-7.3 only: onMessage runs unlocked, so a handler may stage a reply.
-    const lockName = economic ? 'threads' : env.type === 'decision' ? 'requests' : null;
+    const lockName = economic ? 'threads' : principal !== undefined && parsed.type === 'decision' ? 'requests' : null;
     let committed: ReceiveOutcome | DeliveryRecord;
     if (lockName === null) {
       committed = await run();
@@ -741,10 +532,9 @@ export class Inbox {
       fingerprint: d.fingerprint,
       message: {
         body: m.body, conversationId: m.conversationId, from: m.from, messageId: m.messageId, threadId: m.threadId,
-        timestamp: m.timestamp, to: m.to, type: m.type,
+        timestamp: m.timestamp, to: m.to, type: m.type, schemaDigest: m.schemaDigest,
       },
       receivedAt: d.receivedAt,
-      source: d.source,
       status: d.status,
       thread: d.thread === null ? null : encodeSnapshot(d.thread),
       version: 1,
@@ -770,8 +560,7 @@ export class Inbox {
     if (codePointLength(reason) > 1000) reason = [...reason].slice(0, 1000).join('');
     const key = `quarantine/${fingerprint}.json`;
     await this.#store.write(key, canonicalStateBytes({
-      code: error.code, envelope: envelopeKnownFields(env), fingerprint, quarantinedAt: this.#now(), reason,
-      source: 'relay', version: 1,
+      code: error.code, envelope: envelopeKnownFields(env), fingerprint, quarantinedAt: this.#now(), reason, version: 1,
     }));
     // listed once per instance; the records are read only when the cap is crossed, which then
     // trims to QUARANTINE_FLOOR (so at most once per 100 inserts)
@@ -821,7 +610,7 @@ export class Inbox {
     await this.#threads.withLock(() => repairThreads(this.#threads, records));
     // 1a: a decision's requests/ fill (no-op when already filled). A fill that throws bad_reference or
     // wrong_principal (only possible with a corrupted store: step 7 and the fill run under one lock) fails open().
-    const decisions = records.filter(([, d]) => d.message.type === 'decision');
+    const decisions = records.filter(([, d]) => this.#principal !== null && d.message.type === 'decision');
     if (decisions.length > 0) {
       const release = await this.#store.lock('requests');
       try {
@@ -865,10 +654,9 @@ async function readDelivery(store: ACEStore, key: string, localAceId: string): P
   const m = doc.message as Record<string, unknown>;
   const receivedAt = wireInt(doc.receivedAt);
   if (
-    typeof doc.fingerprint !== 'string' || receivedAt === null || (doc.source !== 'relay' && doc.source !== 'direct')
-    || (doc.status !== 'pending' && doc.status !== 'acked') || typeof m !== 'object' || m === null
+    typeof doc.fingerprint !== 'string' || receivedAt === null || (doc.status !== 'pending' && doc.status !== 'acked') || typeof m !== 'object' || m === null
     || !isMessageId(m.messageId) || !isACEId(m.from) || !isACEId(m.to) || !isConversationId(m.conversationId)
-    || !isMessageType(m.type) || (m.threadId !== null && !isThreadId(m.threadId)) || wireInt(m.timestamp) === null
+    || typeof m.schemaDigest !== 'string' || !isConversationId(m.schemaDigest) || !isMessageType(m.type) || (m.threadId !== null && !isThreadId(m.threadId)) || wireInt(m.timestamp) === null
     || typeof m.body !== 'object' || m.body === null || Array.isArray(m.body)
   ) {
     throw bad('invalid delivery record');
@@ -888,9 +676,9 @@ async function readDelivery(store: ACEStore, key: string, localAceId: string): P
     fingerprint: doc.fingerprint,
     message: {
       messageId: m.messageId as string, from: m.from as string, to: m.to as string, conversationId: m.conversationId as string,
-      type: m.type, threadId: (m.threadId as string | null), timestamp: m.timestamp as number, body: m.body as JSONObject,
+      type: m.type, schemaDigest: m.schemaDigest as string, threadId: (m.threadId as string | null), timestamp: m.timestamp as number, body: m.body as JSONObject,
     },
-    receivedAt, source: doc.source, status: doc.status, thread,
+    receivedAt, status: doc.status, thread,
   };
 }
 
@@ -913,7 +701,7 @@ async function repairThreads(threads: ThreadRecords, records: Array<[string, Del
     const rec = await threads.loadRecord(snap.conversationId, snap.threadId);
     const cmp = rec === null ? -1 : compareHistories(rec.snapshot.history, snap.history);
     if (cmp === null) throw new ACEError('storage_failed', 'delivery record diverges from the stored thread');
-    if (cmp === -1) await threads.saveRecord({ snapshot: snap, pending: clearedPending(rec, snap) });
+    if (cmp === -1) await threads.saveRecord({ snapshot: snap, pending: clearedPending(rec, snap) }, rec);
   }
 }
 
@@ -939,16 +727,6 @@ export async function repairThreadsFromDeliveries(store: ACEStore, threads: Thre
     const live = records.filter(([, d]) => !(d.status === 'acked' && covers(d.message.from, d.message.timestamp)));
     await repairThreads(threads, live);
   });
-}
-
-/** Validate a receive source; returns the normalized relay URL (null for direct). */
-function checkSource(source: ReceiveSource): string | null {
-  if (typeof source !== 'object' || source === null || (source.kind !== 'relay' && source.kind !== 'direct')) {
-    throw new ACEError('invalid_argument', 'source must be {kind: "relay" | "direct"}');
-  }
-  if (source.kind === 'direct') return null;
-  if (source.streamId !== undefined && !isStreamId(source.streamId)) throw new ACEError('invalid_argument', 'invalid streamId');
-  return normalizeRelayUrl(source.relayUrl);
 }
 
 /** Keep the stored pending send unless an inbound entry now follows it (delivery proven). */

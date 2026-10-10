@@ -2,7 +2,7 @@
 
 import { ACEError } from './errors.js';
 import {
-  canonicalStateBytes, codePointLength, CONTROL_CHAR_RE, isACEId, pairKey, parseStateBytes, sha256Hex, wireInt,
+  canonicalStateBytes, codePointLength, isThreadId, isConversationId, CONTROL_CHAR_RE, isACEId, pairKey, parseStateBytes, sha256Hex, wireInt,
 } from './encoding.js';
 import { decodeEnvelope, envelopeKnownFields } from './envelope.js';
 import { MAX_OPEN_THREADS_PER_PEER } from './limits.js';
@@ -10,11 +10,11 @@ import {
   isTerminalState, ThreadStateMachine, type ThreadHistoryEntry, type ThreadSnapshot, type ThreadState,
 } from './state-machine.js';
 import type { ACEStore } from './store.js';
-import type { ACEMessage, MessageType } from './types.js';
+import { isMessageType, type ACEMessage, type MessageType } from './types.js';
 
 /**
  * A staged outbound message awaiting acknowledgement. `requestTtl` is the body `ttl` of a principal `request` (the
- * body is encrypted to the recipient, so the Outbox keeps it to write the `requests/` record after delivery);
+ * body is encrypted to the recipient, so the Outbox keeps it to write the `requests/` record before transport);
  * persisted as `requestTtl` only when present (06 Appendix A).
  */
 export interface PendingSend {
@@ -22,6 +22,11 @@ export interface PendingSend {
   status: 'pending' | 'expired';
   stagedAt: number;
   message: ACEMessage;
+  type: MessageType;
+  threadId?: string;
+  schemaDigest: string;
+  /** Digest of the original recipient, type, thread and body; never an authorization. */
+  intentDigest: string;
   requestTtl?: number;
 }
 
@@ -77,18 +82,30 @@ export function decodePendingSend(v: unknown, what: string): PendingSend {
   } catch {
     throw bad();
   }
-  if (requestTtl !== null && message.type !== 'request') throw bad(); // requestTtl belongs to a principal request only
-  const out: PendingSend = { requestId: p.requestId, status: p.status, stagedAt, message };
+  if (requestTtl !== null && p.type !== 'request') throw bad(); // requestTtl belongs to a principal request only
+  if (typeof p.intentDigest !== 'string' || !isConversationId(p.intentDigest)) throw bad();
+  if (!isMessageType(p.type) || (p.threadId !== undefined && !isThreadId(p.threadId)) || typeof p.schemaDigest !== 'string' || !isConversationId(p.schemaDigest)) throw bad();
+  const out: PendingSend = { type: p.type, schemaDigest: p.schemaDigest, ...(p.threadId === undefined ? {} : { threadId: p.threadId as string }), requestId: p.requestId, status: p.status, stagedAt, message, intentDigest: p.intentDigest };
   if (requestTtl !== null) out.requestTtl = requestTtl;
   return out;
 }
 
 export function encodePendingSend(p: PendingSend): Record<string, unknown> {
   const d: Record<string, unknown> = {
-    message: envelopeKnownFields(p.message), requestId: p.requestId, stagedAt: p.stagedAt, status: p.status,
+    message: envelopeKnownFields(p.message), type: p.type, schemaDigest: p.schemaDigest, ...(p.threadId === undefined ? {} : { threadId: p.threadId }), requestId: p.requestId, stagedAt: p.stagedAt, status: p.status, intentDigest: p.intentDigest,
   };
   if (p.requestTtl !== undefined) d.requestTtl = p.requestTtl;
   return d;
+}
+
+/** Internal: the `sent/` archive key of a completed request. */
+export function sentKey(requestId: string): string {
+  return `sent/${sha256Hex(requestId)}.json`;
+}
+
+/** Internal: archive a cleared pending send under `sent/` (caller holds the lock). */
+export async function archiveSent(store: ACEStore, p: PendingSend): Promise<void> {
+  await store.write(sentKey(p.requestId), canonicalStateBytes({ ...encodePendingSend(p), version: 1 }));
 }
 
 /** Internal: derive the state reached by a history (no validation beyond the table). */
@@ -260,9 +277,16 @@ export class ThreadRecords {
     return out;
   }
 
-  /** Write a record (caller holds the lock), then prune old terminal threads. */
-  async saveRecord(rec: ThreadRecord): Promise<void> {
+  /**
+   * Write a record (caller holds the lock), then prune old terminal threads. Clearing `pending` archives the stored
+   * one under `sent/`; a caller that loaded the stored record under this lock passes it as `prior` (saves a read).
+   */
+  async saveRecord(rec: ThreadRecord, prior?: ThreadRecord | null): Promise<void> {
     const s = rec.snapshot;
+    if (rec.pending === null) {
+      if (prior === undefined) prior = await this.loadRecord(s.conversationId, s.threadId);
+      if (prior?.pending) await archiveSent(this.#store, prior.pending);
+    }
     const doc = {
       conversationId: s.conversationId,
       history: s.history.map((h) => ({ from: h.from, messageId: h.messageId, timestamp: h.timestamp, type: h.type })),

@@ -5,6 +5,7 @@ import {
   ACEError, decodeEnvelope, envelopeFingerprint, fromBase64, parseAuthHeaders, verifyAuthHeaders,
   verifyEnvelopeSignature, verifyRegistrationRequest, type PeerRecord, type RelayAuthRequest,
 } from '../src/index.js';
+import { canonicalStateBytes } from '../src/encoding.js';
 
 class HTTPError extends Error {
   constructor(readonly status: number, readonly code: string) {
@@ -165,14 +166,14 @@ export class FakeRelay {
         case 'GET /v1/listen': return await this.#listen(req, res, query.since ?? '-');
         case 'POST /v1/intents': {
           const id = this.#auth(req, {
-            action: 'intent', need: body.need, tags: body.tags ?? [], maxPrice: body.maxPrice ?? null, currency: body.currency ?? null, ttl: body.ttl,
+            action: 'intent', need: body.need, tags: body.tags ?? [], ext: body.ext ?? null, ttl: body.ttl,
           });
           const now = this.clock();
           const intent: Record<string, unknown> = {
             intentId: crypto.randomUUID(), from: id, need: body.need, tags: body.tags ?? [], ttl: body.ttl, createdAt: now, expiresAt: now + body.ttl,
           };
-          if (body.maxPrice !== undefined) intent.maxPrice = body.maxPrice;
-          if (body.currency !== undefined) intent.currency = body.currency;
+          // stored re-canonicalised, served as is, present only when non-empty
+          if (body.ext !== undefined && body.ext !== null && Object.keys(body.ext).length > 0) intent.ext = JSON.parse(new TextDecoder().decode(canonicalStateBytes(body.ext)));
           this.intents.push(intent);
           return this.#reply(res, 201, { intentId: intent.intentId, expiresAt: intent.expiresAt });
         }

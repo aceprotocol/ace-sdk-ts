@@ -1,7 +1,7 @@
-// RelayClient against a local fake relay (08-relay); PeerStore; Inbox.pull / follow end to end.
+// RelayClient against a local fake relay (08-relay); PeerStore.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  ACEError, MemoryStore, PeerStore, RelayClient, SoftwareIdentity, createRegistrationFile, verifyPeerRecord, type ReceiveOutcome,
+  ACEError, MemoryStore, PeerStore, RelayClient, SoftwareIdentity, createRegistrationFile, intentCommerceExt, verifyPeerRecord,
 } from '../src/index.js';
 import { parseSSE } from '../src/relay.js';
 import { toBase64 } from '../src/encoding.js';
@@ -68,7 +68,7 @@ describe('SSE parser', () => {
 });
 
 describe('RelayClient', () => {
-  it('normalizes the base URL', () => {
+  it('normalizes the base URL', async () => {
     expect(new RelayClient('HTTPS://Relay.Example/').baseUrl).toBe('https://relay.example');
     expect(new RelayClient('https://relay.example/base/').baseUrl).toBe('https://relay.example/base');
     expect(() => new RelayClient('ftp://x')).toThrow(ACEError);
@@ -154,11 +154,20 @@ describe('RelayClient', () => {
 
   it('intents', async () => {
     const a = await registered('a');
-    const r = await a.relay!.postIntent(a.identity, { need: 'gpu', tags: ['gpu', 'ml'], maxPrice: '5', currency: 'USDC', ttl: 60 });
+    const ext = { 'urn:ace:commerce:1': { maxPrice: '5', currency: 'USDC' }, 'urn:other:1': { z: 1, a: 'x' } };
+    const r = await a.relay!.postIntent(a.identity, { need: 'gpu', tags: ['gpu', 'ml'], ext, ttl: 60 });
     expect(r.expiresAt).toBe(clock.t + 60);
     const l = await a.relay!.listIntents({});
-    expect(l.intents).toEqual([{ intentId: r.intentId, from: a.id, need: 'gpu', tags: ['gpu', 'ml'], maxPrice: '5', currency: 'USDC', ttl: 60, createdAt: clock.t, expiresAt: clock.t + 60 }]);
+    expect(l.intents).toEqual([{ intentId: r.intentId, from: a.id, need: 'gpu', tags: ['gpu', 'ml'], ttl: 60, ext, createdAt: clock.t, expiresAt: clock.t + 60 }]);
+    expect(intentCommerceExt(l.intents[0])).toEqual({ maxPrice: '5', currency: 'USDC' });
+    expect(relay.bodies.filter(([p]) => p === '/v1/intents').map(([, b]) => b)).toEqual([{ need: 'gpu', tags: ['gpu', 'ml'], ttl: 60, ext }]);
     await expectCode(a.relay!.postIntent(a.identity, { need: 'x', tags: ['a,b'], ttl: 1 }), 'invalid_argument');
+    await expectCode(a.relay!.postIntent(a.identity, { need: 'x', ext: { 'urn:ace:commerce:1': { maxPrice: '5' } }, ttl: 1 }), 'invalid_argument');
+    await expectCode(a.relay!.postIntent(a.identity, { need: 'x', ext: { bad: {} }, ttl: 1 }), 'invalid_argument');
+    // an empty ext is absent: not sent, not signed
+    await a.relay!.postIntent(a.identity, { need: 'y', ext: {}, ttl: 1 });
+    expect(relay.bodies.filter(([p]) => p === '/v1/intents').map(([, b]) => b).at(-1)).toEqual({ need: 'y', tags: [], ttl: 1 });
+    expect((await a.relay!.listIntents({})).intents.at(-1)).not.toHaveProperty('ext');
   });
 
   it('sets, reads and clears a webhook', async () => {
@@ -373,7 +382,7 @@ describe('RelayClient strictness', () => {
   it('listIntents: a present but malformed optional field is relay_protocol_error', async () => {
     const a = await registered('a');
     const base = { intentId: 'i', from: a.id, need: 'x', tags: [], ttl: 60, createdAt: 1, expiresAt: 61 };
-    for (const extra of [{ maxPrice: 5 }, { maxPrice: null }, { currency: 1 }, { from: 'someone' }]) {
+    for (const extra of [{ ext: 5 }, { ext: [] }, { ext: { bad: {} } }, { ext: { 'urn:x': 'y' } }, { ext: { 'urn:ace:commerce:1': { maxPrice: '1' } } }, { from: 'someone' }]) {
       relay.inject.push({ path: '/v1/intents', status: 200, body: { intents: [{ ...base, ...extra }], cursor: null } });
       await expectCode(a.relay!.listIntents(), 'relay_protocol_error');
     }
@@ -452,36 +461,12 @@ describe('RelayClient strictness', () => {
     expect(urls).toHaveLength(3);
   });
 
-  it('listen yields raw frame data; follow quarantines a non-JSON frame and moves on', async () => {
-    const alice = await registered('alice');
+  it('listen yields raw frame data (the SecureMailbox decides what it is)', async () => {
     const bob = await registered('bob', 'secp256k1');
     relay.enqueueRaw(bob.id, new RawFrame('not json'));
     const gen = bob.relay!.listen(bob.identity);
     expect((await gen.next()).value).toMatchObject({ data: 'not json', catchup: true });
     await gen.return();
-    relay.streams.delete(bob.id); // the live phase gets the raw frame below
-    const inbox = await bob.open();
-    const bobPeer = await alice.peers.resolve(bob.id);
-    const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: 'after' } });
-    const kinds: string[] = [];
-    const ctrl = new AbortController();
-    let sent: Promise<void> | null = null;
-    for await (const o of inbox.follow(bob.relay!, {
-      signal: ctrl.signal,
-      onLive: () => {
-        if (sent === null) {
-          relay.enqueueRaw(bob.id, new RawFrame('not json'));
-          sent = alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
-        }
-      },
-    })) {
-      kinds.push(o.kind);
-      if (o.kind === 'delivered') ctrl.abort();
-    }
-    await sent;
-    expect(kinds).toEqual(['quarantined', 'delivered']);
-    expect(inbox.cursor(bob.relay!)).toBe('1003-0');
-    await inbox.close();
   });
 });
 
@@ -507,17 +492,19 @@ describe('PeerStore', () => {
     await expectCode(alice.peers.resolve(bob.id, { maxAgeSeconds: 0 }), 'relay_unavailable');
   });
 
-  it('a registration file never rotates a pinned key; corrupt pins are storage_failed', async () => {
+  it('signed files rotate only forward; corrupt pins are storage_failed', async () => {
     const clock2 = new Clock();
     const store = new MemoryStore();
     const peers = new PeerStore({ store, clock: clock2.fn });
     const bob = await SoftwareIdentity.generate('secp256k1');
-    const reg = createRegistrationFile(bob, { name: 'Bob', endpoint: 'https://bob.example/ace' });
+    const reg = await createRegistrationFile(bob, { name: 'Bob', endpoint: 'https://bob.example/ace', timestamp: clock2.t });
     const p = await peers.pinRegistrationFile(reg);
     expect(p.registeredAt).toBe(clock2.t);
     expect((await peers.adopt(p)).outcome).toBe('unchanged');
     const other = SoftwareIdentity.fromExport({ ...bob.exportPrivateKey(), encryptionPrivateKey: toBase64(new Uint8Array(32).fill(7)) });
-    await expectCode(peers.pinRegistrationFile(createRegistrationFile(other, { name: 'Bob', endpoint: 'https://bob.example/ace' }), { pinnedAt: clock2.t + 100 }), 'stale_peer_binding');
+    await expectCode(peers.pinRegistrationFile(await createRegistrationFile(other, { name: 'Bob', endpoint: 'https://bob.example/ace', timestamp: clock2.t })), 'stale_peer_binding');
+    clock2.t += 100;
+    expect((await peers.pinRegistrationFile(await createRegistrationFile(other, { name: 'Bob', endpoint: 'https://bob.example/ace', timestamp: clock2.t }))).encryptionPublicKey).toEqual(other.getEncryptionPublicKey());
     await expectCode(peers.resolve('ace:sha256:' + '1'.repeat(64)), 'unknown_peer');
     const [key] = await store.list('peers/');
     const doc = JSON.parse(new TextDecoder().decode((await store.read(key))!));
@@ -529,98 +516,5 @@ describe('PeerStore', () => {
     expect(await store.read(key)).toEqual(bytes);
     await peers.remove(bob.getACEId());
     expect(await peers.get(bob.getACEId())).toBeNull();
-  });
-});
-
-describe('end to end over the relay', () => {
-  it('pull: maxPages sets hasMore, invalid arguments are blocked, abort stops before the next entry', async () => {
-    const alice = await registered('alice');
-    const bob = await registered('bob', 'secp256k1');
-    const bobPeer = await alice.peers.resolve(bob.id);
-    for (let i = 0; i < 6; i++) {
-      const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: `m${i}` } });
-      await alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
-    }
-    const ctrl = new AbortController();
-    let handed = 0;
-    const inbox = await bob.open({
-      onMessage: () => {
-        if (++handed === 4) ctrl.abort();
-      },
-    });
-    for (const bad of [{ maxPages: 0 }, { maxPages: 1.5 }, { limit: 0 }, { limit: 101 }]) {
-      const r = await inbox.pull(bob.relay!, bad);
-      expect([r.blocked?.code, r.outcomes, r.hasMore]).toEqual(['invalid_argument', [], false]);
-    }
-    const first = await inbox.pull(bob.relay!, { limit: 3, maxPages: 1 });
-    expect([first.delivered, first.blocked, first.hasMore]).toEqual([3, null, true]);
-    expect(first.messages.map((m) => m.body)).toEqual([{ message: 'm0' }, { message: 'm1' }, { message: 'm2' }]);
-    const aborted = await inbox.pull(bob.relay!, { signal: ctrl.signal });
-    expect([aborted.delivered, aborted.blocked, aborted.hasMore]).toEqual([1, null, true]);
-    expect(inbox.cursor(bob.relay!)).toBe('1004-0');
-    const rest = await inbox.pull(bob.relay!, { limit: 3 });
-    expect([rest.delivered, rest.duplicates, rest.blocked, rest.hasMore]).toEqual([2, 0, null, false]);
-    await inbox.close();
-  });
-
-  it('stage/deliver → Inbox.pull, then follow live; cursor persists', async () => {
-    const alice = await registered('alice');
-    const bob = await registered('bob', 'secp256k1');
-    const bobPeer = await alice.peers.resolve(bob.id);
-    for (let i = 0; i < 3; i++) {
-      const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: `m${i}` } });
-      await alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
-    }
-    const inbox = await bob.open();
-    const first = await inbox.pull(bob.relay!, { limit: 2 });
-    expect(first.blocked).toBeNull();
-    expect(first.outcomes.map((o) => o.kind)).toEqual(['delivered', 'delivered', 'delivered']);
-    expect(first.messages.map((m) => m.body)).toEqual([{ message: 'm0' }, { message: 'm1' }, { message: 'm2' }]);
-    expect([first.delivered, first.duplicates, first.quarantined]).toEqual([3, 0, 0]);
-    expect(inbox.cursor(bob.relay!)).toBe('1003-0');
-    const again = await inbox.pull(bob.relay!);
-    expect([again.outcomes, again.blocked]).toEqual([[], null]);
-
-    // follow: initial-pull outcomes first, then live; onLive after the pull and after each reconnect
-    for (const m of ['q0', 'q1']) {
-      const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: m } });
-      await alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
-    }
-    const rfq = await alice.outbox.stage({ recipient: bobPeer, type: 'rfq', body: { need: 'gpu' }, threadId: 'deal' });
-    const ctrl = new AbortController();
-    const events: string[] = [];
-    let sentRfq: Promise<void> | null = null;
-    const onLive = () => {
-      events.push('live');
-      if (sentRfq === null) sentRfq = alice.outbox.deliver(rfq.requestId, (env) => alice.relay!.send(env));
-    };
-    for await (const o of inbox.follow(bob.relay!, { signal: ctrl.signal, onLive })) {
-      events.push(o.kind === 'delivered' ? `${o.message.type}:${JSON.stringify(o.message.body)}` : o.kind);
-      if (o.kind === 'delivered' && o.message.type === 'rfq') {
-        relay.drainAfter = 0; // the next event drains the stream: a reconnect
-        const p = await alice.outbox.stage({ recipient: bobPeer, type: 'text', body: { message: 'after' } });
-        await alice.outbox.deliver(p.requestId, (env) => alice.relay!.send(env));
-      }
-      if (o.kind === 'delivered' && o.message.type === 'text' && (o.message.body as { message: string }).message === 'after') ctrl.abort();
-    }
-    await sentRfq;
-    expect(events).toEqual([
-      'text:{"message":"q0"}', 'text:{"message":"q1"}', 'live', 'rfq:{"need":"gpu"}', 'live', 'text:{"message":"after"}',
-    ]);
-    expect(bob.host.calls.length).toBe(7);
-    expect(inbox.cursor(bob.relay!)).toBe('1007-0');
-    // pull blocked by a retryable failure
-    relay.inject.push({ path: '/v1/inbox', status: 503, code: 'down' });
-    const r = await inbox.pull(bob.relay!);
-    expect(r.blocked?.code).toBe('relay_unavailable');
-    expect(r.outcomes).toEqual([]);
-    // follow throws a failed initial pull
-    relay.inject.push({ path: '/v1/inbox', status: 503, code: 'down' });
-    let live = 0;
-    await expectCode((async () => {
-      for await (const _ of inbox.follow(bob.relay!, { onLive: () => live++ })) { /* none */ }
-    })(), 'relay_unavailable');
-    expect(live).toBe(0);
-    await inbox.close();
   });
 });

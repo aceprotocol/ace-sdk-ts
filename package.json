@@ -1,7 +1,7 @@
 {
   "name": "@ace-protocol/sdk",
   "version": "0.3.0",
-  "description": "ACE Protocol SDK — Agent Commerce Engine: end-to-end encrypted agent-to-agent commerce messaging",
+  "description": "ACE Protocol SDK \u2014 Agent Commerce Engine: end-to-end encrypted agent-to-agent commerce messaging",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,9 +10,21 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./session": {
+      "types": "./dist/session.d.ts",
+      "import": "./dist/session.js"
+    },
     "./node": {
       "types": "./dist/node.d.ts",
       "import": "./dist/node.js"
+    },
+    "./secure-transport": {
+      "types": "./dist/secure-transport.d.ts",
+      "import": "./dist/secure-transport.js"
+    },
+    "./secure-mailbox": {
+      "types": "./dist/secure-mailbox.d.ts",
+      "import": "./dist/secure-mailbox.js"
     }
   },
   "files": [
@@ -21,7 +33,7 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/package-session-core.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit && tsc --noEmit --target ES2022 --module NodeNext --strict --skipLibCheck examples/quickstart.ts",
@@ -57,9 +69,13 @@
     "bs58": "^6.0.0"
   },
   "devDependencies": {
+    "@types/fs-ext": "^2.0.3",
     "@types/node": "^25.0.0",
     "typescript": "^5.9.0",
     "vitest": "^4.1.11"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "optionalDependencies": {
+    "fs-ext": "^2.1.1"
+  }
 }

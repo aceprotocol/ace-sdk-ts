@@ -2,17 +2,17 @@
  * Node.js-only exports (`@ace-protocol/sdk/node`).
  *
  * `postDirect` / `deliverDirectOrRelay`: the sending side of direct delivery
- * (08-relay § Direct Delivery).
+ * (08-relay § Direct Delivery), a transport for the secure delivery frames
+ * (`SecureRelayReplies`): direct endpoint first, relay fallback.
  *
  * `FileStore(root)`: an `ACEStore` over a directory. Directories are 0700, files 0600.
- * Writes are atomic (temp file + fsync + rename + directory fsync). Locks are lock files
- * shared with the Python and Swift SDKs' protocol; concurrent mixed-language access to one
- * root is unsupported, but the files at rest are portable.
+ * Writes are atomic (temp file + fsync + rename + directory fsync). Locks use POSIX flock
+ * over permanent files on a local filesystem; the kernel releases them on process exit.
+ * Never unlink or replace a lock file. Network filesystems are unsupported.
  */
 
 import { constants as fsc, promises as fs } from 'node:fs';
-import { hostname } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import * as https from 'node:https';
 import { promises as dns } from 'node:dns';
@@ -21,9 +21,10 @@ import { directOrRelayWith, postDirectWith, type DeliveryPath, type PostDirectOp
 import type { LookupFn } from './pinned-https.js';
 import type { RelayClient } from './relay.js';
 import type { ACEMessage } from './types.js';
-import { checkKey, checkLockName, checkTimeout, checkValue, lockTimeoutError, MAX_VALUE_BYTES, Mutex, type ACEStore } from './store.js';
+import { checkKey, checkLockName, checkTimeout, checkValue, lockTimeoutError, MAX_VALUE_BYTES, Mutex, withLock, type ACEStore, type StoreData } from './store.js';
 
 export type { ACEStore } from './store.js';
+export { EtcdStore, type EtcdStoreOptions } from './etcd-store.js';
 export type { DeliveryPath, PostDirectOptions } from './direct.js';
 
 /**
@@ -44,9 +45,11 @@ export async function postDirect(endpoint: string, envelope: ACEMessage, opts: P
 }
 
 /**
- * An `Outbox.deliver` transport: `postDirect` to `endpoint` when one is given, falling back
- * to `relay.send` on `direct_unavailable` or an unsafe endpoint (`invalid_argument`). A
- * `direct_rejected` is thrown (no relay fallback). Resolves to the path that delivered.
+ * A transport for `SecureRelayReplies` / secure delivery frames: `postDirect` to `endpoint`
+ * when one is given, falling back to `relay.send` on `direct_unavailable` or an unsafe
+ * endpoint (`invalid_argument`). A `direct_rejected` is thrown (no relay fallback). Resolves
+ * to the path that delivered. Application envelopes never travel through it: `Outbox.deliver`
+ * takes `secure.deliver(envelope, peer, exchange)`, whose frames this transport carries.
  */
 export function deliverDirectOrRelay(
   relay: Pick<RelayClient, 'send'>, endpoint?: string | null, opts: PostDirectOptions = {},
@@ -55,7 +58,6 @@ export function deliverDirectOrRelay(
 }
 
 const LOCK_POLL_MS = 50;
-const STALE_UNPARSEABLE_MS = 60_000;
 const processMutexes = new Map<string, Mutex>();
 
 function fail(what: string, e: unknown): ACEError {
@@ -73,6 +75,7 @@ function errno(e: unknown): string | undefined {
 }
 
 export class FileStore implements ACEStore {
+  coordinate<T>(name: string, body: (data: StoreData) => Promise<T>): Promise<T> { return withLock(this, name, body); }
   readonly root: string;
   #realRoot: Promise<string> | null = null;
 
@@ -85,9 +88,14 @@ export class FileStore implements ACEStore {
     if (this.#realRoot === null) {
       this.#realRoot = (async () => {
         try {
-          await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
+          const created = await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
           const st = await fs.lstat(this.root);
           if (!st.isDirectory()) throw new ACEError('storage_failed', 'store root is not a directory');
+          if (created) {
+            const stop = dirname(resolve(created));
+            let dir = dirname(resolve(this.root));
+            for (;;) { await syncDir(dir); if (dir === stop) break; dir = dirname(dir); }
+          }
           return await fs.realpath(this.root);
         } catch (e) {
           this.#realRoot = null;
@@ -115,6 +123,7 @@ export class FileStore implements ACEStore {
         if (!create) return null;
         try {
           await fs.mkdir(dir, { mode: 0o700 });
+          await syncDir(dirname(dir));
         } catch (e2) {
           if (errno(e2) !== 'EEXIST') throw fail('creating a directory', e2);
         }
@@ -210,7 +219,7 @@ export class FileStore implements ACEStore {
   async lock(name: string, opts: { timeoutMs?: number } = {}): Promise<() => Promise<void>> {
     checkLockName(name);
     const timeout = checkTimeout(opts.timeoutMs);
-    const deadline = Date.now() + timeout;
+    const deadline = performance.now() + timeout;
     const base = await this.#base();
     const mkey = `${base}\u0000${name}`;
     let mutex = processMutexes.get(mkey);
@@ -246,62 +255,30 @@ export class FileStore implements ACEStore {
     } catch (e) {
       throw fail('creating the locks directory', e);
     }
-    const host = hostname();
-    const content = Buffer.from(JSON.stringify({ createdAt: Math.floor(Date.now() / 1000), host, pid: process.pid }));
-    for (;;) {
-      try {
-        const fh = await fs.open(path, fsc.O_CREAT | fsc.O_EXCL | fsc.O_WRONLY | fsc.O_NOFOLLOW, 0o600);
-        try {
-          await fh.writeFile(content);
-          await fh.sync();
-        } finally {
-          await fh.close();
+    const st = await fs.lstat(dir);
+    if (!st.isDirectory()) throw new ACEError('storage_failed', 'locks path is not a directory');
+    let fh;
+    try { fh = await fs.open(path, fsc.O_CREAT | fsc.O_RDWR | fsc.O_NOFOLLOW | fsc.O_NONBLOCK, 0o600); }
+    catch (e) { throw fail('opening a lock', e); }
+    try {
+      if (!(await fh.stat()).isFile()) throw new ACEError('storage_failed', 'lock is not a regular file');
+      // Optional native dependency is loaded only for FileStore locking. No unsafe fallback.
+      const native = await import('fs-ext');
+      const flock = (flags: 'exnb'): Promise<void> => new Promise((resolve, reject) => {
+        native.flock(fh.fd, flags, e => e ? reject(e) : resolve());
+      });
+      for (;;) {
+        try { await flock('exnb'); break; }
+        catch (e) {
+          if (!['EAGAIN', 'EWOULDBLOCK', 'EINTR'].includes(errno(e) ?? '')) throw e;
+          if (performance.now() >= deadline) throw lockTimeoutError(name);
+          await sleep(Math.min(LOCK_POLL_MS, Math.max(1, deadline - performance.now())));
         }
-        return async () => {
-          try {
-            const current = await fs.readFile(path);
-            if (current.equals(content)) await fs.unlink(path);
-          } catch (e) {
-            if (errno(e) !== 'ENOENT') throw fail('releasing a lock', e);
-          }
-        };
-      } catch (e) {
-        if (errno(e) !== 'EEXIST') throw fail('acquiring a lock', e);
       }
-      if (await this.#isStale(path, host)) {
-        await fs.unlink(path).catch(() => {});
-        continue;
-      }
-      if (Date.now() >= deadline) throw lockTimeoutError(name);
-      await sleep(Math.min(LOCK_POLL_MS, Math.max(1, deadline - Date.now())));
-    }
-  }
-
-  async #isStale(path: string, host: string): Promise<boolean> {
-    let raw: Buffer;
-    let mtimeMs: number;
-    try {
-      raw = await fs.readFile(path);
-      mtimeMs = (await fs.stat(path)).mtimeMs;
-    } catch {
-      return false;
-    }
-    let info: { host?: unknown; pid?: unknown } | null = null;
-    try {
-      const parsed = JSON.parse(raw.toString('utf8'));
-      if (typeof parsed === 'object' && parsed !== null) info = parsed;
-    } catch {
-      info = null;
-    }
-    if (info === null || typeof info.pid !== 'number' || typeof info.host !== 'string') {
-      return Date.now() - mtimeMs > STALE_UNPARSEABLE_MS;
-    }
-    if (info.host !== host) return false;
-    try {
-      process.kill(info.pid, 0);
-      return false;
+      // Closing the open description releases flock. Keep its inode forever.
+      return async () => { try { await fh.close(); } catch (e) { throw fail('releasing a lock', e); } };
     } catch (e) {
-      return errno(e) === 'ESRCH';
+      await fh.close(); throw fail('acquiring a lock', e);
     }
   }
 }
@@ -317,4 +294,12 @@ async function syncDir(dir: string): Promise<void> {
   } finally {
     await fh?.close();
   }
+}
+
+/** Load the source-built, packaged WASM core. Missing artifacts are a hard error; never downgrade. */
+export async function loadMLSEngine(): Promise<import('./session.js').MLSEngine & { free(): void }> {
+  const url = new URL('./session-core/ace_session_core.js', import.meta.url);
+  const core = await import(url.href);
+  await core.default({ module_or_path: await fs.readFile(new URL('./session-core/ace_session_core_bg.wasm', import.meta.url)) });
+  return new core.SessionEngine();
 }

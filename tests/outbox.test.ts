@@ -30,12 +30,70 @@ describe('Outbox', () => {
     expect(p.stagedAt).toBe(clock.t);
     const rec = json(await alice.store.read(threadKey(p.message.conversationId, 'd')));
     expect(rec.state).toBe('rfq');
-    expect(rec.pending).toEqual({ message: p.message, requestId: 'req-1', stagedAt: clock.t, status: 'pending' });
-    const again = await alice.outbox.stage({ recipient: peer, type: 'rfq', body: { need: 'other' }, threadId: 'zzz', requestId: 'req-1' });
+    expect(rec.pending).toEqual({ message: p.message, requestId: 'req-1', stagedAt: clock.t, status: 'pending', intentDigest: p.intentDigest, type: p.type, schemaDigest: p.schemaDigest, threadId: p.threadId });
+    await expectCode(alice.outbox.stage({ recipient: peer, type: 'rfq', body: { need: 'other' }, threadId: 'zzz', requestId: 'req-1' }), 'pending_send_conflict');
+    const again = await alice.outbox.stage({ recipient: peer, type: 'rfq', body: { need: 'x' }, threadId: 'd', requestId: 'req-1' });
     expect(again).toEqual(p);
     await alice.outbox.stage({ recipient: peer, type: 'text', body: { message: 'x' }, requestId: 'req-2' });
     await expectCode(alice.outbox.stage({ recipient: peer, type: 'rfq', body: { need: 'y' }, threadId: 'd', requestId: 'req-3' }), 'pending_send_conflict');
     expect((await alice.outbox.pending()).map((x) => x.requestId)).toEqual(['req-1', 'req-2']);
+  });
+
+  it.each(['completed', 'abandoned'])('binds %s operation keys across restart and rejects changed parameters', async (terminal) => {
+    const { clock, alice, bob } = await pair();
+    const recipient = await alice.peer(bob);
+    const input = { recipient, type: 'text' as const, body: { message: 'same operation' }, requestId: 'stable-operation' };
+    const first = await alice.outbox.stage(input);
+    const rx = await bob.open();
+    expect((await rx.receive(wire(first.message))).kind).toBe('delivered');
+    if (terminal === 'completed') await alice.outbox.deliver(input.requestId, async () => {});
+    else await alice.outbox.abandon(input.requestId);
+    const restarted = await Outbox.open({ commerce: true, identity: alice.identity, store: alice.store, clock: clock.fn });
+    const retried = await restarted.stage(input);
+    expect(retried.message).toEqual(first.message);
+    expect((await restarted.deliver(input.requestId, env => rx.receive(wire(env)))).kind).toBe('duplicate');
+    await expectCode(restarted.stage({ ...input, body: { message: 'different operation' } }), 'pending_send_conflict');
+    await rx.close();
+  });
+
+  it('concurrent staging of one key creates one envelope', async () => {
+    const { clock, alice, bob } = await pair();
+    const other = await Outbox.open({ commerce: true, identity: alice.identity, store: alice.store, clock: clock.fn });
+    const input = { recipient: await alice.peer(bob), type: 'text' as const, body: { message: 'one' }, requestId: 'race' };
+    const [a, b] = await Promise.all([alice.outbox.stage(input), other.stage(input)]);
+    expect(a.message).toEqual(b.message);
+  });
+
+  it('captures the intent before awaiting a store lock', async () => {
+    const { alice, bob } = await pair();
+    const input = { recipient: await alice.peer(bob), type: 'text' as const, body: { message: 'original' }, requestId: 'immutable' };
+    const release = await alice.store.lock('threads');
+    const staging = alice.outbox.stage(input);
+    input.body.message = 'mutated while waiting';
+    await release();
+    const first = await staging;
+    const retry = await alice.outbox.stage({ ...input, body: { message: 'original' } });
+    expect(retry.message).toEqual(first.message);
+    await expectCode(alice.outbox.stage(input), 'pending_send_conflict');
+  });
+
+  it('concurrent completion, abandonment and restaging retain one operation', async () => {
+    const { clock, alice, bob } = await pair();
+    const other = await Outbox.open({ commerce: true, identity: alice.identity, store: alice.store, clock: clock.fn });
+    const input = { recipient: await alice.peer(bob), type: 'text' as const, body: { message: 'one' }, requestId: 'finish-race' };
+    const original = await alice.outbox.stage(input);
+    let finish!: () => void, started!: () => void;
+    const arrived = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    const sending = alice.outbox.deliver(input.requestId, async () => { started(); await gate; });
+    await arrived;
+    await other.abandon(input.requestId);
+    finish();
+    const [, retry] = await Promise.all([sending, other.stage(input)]);
+    expect(retry.message).toEqual(original.message);
+    const reopened = await Outbox.open({ commerce: true, identity: alice.identity, store: alice.store, clock: clock.fn });
+    expect((await reopened.stage(input)).message).toEqual(original.message);
+    await expectCode(reopened.stage({ ...input, body: { message: 'changed' } }), 'pending_send_conflict');
   });
 
   it('stage validation writes nothing', async () => {
@@ -105,7 +163,7 @@ describe('Outbox', () => {
     const got: ACEMessage[] = [];
     await alice.outbox.deliver('r', async (e) => { got.push(e); });
     const inbox = await bob.open();
-    const out = await inbox.receive(wire(got[0]), { kind: 'relay', relayUrl: 'https://r.example', streamId: '1-0' });
+    const out = await inbox.receive(wire(got[0]));
     expect(out.kind).toBe('delivered');
     if (out.kind === 'delivered') expect(out.message.timestamp).toBe(t0 + 1000);
   });
@@ -129,7 +187,7 @@ describe('Outbox', () => {
     const first = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'rfq', body: { need: 'x' }, threadId: 'd', requestId: 'r1' });
     await alice.outbox.deliver('r1', async () => {});
     const inbox = await bob.open();
-    await inbox.receive(wire(first.message), { kind: 'direct' });
+    await inbox.receive(wire(first.message));
     const offer = await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'offer', body: { price: '3', currency: 'USDC' }, threadId: 'd', requestId: 'o1' });
     await bob.outbox.abandon('o1');
     const snap = (await new ThreadStore({ store: bob.store, localAceId: bob.id }).get(offer.message.conversationId, 'd'))!;
@@ -147,14 +205,14 @@ describe('Outbox', () => {
     const p = await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'rfq', body: { need: 'x' }, threadId: 'old', requestId: 'a' });
     await alice.outbox.deliver('a', async () => {});
     const inbox = await bob.open();
-    await inbox.receive(wire(p.message), { kind: 'direct' });
+    await inbox.receive(wire(p.message));
     const rej = await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'reject', body: { reason: 'busy' }, threadId: 'old', requestId: 'r' });
     await bob.outbox.deliver('r', async () => {});
     const store = new ThreadStore({ store: bob.store, localAceId: bob.id, clock: clock.fn });
     expect((await store.get(rej.message.conversationId, 'old'))!.state).toBe('rejected');
     expect(await store.allowedTypes(rej.message.conversationId, 'old', alice.id)).toEqual([]);
     clock.t += 30 * 86400 + 10;
-    const fresh = await Outbox.open({ identity: bob.identity, store: bob.store, clock: clock.fn });
+    const fresh = await Outbox.open({ commerce: true, identity: bob.identity, store: bob.store, clock: clock.fn });
     const keep = await fresh.stage({ recipient: await bob.peer(alice), type: 'rfq', body: { need: 'new' }, threadId: 'new', requestId: 'n' });
     expect((await store.list()).map((s) => s.threadId)).toEqual(['new']);
     expect(await store.remove(keep.message.conversationId, 'new')).toBe(true);

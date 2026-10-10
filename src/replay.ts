@@ -1,7 +1,7 @@
 /** Seen store with replay horizons and a per-sender quota (06-security). */
 
 import { ACEError } from './errors.js';
-import { compareUtf8, isMessageId, wireInt } from './encoding.js';
+import { compareUtf8, isMessageId, nowOf, wireInt } from './encoding.js';
 import { DEFAULT_REPLAY_CAPACITY, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import type { ReplayState } from './types.js';
 
@@ -61,10 +61,6 @@ const globalLess = (a: GlobalEntry, b: GlobalEntry) =>
   a[0] !== b[0] ? a[0] < b[0] : a[1] !== b[1] ? compareUtf8(a[1], b[1]) < 0 : compareUtf8(a[2], b[2]) < 0;
 const pairLess = (a: [number, string], b: [number, string]) =>
   a[0] !== b[0] ? a[0] < b[0] : compareUtf8(a[1], b[1]) < 0;
-
-function nowOf(clock?: () => number): number {
-  return Math.floor(clock ? clock() : Date.now() / 1000);
-}
 
 function tsArg(v: unknown, what: string): number {
   const n = wireInt(v);

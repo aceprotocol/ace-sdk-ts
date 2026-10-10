@@ -24,7 +24,7 @@ const NOW = 1_800_000_000;
 const ACC = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
 
 describe('principal refresh errors', () => {
-  it('a permanent error from the usable-check is quarantined and the cursor moves', async () => {
+  it('a permanent error from the usable-check is quarantined (one-shot)', async () => {
     const clock = new Clock(NOW);
     const owner = await SoftwareIdentity.generate('ed25519');
     const relay = { calls: 0, async lookupPeer() { this.calls++; throw new ACEError('relay_unavailable', 'x'); } };
@@ -39,9 +39,9 @@ describe('principal refresh errors', () => {
     };
     await pin(a.peers, b.identity);
     await pin(b.peers, a.identity, await createPrincipalRecord(principalSignerFromIdentity(owner), {
-      subjectSigningPublicKey: a.identity.getSigningPublicKey(), account: ACC, roles: ['agent'], expiresAt: NOW + 3600, issuedAt: NOW - 10,
+      subjectSigningPublicKey: a.identity.getSigningPublicKey(), account: ACC, roles: ['delegate'], expiresAt: NOW + 3600, issuedAt: NOW - 10,
     }));
-    const ia = await Inbox.open({
+    const ia = await Inbox.open({ commerce: true,
       identity: a.identity, store: a.store, peers: new PeerStore({ store: a.store, relay: relay as any, clock: clock.fn }),
       onMessage: a.host.fn, clock: clock.fn,
       principal: { account: ACC, selfSigner: { scheme: owner.getSigningScheme(), publicKey: toBase64(owner.getSigningPublicKey()) } },
@@ -49,18 +49,16 @@ describe('principal refresh errors', () => {
     const p = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's' } });
     flags.throwPermanent = true;
     try {
-      const r = await ia.receive(wire(p.message), { kind: 'relay', relayUrl: 'https://relay.example', streamId: '1-0' });
+      const r = await ia.receive(wire(p.message));
       expect(r.kind).toBe('quarantined');
       expect('error' in r && r.error.code).toBe('invalid_principal');
       expect(relay.calls).toBe(0);
-      const cursors = JSON.parse(new TextDecoder().decode((await a.store.read('cursors.json'))!)).cursors;
-      expect(cursors['https://relay.example']).toBe('1-0');
     } finally {
       flags.throwPermanent = false;
     }
-    // the inbox is not failed: the transient relay error now makes the same message retryable
-    const r2 = await ia.receive(wire(p.message), { kind: 'relay', relayUrl: 'https://relay.example', streamId: '2-0' });
-    expect(r2.kind).toBe('retryable');
-    expect(relay.calls).toBe(1);
+    // Authenticated permanent policy rejection is one-shot; replay never triggers refresh.
+    const r2 = await ia.receive(wire(p.message));
+    expect(r2.kind).toBe('duplicate');
+    expect(relay.calls).toBe(0);
   });
 });

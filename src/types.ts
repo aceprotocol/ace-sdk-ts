@@ -13,6 +13,48 @@ export function isSigningScheme(v: unknown): v is SigningScheme {
 export type JSONValue = null | boolean | number | string | JSONValue[] | { [key: string]: JSONValue };
 export type JSONObject = { [key: string]: JSONValue };
 
+/** ASCII namespaced identifier (04 § Message Types grammar); also the key grammar of `ext`. */
+export const NAMESPACED_ID_RE = /^[a-z][a-z0-9+.-]*:[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$/;
+
+// === Extensions (02 § Profile Fields) ===
+
+/**
+ * Namespaced extensions of a profile, registration file or intent: each key is a namespaced identifier (at most 256
+ * bytes), each value a JSON object; at most 8 keys, canonical JSON at most 4096 bytes, nesting depth at most 8.
+ * Validated by `validateExt`; the bundled `urn:ace:commerce:1` member is typed (`CommerceProfileExt`, `CommerceIntentExt`).
+ */
+export type ExtMap = { [namespace: string]: JSONObject };
+
+/** `urn:ace:commerce:1` in a profile or registration file (04 § Commerce extension). */
+export interface CommerceProfileExt {
+  /** CAIP-2 identifiers, at most 10. */
+  chains?: string[];
+  pricing?: CommercePricing;
+  /** Settlement methods (05), at most 10. */
+  settlement?: string[];
+  /** Payment addresses, at most 10. */
+  accounts?: CommerceAccount[];
+}
+
+export interface CommercePricing {
+  /** 1-16 characters without control characters. */
+  currency: string;
+  /** 1-32 characters matching `^[0-9]+(\.[0-9]+)?$`. */
+  maxAmount?: string;
+}
+
+export interface CommerceAccount {
+  /** CAIP-2. */
+  network: string;
+  address: string;
+}
+
+/** `urn:ace:commerce:1` in an intent: `maxPrice` (1-64) and `currency` (1-16), both present or both absent. */
+export interface CommerceIntentExt {
+  maxPrice?: string;
+  currency?: string;
+}
+
 /**
  * What the SDK needs from an identity (software, Secure Enclave, HSM, ...).
  *
@@ -33,23 +75,11 @@ export interface ACEIdentity {
 
 // === Registration file ===
 
-export interface PricingInfo {
-  model: 'per-call' | 'per-token' | 'per-hour' | 'flat';
-  amount: string;
-  currency: string;
-}
-
 export interface Capability {
   id: string;
   description: string;
   input?: string;
   output?: string;
-  pricing?: PricingInfo;
-}
-
-export interface ChainInfo {
-  network: string; // CAIP-2
-  address: string;
 }
 
 export interface SigningConfig {
@@ -63,6 +93,8 @@ export interface SigningConfig {
 
 export interface RegistrationFile {
   ace: '1.0';
+  registeredAt: number;
+  registrationSignature: string;
   id: string;
   name: string;
   description?: string;
@@ -71,14 +103,15 @@ export interface RegistrationFile {
   hardwareBacking?: HardwareBacking;
   signing: SigningConfig;
   capabilities?: Capability[];
-  settlement?: string[];
-  chains?: ChainInfo[];
+  /** Namespaced extensions, same rules as a profile's `ext` (commerce data lives under `urn:ace:commerce:1`). */
+  ext?: ExtMap;
   principal?: PrincipalRecord;
 }
 
 // === Principal (09) ===
 
-export type PrincipalRole = 'controller' | 'agent';
+/** `controller` approves; `delegate` acts. */
+export type PrincipalRole = 'controller' | 'delegate';
 
 /** A `(scheme, publicKey)` pair as it appears in a principal record (`publicKey` is canonical Base64). */
 export interface PrincipalKey {
@@ -100,11 +133,6 @@ export interface PrincipalRecord {
 
 // === Discovery ===
 
-export interface ProfilePricing {
-  currency: string;
-  maxAmount?: string;
-}
-
 /** Relay discovery profile: self-asserted metadata. All fields optional. */
 export interface AgentProfile {
   name?: string;
@@ -112,9 +140,9 @@ export interface AgentProfile {
   image?: string;
   tags?: string[];
   capabilities?: string[];
-  chains?: string[];
   endpoint?: string;
-  pricing?: ProfilePricing;
+  /** Namespaced extensions (02 § Profile Fields); stored and served in canonical form, never indexed. */
+  ext?: ExtMap;
   /** Principal record (09), verified against the peer's signing key when the peer is verified. */
   principal?: PrincipalRecord;
 }
@@ -123,7 +151,6 @@ export interface DiscoverQuery {
   q?: string;
   /** Exact-match tags (all must match); sent comma-separated. */
   tags?: string[];
-  chain?: string;
   scheme?: SigningScheme;
   /** CAIP-10 account (exact match on profile.principal.account). */
   account?: string;
@@ -161,9 +188,9 @@ export interface Intent {
   from: string;
   need: string;
   tags: string[];
-  maxPrice?: string;
-  currency?: string;
   ttl: number;
+  /** Present only when non-empty; `urn:ace:commerce:1` carries `maxPrice` / `currency`. */
+  ext?: ExtMap;
   createdAt: number;
   expiresAt: number;
 }
@@ -181,7 +208,8 @@ export interface ReplayState {
 export type MessageType =
   | 'rfq' | 'offer' | 'accept' | 'reject' | 'invoice' | 'receipt' | 'deliver' | 'confirm'
   | 'info' | 'text'
-  | 'request' | 'decision' | 'report';
+  | 'request' | 'decision' | 'report'
+  | `${string}:${string}`;
 
 export const MESSAGE_TYPES: readonly MessageType[] = [
   'rfq', 'offer', 'accept', 'reject', 'invoice', 'receipt', 'deliver', 'confirm', 'info', 'text',
@@ -191,7 +219,8 @@ export const ECONOMIC_TYPES: readonly MessageType[] = MESSAGE_TYPES.slice(0, 8);
 export const PRINCIPAL_TYPES: readonly MessageType[] = MESSAGE_TYPES.slice(10);
 
 export function isMessageType(t: unknown): t is MessageType {
-  return typeof t === 'string' && (MESSAGE_TYPES as readonly string[]).includes(t);
+  return typeof t === 'string' && ((MESSAGE_TYPES as readonly string[]).includes(t)
+    || (t.length <= 256 && NAMESPACED_ID_RE.exec(t)?.[0] === t));
 }
 
 export function isEconomicType(t: unknown): boolean {
@@ -217,13 +246,11 @@ export interface SignatureEnvelope {
 
 /** A decoded envelope (wire shape). Obtain from `decodeEnvelope` or `createMessage`. */
 export interface ACEMessage {
-  ace: '1.0';
+  ace: '2.0';
   messageId: string;
   from: string;
   to: string;
   conversationId: string;
-  type: MessageType;
-  threadId?: string;
   timestamp: number;
   encryption: EncryptionEnvelope;
   signature: SignatureEnvelope;
@@ -235,6 +262,8 @@ export interface ParsedMessage {
   to: string;
   conversationId: string;
   type: MessageType;
+  /** SHA-256 of the locally installed schema definition; never fetched from the sender. */
+  schemaDigest: string;
   threadId: string | null;
   timestamp: number;
   body: JSONObject;

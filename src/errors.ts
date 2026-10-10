@@ -9,7 +9,7 @@ export type ACEErrorCode =
   | 'replay' | 'decryption_failed' | 'invalid_body' | 'transition_not_allowed' | 'wrong_role'
   | 'wrong_party' | 'bad_reference' | 'limit_exceeded' | 'invalid_key' | 'invalid_registration'
   | 'invalid_profile' | 'invalid_principal' | 'wrong_principal' | 'invalid_peer' | 'stale_peer_binding' | 'unknown_peer' | 'not_registered'
-  | 'relay_rejected' | 'envelope_expired' | 'pending_send_conflict' | 'blocked_address' | 'direct_rejected'
+  | 'relay_rejected' | 'envelope_expired' | 'pending_send_conflict' | 'blocked_address' | 'direct_rejected' | 'delivery_rejected'
   // transient
   | 'relay_unavailable' | 'relay_protocol_error' | 'fetch_failed' | 'direct_unavailable'
   // local
@@ -23,14 +23,17 @@ const ALL: ReadonlySet<string> = new Set([
   'replay', 'decryption_failed', 'invalid_body', 'transition_not_allowed', 'wrong_role',
   'wrong_party', 'bad_reference', 'limit_exceeded', 'invalid_key', 'invalid_registration',
   'invalid_profile', 'invalid_principal', 'wrong_principal', 'invalid_peer', 'stale_peer_binding', 'unknown_peer', 'not_registered',
-  'relay_rejected', 'envelope_expired', 'pending_send_conflict', 'blocked_address', 'direct_rejected',
+  'relay_rejected', 'envelope_expired', 'pending_send_conflict', 'blocked_address', 'direct_rejected', 'delivery_rejected',
   ...TRANSIENT, ...LOCAL,
 ]);
 
 export interface ACEErrorOptions {
   status?: number;
   relayCode?: string;
-  /** `direct_rejected`: the receiver's `error` string (08-relay § Direct Delivery). */
+  /**
+   * `direct_rejected`: the receiver's `error` string (08-relay § Direct Delivery);
+   * `delivery_rejected`: the Inbox code carried by the receiver's secure-delivery receipt (13-session-core).
+   */
   remoteCode?: string;
   retryAfterSeconds?: number;
   cause?: unknown;
@@ -80,13 +83,6 @@ export class ACEError extends Error {
   get isTransient(): boolean {
     return this.category !== 'permanent';
   }
-}
-
-/** Internal: wrap a non-ACE failure into `code`, passing ACE errors through. */
-export function asACEError(err: unknown, code: ACEErrorCode, message: string): ACEError {
-  if (err instanceof ACEError) return err;
-  const detail = err instanceof Error ? err.message : String(err);
-  return new ACEError(code, `${message}: ${detail}`.slice(0, 500), { cause: err });
 }
 
 /** Internal: the message an error was created with, without the `code: ` prefix. */

@@ -9,7 +9,7 @@ import { ACEError } from './errors.js';
  * timeout is 10 s. A lock not acquired in time is `receiver_busy` for the `receive` lock and
  * `lock_busy` otherwise.
  */
-export interface ACEStore {
+export interface StoreData {
   read(key: string): Promise<Uint8Array | null>;
   /** Atomic replace, durable when the promise resolves. A value over 64 MiB is `invalid_argument`. */
   write(key: string, value: Uint8Array): Promise<void>;
@@ -17,25 +17,39 @@ export interface ACEStore {
   delete(key: string): Promise<void>;
   /** Keys starting with `prefix`, sorted ascending. */
   list(prefix: string): Promise<string[]>;
+}
+
+/** The scoped data handle is valid only during this callback; do not retain it or detach work. */
+export interface CoordinatedStore {
+  coordinate<T>(name: string, body: (data: StoreData) => Promise<T>): Promise<T>;
+}
+
+export interface ACEStore extends StoreData {
   /** Exclusive, non-reentrant lock. Resolves to a release function. */
   lock(name: string, opts?: { timeoutMs?: number }): Promise<() => Promise<void>>;
 }
 
+/** Internal: run `body` under `store.lock(name)`, the plain-lock implementation of `CoordinatedStore.coordinate`. */
+export async function withLock<T>(store: ACEStore, name: string, body: (data: ACEStore) => Promise<T>): Promise<T> {
+  const release = await store.lock(name);
+  try { return await body(store); } finally { await release(); }
+}
+
 const KEY_RE = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)*$/;
 const LOCK_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
+export const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
 /** Internal: the largest value a store accepts (and reads back). */
 export const MAX_VALUE_BYTES = 64 * 1024 * 1024;
 
 export function checkKey(key: unknown): string {
-  if (typeof key !== 'string' || key.length > 200 || !KEY_RE.test(key)) {
+  if (typeof key !== 'string' || key.length > 200 || KEY_RE.exec(key)?.[0] !== key) {
     throw new ACEError('invalid_argument', `invalid store key ${JSON.stringify(String(key).slice(0, 60))}`);
   }
   return key;
 }
 
 export function checkLockName(name: unknown): string {
-  if (typeof name !== 'string' || !LOCK_RE.test(name)) {
+  if (typeof name !== 'string' || LOCK_RE.exec(name)?.[0] !== name) {
     throw new ACEError('invalid_argument', 'invalid lock name');
   }
   return name;
@@ -147,4 +161,6 @@ export class MemoryStore implements ACEStore {
       mutex.release();
     };
   }
+
+  coordinate<T>(name: string, body: (data: StoreData) => Promise<T>): Promise<T> { return withLock(this, name, body); }
 }

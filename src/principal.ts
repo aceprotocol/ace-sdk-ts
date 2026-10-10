@@ -1,11 +1,11 @@
 /** Principal binding (09-principal): records, the `principal` signing context, same-account rules and the `requests/` ledger. */
 
-import type { VerifiedPeer } from './discovery.js';
 import {
   CONTROL_CHAR_RE, MAX_SAFE_INTEGER, canonicalStateBytes, codePointLength, decodeB64, decodeSignature, encodeSignature, isACEId,
   isConversationId, isMessageId, isObj, pairKey, parseStateBytes, toBase64, wireInt,
 } from './encoding.js';
 import { ACEError } from './errors.js';
+
 import { PRINCIPAL_MAX_LIFETIME_SECONDS, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { buildSignData, computeACEId, encodePayload, isValidSigningPublicKey, signingAddress, verifySignature } from './signing.js';
 import type { ACEStore } from './store.js';
@@ -15,9 +15,17 @@ import {
   type PrincipalRole, type SigningScheme,
 } from './types.js';
 
-export const PRINCIPAL_ROLES: readonly PrincipalRole[] = ['controller', 'agent'];
+/** Compare authenticated statements, independently of randomized signature bytes. */
+export function samePrincipalClaims(a: PrincipalRecord, b: PrincipalRecord): boolean {
+  return a.account === b.account && a.issuedAt === b.issuedAt && a.expiresAt === b.expiresAt
+    && a.scope === b.scope && a.signer.scheme === b.signer.scheme && a.signer.publicKey === b.signer.publicKey
+    && a.roles.length === b.roles.length && a.roles.every((role, i) => role === b.roles[i]);
+}
+
+/** Canonical order: `controller` (approves) before `delegate` (acts). */
+export const PRINCIPAL_ROLES: readonly PrincipalRole[] = ['controller', 'delegate'];
 const CAIP10_RE = /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}$/;
-const ALLOWED_ROLES: ReadonlyArray<readonly string[]> = [['controller'], ['agent'], ['controller', 'agent']];
+const ALLOWED_ROLES: ReadonlyArray<readonly string[]> = [['controller'], ['delegate'], ['controller', 'delegate']];
 const EIP155_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const WRONG_DECIDER = 'decision from a different controller than the request was sent to';
 
@@ -28,7 +36,7 @@ const WRONG_DECIDER = 'decision from a different controller than the request was
 export type OpenRequestTo = (conversationId: string, requestId: string, now: number) => string | null | Promise<string | null>;
 
 export function isCaip10(v: unknown): v is string {
-  return typeof v === 'string' && CAIP10_RE.test(v);
+  return typeof v === 'string' && CAIP10_RE.exec(v)?.[0] === v;
 }
 
 const bad = (m: string) => new ACEError('invalid_principal', m);
@@ -101,7 +109,7 @@ function rolesAllowed(roles: readonly string[]): boolean {
 /** 09 § Validation rules 2-7 on a parsed record; returns the decoded signer key. */
 function checkFields(r: PrincipalRecord, now: number): Uint8Array {
   if (!isCaip10(r.account)) throw bad('principal.account must be a CAIP-10 account'); // 2
-  if (!rolesAllowed(r.roles)) throw bad('principal.roles must be ["controller"], ["agent"] or ["controller","agent"]'); // 3
+  if (!rolesAllowed(r.roles)) throw bad('principal.roles must be ["controller"], ["delegate"] or ["controller","delegate"]'); // 3
   if (!isSigningScheme(r.signer.scheme)) throw bad('principal.signer.scheme is unsupported'); // 4
   const signerKey = decodeB64(r.signer.publicKey, 'invalid_principal', 'principal.signer.publicKey', 64);
   if (!isValidSigningPublicKey(r.signer.scheme, signerKey)) throw bad('principal.signer.publicKey is not a valid key for its scheme');
@@ -166,7 +174,7 @@ export async function createPrincipalRecord(signer: PrincipalSigner, o: {
   issuedAt?: number;
 }): Promise<PrincipalRecord> {
   if (!Array.isArray(o.roles) || o.roles.some((r) => !(PRINCIPAL_ROLES as readonly unknown[]).includes(r))) {
-    throw new ACEError('invalid_argument', "roles must contain only 'controller' and 'agent'");
+    throw new ACEError('invalid_argument', "roles must contain only 'controller' and 'delegate'");
   }
   const issuedAt = o.issuedAt ?? Math.floor(Date.now() / 1000);
   const draft: PrincipalRecord = {
@@ -226,20 +234,8 @@ export async function checkPrincipalRules(type: string, body: JSONObject, o: {
 }): Promise<void> {
   if (!isPrincipalType(type)) throw new ACEError('invalid_argument', 'not a principal message type');
   if (o.selfAccount === null || o.selfAccount === undefined) throw new ACEError('wrong_principal', 'the receiver has no principal'); // 1
-  if (o.senderPrincipal === null || o.senderPrincipal === undefined) throw new ACEError('wrong_principal', 'the sender has no principal'); // 2
-  let p: PrincipalRecord;
-  try { // 3
-    p = validatePrincipalRecord(o.senderPrincipal, o.senderSigningPublicKey, o.now);
-  } catch (e) {
-    if (e instanceof ACEError && e.code === 'invalid_principal') {
-      throw new ACEError('wrong_principal', `the sender's principal is invalid: ${e.message}`);
-    }
-    throw e;
-  }
-  if (!isAccountAuthority(p, o.selfSigner, o.trustedSigners ?? [])) { // 4
-    throw new ACEError('wrong_principal', 'signer is not an authority of the account');
-  }
-  if (p.account !== o.selfAccount) throw new ACEError('wrong_principal', 'the sender belongs to another account'); // 5
+  const p = senderPrincipal(o.senderPrincipal, o.senderSigningPublicKey, o.selfAccount, o.selfSigner, o.trustedSigners, o.now);
+  if (p instanceof ACEError) throw p;
   if (type === 'decision') {
     if (!p.roles.includes('controller')) throw new ACEError('wrong_principal', 'only a controller may send a decision'); // 6
     const recipient = o.openRequestTo ? await o.openRequestTo(o.conversationId, body.requestId as string, o.now) : null;
@@ -255,17 +251,32 @@ export async function checkPrincipalRules(type: string, body: JSONObject, o: {
  * account, same account). False means a peer refresh may help (R-P20).
  */
 export function senderPrincipalUsable(
-  senderPrincipal: unknown, senderSigningPublicKey: Uint8Array, ctx: PrincipalContext, now: number,
+  principal: unknown, senderSigningPublicKey: Uint8Array, ctx: PrincipalContext, now: number,
 ): boolean {
-  if (senderPrincipal === null || senderPrincipal === undefined) return false;
+  return !(senderPrincipal(principal, senderSigningPublicKey, ctx.account, ctx.selfSigner, ctx.trustedSigners, now) instanceof ACEError);
+}
+
+/** 09 steps 2-5 (and scope): the sender's valid principal, or the first `wrong_principal` failure. Other errors throw. */
+function senderPrincipal(
+  principal: unknown, signingPublicKey: Uint8Array, selfAccount: string, selfSigner: PrincipalKey | undefined,
+  trustedSigners: readonly PrincipalKey[] | undefined, now: number,
+): PrincipalRecord | ACEError {
+  if (principal === null || principal === undefined) return new ACEError('wrong_principal', 'the sender has no principal'); // 2
   let p: PrincipalRecord;
-  try {
-    p = validatePrincipalRecord(senderPrincipal, senderSigningPublicKey, now);
+  try { // 3
+    p = validatePrincipalRecord(principal, signingPublicKey, now);
   } catch (e) {
-    if (e instanceof ACEError && e.code === 'invalid_principal') return false;
+    if (e instanceof ACEError && e.code === 'invalid_principal') {
+      return new ACEError('wrong_principal', `the sender's principal is invalid: ${e.message}`);
+    }
     throw e;
   }
-  return isAccountAuthority(p, ctx.selfSigner, ctx.trustedSigners ?? []) && p.account === ctx.account;
+  if (!isAccountAuthority(p, selfSigner, trustedSigners ?? [])) { // 4
+    return new ACEError('wrong_principal', 'signer is not an authority of the account');
+  }
+  if (p.account !== selfAccount) return new ACEError('wrong_principal', 'the sender belongs to another account'); // 5
+  if (p.scope !== undefined) return new ACEError('wrong_principal', 'unsupported principal scope');
+  return p;
 }
 
 // --- requests/ ledger (09 § Persistence, 06 Appendix A) ----------------------------------------------------------

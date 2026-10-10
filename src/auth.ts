@@ -4,7 +4,8 @@ import { ACEError } from './errors.js';
 import { codePointLength, CONTROL_CHAR_RE, decimal, decodeSignature, encodeSignature, isACEId, isHttpsUrl, isStreamId, MAX_SAFE_INTEGER, wireInt } from './encoding.js';
 import { MAX_INBOX_PAGE, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { buildSignData, encodePayload, verifySignature } from './signing.js';
-import type { ACEIdentity, SigningScheme } from './types.js';
+import { extCanonical, validateExt } from './ext.js';
+import type { ACEIdentity, ExtMap, SigningScheme } from './types.js';
 import { isSigningScheme } from './types.js';
 
 export type WebhookMethod = 'PUT' | 'GET' | 'DELETE';
@@ -13,7 +14,8 @@ export type RelayAuthRequest =
   | { action: 'listen'; since: string }
   | { action: 'inbox'; since: string; limit: number }
   | { action: 'unregister' }
-  | { action: 'intent'; need: string; tags: string[]; maxPrice: string | null; currency: string | null; ttl: number }
+  /** `ext`: the intent's namespaced extensions (02 § Profile Fields rules), or null / absent. */
+  | { action: 'intent'; need: string; tags: string[]; ext?: ExtMap | null; ttl: number }
   | { action: 'webhook'; method: WebhookMethod; url: string; secret: string };
 
 export const WEBHOOK_SECRET_MIN = 16;
@@ -84,11 +86,9 @@ export function authPayload(req: RelayAuthRequest): Uint8Array {
       if (!Array.isArray(req.tags) || !req.tags.every((t) => typeof t === 'string' && !t.includes(','))) {
         throw bad("tags must be strings without ','");
       }
-      for (const v of [req.maxPrice, req.currency]) {
-        if (v !== null && v !== undefined && typeof v !== 'string') throw bad('maxPrice and currency must be strings or null');
-      }
+      const ext = validateExt(req.ext, 'intent'); // invalid_argument, incl. urn:ace:commerce:1 when present
       if (wireInt(req.ttl) === null) throw bad('ttl must be an integer in [0, 2^53-1]');
-      return encodePayload(req.need, req.tags.join(','), req.maxPrice ?? '', req.currency ?? '', decimal(req.ttl));
+      return encodePayload(req.need, req.tags.join(','), extCanonical(ext), decimal(req.ttl));
     }
     case 'webhook': {
       if (req.method !== 'PUT' && req.method !== 'GET' && req.method !== 'DELETE') throw bad('method must be PUT, GET or DELETE');

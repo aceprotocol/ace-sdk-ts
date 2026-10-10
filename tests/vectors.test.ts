@@ -13,8 +13,10 @@ import { adoptDecision, type VerifiedPeer } from '../src/discovery.js';
 import { authPayload } from '../src/auth.js';
 import { decodeBody } from '../src/messages.js';
 import {
-  Inbox, MAX_DIRECT_BODY_BYTES, MemoryStore, PeerStore, isBlockedAddress, signWebhookNotification, verifyWebhookNotification,
+  Inbox, MAX_DIRECT_BODY_BYTES, MemoryStore, PeerStore, RelayClient, isBlockedAddress, signWebhookNotification, verifyWebhookNotification,
 } from '../src/index.js';
+import { SecureMailbox } from '../src/secure-mailbox.js';
+import { SecureTransport } from '../src/secure-transport.js';
 import { normalizeRelayUrl, relayErrorFor } from '../src/relay.js';
 import {
   checkPrincipalRules, createPrincipalRecord, principalPayload, principalSignData, principalSignerFromIdentity, validatePrincipalRecord,
@@ -56,7 +58,7 @@ describe('vectors', () => {
     expect(computeConversationId(alice.getEncryptionPublicKey(), bob.getEncryptionPublicKey())).toBe(V.conversationId);
     const sd = V.signData;
     const mp = sd.messagePayload;
-    const payload = encodePayload(mp.type, mp.to, mp.conversationId, mp.messageId, mp.threadId, b64(mp.kemCiphertext), b64(mp.ciphertext));
+    const payload = encodePayload(mp.to, mp.conversationId, mp.messageId, b64(mp.kemCiphertext), b64(mp.ciphertext));
     const data = buildSignData(sd.action, sd.aceId, sd.timestamp, payload);
     expect(hex(data)).toBe(sd.signDataHex);
     expect(toBase64(await alice.sign(data))).toBe(V.signature.signatureValue);
@@ -74,7 +76,7 @@ describe('vectors', () => {
     const env = em.envelope;
     const raw = await decryptWithSeed(b64(env.encryption.kemCiphertext), b64(env.encryption.payload),
       b64(VECTORS.agents.bob.encryptionPrivateKey), env.conversationId);
-    expect(JSON.parse(new TextDecoder().decode(raw))).toEqual(em.expectedBody);
+    expect(JSON.parse(new TextDecoder().decode(raw)).body).toEqual(em.expectedBody);
   });
 
   it.each(V.envelopes.map((v: { name: string }) => [v.name, v]))('envelope: %s', (_name, v: any) => {
@@ -210,7 +212,7 @@ function authRequest(r: any): RelayAuthRequest {
   if (r.action === 'inbox') return { action: 'inbox', since: r.since, limit: r.limit };
   if (r.action === 'unregister') return { action: 'unregister' };
   if (r.action === 'webhook') return { action: 'webhook', method: r.method, url: r.url, secret: r.secret };
-  return { action: 'intent', need: r.need, tags: r.tags, maxPrice: r.maxPrice, currency: r.currency, ttl: r.ttl };
+  return { action: 'intent', need: r.need, tags: r.tags, ext: r.ext ?? null, ttl: r.ttl };
 }
 
 describe('auth', () => {
@@ -274,7 +276,7 @@ describe('peer binding', () => {
       try {
         const cand = s.record !== undefined
           ? verifyPeerRecord(s.record)
-          : verifyRegistrationFile(s.registrationFile, { pinnedAt: s.pinnedAt });
+          : verifyRegistrationFile(s.registrationFile);
         const d = adoptDecision(pin, cand, c.now);
         pin = d.peer;
         got = d.outcome;
@@ -340,8 +342,12 @@ describe('directReceive', () => {
   });
 
   it.each(V.directReceive.cases.map((c: any) => [c.name, c]))('%s', async (_n, c: any) => {
-    const store = new MemoryStore();
-    const inbox = await Inbox.open({ identity: agent('bob'), store, peers: new PeerStore({ store }), onMessage: () => {} });
+    const store = new MemoryStore(), peers = new PeerStore({ store }), identity = agent('bob');
+    const inbox = await Inbox.open({ commerce: true, identity, store, peers, onMessage: () => {} });
+    // every case fails before any MLS work: the engine is never reached
+    const mailbox = await SecureMailbox.open({
+      identity, store, peers, relay: new RelayClient('https://relay.example'), secure: new SecureTransport(identity, null as never, store), inbox,
+    });
     try {
       let raw = c.bodyHex !== undefined ? unhex(c.bodyHex) : new TextEncoder().encode(c.body);
       if (c.padTo !== undefined) {
@@ -349,10 +355,10 @@ describe('directReceive', () => {
         padded.set(raw);
         raw = padded;
       }
-      const reply = await inbox.receiveDirect(raw);
+      const reply = await mailbox.receiveDirect(raw);
       expect([reply.status, reply.body]).toEqual([c.status, { ok: false, error: c.error }]);
     } finally {
-      await inbox.close();
+      await mailbox.close();
     }
   });
 });

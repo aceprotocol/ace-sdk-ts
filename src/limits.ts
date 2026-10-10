@@ -14,6 +14,11 @@ export const MAX_REGISTRATION_FILE_BYTES = 1048576;
 export const MAX_INBOX_PAGE = 100;
 /** The longest principal record lifetime, `expiresAt - issuedAt` (366 days), 09-principal. */
 export const PRINCIPAL_MAX_LIFETIME_SECONDS = 31622400;
+/** `ext` of a profile, registration file or intent (02-discovery § Profile Fields). */
+export const MAX_EXT_KEYS = 8;
+export const MAX_EXT_KEY_BYTES = 256;
+export const MAX_EXT_BYTES = 4096;
+export const MAX_EXT_DEPTH = 8;
 
 export const KEM_SEED_SIZE = 32;
 export const KEM_PUBLIC_KEY_SIZE = 1216;

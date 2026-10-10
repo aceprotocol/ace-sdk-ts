@@ -2,7 +2,7 @@
 
 import { ACEError } from './errors.js';
 import {
-  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isConversationId, isMessageId, isObj, isThreadId, loadsBody, toBase64, wireInt,
+  checkJsonValue, decodeSignature, dumpsBody, encodeSignature, isConversationId, isMessageId, isObj, isThreadId, loadsBody, nowOf, toBase64, wireInt, sha256Hex, canonicalStateBytes,
 } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { computeConversationId, encrypt } from './encryption.js';
@@ -19,7 +19,7 @@ import { isEconomicType, isMessageType, isPrincipalType, isSigningScheme } from 
 
 type FieldKind = 'str' | 'optStr' | 'optObj' | 'obj' | 'optTtl';
 
-const SCHEMAS: Record<MessageType, Array<[string, FieldKind]>> = {
+const SCHEMAS: Partial<Record<MessageType, Array<[string, FieldKind]>>> = {
   rfq: [['need', 'str'], ['maxPrice', 'optStr'], ['currency', 'optStr'], ['ttl', 'optTtl']],
   offer: [['price', 'str'], ['currency', 'str'], ['terms', 'optStr'], ['ttl', 'optTtl']],
   accept: [['offerId', 'str']],
@@ -56,7 +56,7 @@ function checkRef(type: MessageType, ref: Record<string, unknown>): void {
 export function validateBody(type: MessageType, body: JSONObject): void {
   if (!isMessageType(type)) throw new ACEError('invalid_argument', 'unknown message type');
   if (!isObj(body)) throw new ACEError('invalid_body', 'body must be a JSON object');
-  for (const [name, kind] of SCHEMAS[type]) {
+  for (const [name, kind] of SCHEMAS[type] ?? []) {
     const v = body[name];
     if (v === null || v === undefined) {
       if (kind === 'str' || kind === 'obj') throw new ACEError('invalid_body', `${type}.${name} is required`);
@@ -82,6 +82,36 @@ export function validateBody(type: MessageType, body: JSONObject): void {
   }
 }
 
+/**
+ * An installed deterministic validator for one `schemaDigest` (00 § Application schema): pure, no I/O,
+ * no effects. Throw to reject: a permanent `ACEError` keeps its code, anything else is `invalid_body`.
+ * The Inbox quarantines a rejected message; `Outbox.stage` refuses it before anything is persisted.
+ */
+export type SchemaValidator = (message: Pick<ParsedMessage, 'type' | 'schemaDigest' | 'threadId' | 'body'>) => void;
+
+/** Internal: the `schemas` option of Inbox.open / Outbox.open (`invalid_argument`); undefined → empty. */
+export function installedSchemas(v: unknown): ReadonlyMap<string, SchemaValidator> {
+  const out = new Map<string, SchemaValidator>();
+  if (v === undefined) return out;
+  const bad = () => new ACEError('invalid_argument', 'schemas must map 64-hex schema digests to validator functions');
+  if (!isObj(v)) throw bad();
+  for (const [digest, validator] of Object.entries(v)) {
+    if (!isConversationId(digest) || typeof validator !== 'function') throw bad();
+    out.set(digest, validator as SchemaValidator);
+  }
+  return out;
+}
+
+/** Internal: run an installed validator on a copy of the body with the brief's error mapping. */
+export function applySchema(validator: SchemaValidator, message: Parameters<SchemaValidator>[0]): void {
+  try {
+    validator({ type: message.type, schemaDigest: message.schemaDigest, threadId: message.threadId, body: loadsBody(dumpsBody(message.body)) });
+  } catch (e) {
+    if (e instanceof ACEError && e.category === 'permanent') throw e;
+    throw new ACEError('invalid_body', 'installed schema validator rejected the body', { cause: e });
+  }
+}
+
 /** Internal: decrypted bytes -> validated body (`invalid_body`). */
 export function decodeBody(type: MessageType, raw: Uint8Array): JSONObject {
   const body = loadsBody(raw);
@@ -89,15 +119,44 @@ export function decodeBody(type: MessageType, raw: Uint8Array): JSONObject {
   return body;
 }
 
-function nowOf(clock?: () => number): number {
-  return Math.floor(clock ? clock() : Date.now() / 1000);
+/** Locally installed application schema fingerprint. Unknown schemas are never installed from a message. */
+export function knownSchemaDigest(type: MessageType): string | undefined {
+  const fields = SCHEMAS[type];
+  if (fields === undefined) return undefined;
+  let digest = schemaDigests.get(type);
+  if (digest === undefined) {
+    digest = sha256Hex(canonicalStateBytes({ type, fields, outcomes: OUTCOMES[type] ?? [], version: 1 }));
+    schemaDigests.set(type, digest);
+  }
+  return digest;
+}
+const schemaDigests = new Map<MessageType, string>();
+
+export function eventOf(message: ParsedMessage): ThreadEvent {
+  return { ...message, threadId: message.threadId ?? undefined };
 }
 
-export function eventOf(env: ACEMessage): ThreadEvent {
-  return {
-    conversationId: env.conversationId, threadId: env.threadId, type: env.type, messageId: env.messageId,
-    timestamp: env.timestamp, from: env.from, to: env.to,
-  };
+function privateContent(type: MessageType, body: JSONObject, threadId?: string, schemaDigest?: string): JSONObject {
+  const expected = knownSchemaDigest(type);
+  const digest = schemaDigest ?? expected;
+  if (typeof digest !== 'string' || !isConversationId(digest) || (expected !== undefined && digest !== expected)) {
+    throw new ACEError('invalid_body', 'a matching immutable schemaDigest is required');
+  }
+  const content = { type, schemaDigest: digest, body, ...(threadId === undefined ? {} : { threadId }) };
+  checkJsonValue(content);
+  return content;
+}
+
+export function decodePrivateContent(raw: Uint8Array): Pick<ParsedMessage, 'type' | 'schemaDigest' | 'threadId' | 'body'> {
+  const content = loadsBody(raw);
+  if (Object.keys(content).some(k => !['type', 'schemaDigest', 'threadId', 'body'].includes(k))) throw new ACEError('invalid_body', 'unknown private content field');
+  if (!isMessageType(content.type) || !isObj(content.body) || typeof content.schemaDigest !== 'string') throw new ACEError('invalid_body', 'invalid private content');
+  if (content.threadId !== undefined && !isThreadId(content.threadId)) throw new ACEError('invalid_body', 'invalid private threadId');
+  const type = content.type;
+  const body = content.body as JSONObject;
+  const checked = privateContent(type, body, content.threadId as string | undefined, content.schemaDigest as string);
+  validateBody(type, body);
+  return { type, body, schemaDigest: checked.schemaDigest as string, threadId: (content.threadId as string | undefined) ?? null };
 }
 
 // --- create -----------------------------------------------------------------------
@@ -107,8 +166,9 @@ export interface CreateMessageInput {
   recipient: VerifiedPeer;
   type: MessageType;
   body: JSONObject;
-  threads: ThreadStateMachine;
+  threads?: ThreadStateMachine;
   threadId?: string;
+  schemaDigest?: string;
   timestamp?: number;
 }
 
@@ -122,15 +182,15 @@ export async function buildMessage(opts: CreateMessageInput, reuseMessageId?: st
   if (typeof opts !== 'object' || opts === null) throw new ACEError('invalid_argument', 'options are required');
   const { sender, recipient, type, body, threads, threadId } = opts;
   if (!isVerifiedPeer(recipient)) throw new ACEError('invalid_argument', 'recipient must be a VerifiedPeer');
-  if (!(threads instanceof ThreadStateMachine)) throw new ACEError('invalid_argument', 'threads must be a ThreadStateMachine');
+  if (threads !== undefined && !(threads instanceof ThreadStateMachine)) throw new ACEError('invalid_argument', 'threads must be a ThreadStateMachine');
   // 1. type, threadId, local identity
   if (!isMessageType(type)) throw new ACEError('invalid_argument', 'unknown message type');
   if (threadId !== undefined && !isThreadId(threadId)) {
     throw new ACEError('invalid_argument', 'threadId must be 1..256 code points without control characters');
   }
-  if (threadId === undefined && isEconomicType(type)) throw new ACEError('invalid_argument', 'economic messages require threadId');
+  if (threads !== undefined && threadId === undefined && isEconomicType(type)) throw new ACEError('invalid_argument', 'economic messages require threadId');
   const from = sender.getACEId();
-  if (threads.localAceId !== from) throw new ACEError('invalid_argument', 'threads.localAceId must be the sender');
+  if (threads !== undefined && threads.localAceId !== from) throw new ACEError('invalid_argument', 'threads.localAceId must be the sender');
   const ts = opts.timestamp ?? nowOf();
   if (wireInt(ts) === null) throw new ACEError('invalid_argument', 'timestamp must be an integer in [0, 2^53-1]');
   // 2. JSON values, then schema
@@ -142,35 +202,34 @@ export async function buildMessage(opts: CreateMessageInput, reuseMessageId?: st
   const messageId = reuseMessageId ?? crypto.randomUUID();
   const event: ThreadEvent = { conversationId, threadId, type, messageId, timestamp: ts, from, to: recipient.aceId };
   // 4. state machine pre-check
-  threads.check(event, body);
+  threads?.check(event, body);
   // 5. serialize
-  const plaintext = dumpsBody(body);
+  const plaintext = dumpsBody(privateContent(type, body, threadId, opts.schemaDigest));
   if (plaintext.length > MAX_PLAINTEXT_BYTES) throw new ACEError('limit_exceeded', `body exceeds ${MAX_PLAINTEXT_BYTES} bytes`);
   // 6. encrypt
   const { kemCiphertext, payload } = await encrypt(plaintext, recipient.encryptionPublicKey, conversationId);
   const scheme = sender.getSigningScheme();
   const env: ACEMessage = {
-    ace: '1.0', messageId, from, to: recipient.aceId, conversationId, type, timestamp: ts,
+    ace: '2.0', messageId, from, to: recipient.aceId, conversationId, timestamp: ts,
     encryption: { kemCiphertext: toBase64(kemCiphertext), payload: toBase64(payload) },
     signature: { scheme, value: '' },
   };
-  if (threadId !== undefined) env.threadId = threadId;
   // 7. sign
   env.signature.value = encodeSignature(await sender.sign(messageSignData(env)), scheme);
   // 8. commit
-  threads.apply(event, body);
+  threads?.apply(event, body);
   return env;
 }
 
 // --- parse ------------------------------------------------------------------------
 
 export interface ParseMessageOptions {
-  threads: ThreadStateMachine;
+  threads?: ThreadStateMachine;
   replay: ReplayDetector;
   /** Acceptance floor in [0, now]; default now - 300. */
   floor?: number;
   clock?: () => number;
-  /** The receiver's principal context (09); without it principal types are `wrong_principal`. */
+  /** Explicitly installed account coordination policy (09); absence means data-only reception. */
   principal?: PrincipalContext;
 }
 
@@ -191,13 +250,13 @@ function isPrincipalContext(v: unknown): v is PrincipalContext {
  * decode → wrong_recipient → from (invalid_envelope) → scheme_mismatch →
  * conversationId (invalid_envelope) → floor / timestamp (stale_timestamp) → replay →
  * invalid_signature → replay commit → decrypt → invalid_body → state machine / principal rules.
- * Principal types (`request`, `decision`, `report`) need `opts.principal`; without it they are `wrong_principal`.
+ * Account coordination validation applies only when `opts.principal` is installed. Receiving data does not authorize execution.
  */
 export async function parseMessage(
   envelope: ACEMessage, receiver: ACEIdentity, sender: VerifiedPeer, opts: ParseMessageOptions,
 ): Promise<ParsedMessage> {
   if (!isVerifiedPeer(sender)) throw new ACEError('invalid_argument', 'sender must be a VerifiedPeer');
-  if (typeof opts !== 'object' || opts === null || !(opts.threads instanceof ThreadStateMachine) || !(opts.replay instanceof ReplayDetector)) {
+  if (typeof opts !== 'object' || opts === null || (opts.threads !== undefined && !(opts.threads instanceof ThreadStateMachine)) || !(opts.replay instanceof ReplayDetector)) {
     throw new ACEError('invalid_argument', 'threads and replay are required');
   }
   if (opts.principal !== undefined && !isPrincipalContext(opts.principal)) {
@@ -205,7 +264,7 @@ export async function parseMessage(
   }
   const { threads, replay } = opts;
   const receiverId = receiver.getACEId();
-  if (threads.localAceId !== receiverId) throw new ACEError('invalid_argument', 'threads.localAceId must be the receiver');
+  if (threads !== undefined && threads.localAceId !== receiverId) throw new ACEError('invalid_argument', 'threads.localAceId must be the receiver');
   // 1
   const env = decodeEnvelope(envelope);
   // 2-5
@@ -246,29 +305,28 @@ export async function parseMessage(
     if (e instanceof ACEError) throw e;
     throw new ACEError('identity_unavailable', `identity decrypt failed: ${e instanceof Error ? e.name : typeof e}`, { cause: e });
   }
-  // 11-12
-  const body = decodeBody(env.type, plaintext);
-  // 13
-  if (isEconomicType(env.type)) threads.apply(eventOf(env), body);
-  else if (isPrincipalType(env.type)) await checkPrincipal(env, body, sender, opts.principal, now);
-  return {
-    messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId, type: env.type,
-    threadId: env.threadId ?? null, timestamp: env.timestamp, body,
+  const content = decodePrivateContent(plaintext);
+  const parsed: ParsedMessage = {
+    messageId: env.messageId, from: env.from, to: env.to, conversationId: env.conversationId,
+    timestamp: env.timestamp, ...content,
   };
+  // Application profiles are explicitly installed by the host. Receiving data is not permission to execute it.
+  if (threads !== undefined && isEconomicType(parsed.type)) threads.apply(eventOf(parsed), parsed.body);
+  if (opts.principal !== undefined && isPrincipalType(parsed.type)) await checkPrincipal(parsed, sender, opts.principal, now);
+  return parsed;
 }
 
 /**
- * 06 step 7 for principal types (09 § Same-Account Rules). (The Inbox refreshes the
- * sender before parsing, outside any store lock, R-P20.)
+ * Internal: 06 step 7 for principal types (09 § Same-Account Rules). (The Inbox refreshes the
+ * sender after parsing, outside any store lock, R-P20.)
  */
-async function checkPrincipal(
-  env: ACEMessage, body: JSONObject, sender: VerifiedPeer, ctx: PrincipalContext | undefined, now: number,
+export async function checkPrincipal(
+  env: ParsedMessage, sender: VerifiedPeer, ctx: PrincipalContext, now: number,
 ): Promise<void> {
-  const peer = sender;
-  await checkPrincipalRules(env.type, body, {
-    conversationId: env.conversationId, senderPrincipal: peer.principal ?? null, senderSigningPublicKey: peer.signingPublicKey,
-    selfAccount: ctx?.account ?? null, openRequestTo: ctx?.openRequestTo, now, selfSigner: ctx?.selfSigner,
-    trustedSigners: ctx?.trustedSigners,
+  await checkPrincipalRules(env.type, env.body, {
+    conversationId: env.conversationId, senderPrincipal: sender.principal ?? null, senderSigningPublicKey: sender.signingPublicKey,
+    selfAccount: ctx.account, openRequestTo: ctx.openRequestTo, now, selfSigner: ctx.selfSigner,
+    trustedSigners: ctx.trustedSigners,
   });
 }
 

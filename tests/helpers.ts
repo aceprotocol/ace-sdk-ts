@@ -1,6 +1,10 @@
+import { ed25519 } from '@noble/curves/ed25519.js';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { bindingSignData } from '../src/discovery.js';
+import { encodeSignature } from '../src/encoding.js';
 import { readFileSync } from 'node:fs';
 import { expect } from 'vitest';
-import { ACEError, SoftwareIdentity, createRegistrationFile, verifyRegistrationFile, type VerifiedPeer } from '../src/index.js';
+import { ACEError, SoftwareIdentity, verifyPeerRecord, toBase64, type VerifiedPeer } from '../src/index.js';
 
 export const VECTORS = JSON.parse(readFileSync(new URL('./fixtures/test-vectors.json', import.meta.url), 'utf8'));
 export const V = VECTORS.vectors;
@@ -11,7 +15,18 @@ export function agent(name: 'alice' | 'bob'): SoftwareIdentity {
 }
 
 export function peerOf(identity: SoftwareIdentity, pinnedAt = 0): VerifiedPeer {
-  return verifyRegistrationFile(createRegistrationFile(identity, { name: 'Peer', endpoint: 'https://peer.example/ace' }), { pinnedAt });
+  const scheme = identity.getSigningScheme();
+  const spk = toBase64(identity.getSigningPublicKey()), epk = toBase64(identity.getEncryptionPublicKey());
+  const digest = bindingSignData(identity.getACEId(), pinnedAt, epk, spk);
+  const secret = b64(identity.exportPrivateKey().signingPrivateKey);
+  let sig: Uint8Array;
+  if (scheme === 'ed25519') sig = ed25519.sign(digest, secret);
+  else {
+    const recovered = secp256k1.sign(digest, secret, { prehash: false, lowS: true, format: 'recovered' });
+    sig = new Uint8Array([...recovered.subarray(1), recovered[0]]);
+  }
+  return verifyPeerRecord({ aceId: identity.getACEId(), scheme, signingPublicKey: spk, encryptionPublicKey: epk,
+    registeredAt: pinnedAt, registrationSignature: encodeSignature(sig, scheme) });
 }
 
 /** The wire bytes of a JSON value (what `Inbox.receive` takes). */

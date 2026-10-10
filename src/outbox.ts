@@ -1,19 +1,19 @@
 /** Sender durability: stage, deliver, re-sign, abandon (06-security § Durable Delivery, Sender). */
 
 import { ACEError } from './errors.js';
+import { intentDigest as digestIntent } from './intent.js';
 import {
-  canonicalStateBytes, encodeSignature, isACEId, parseStateBytes, sha256Hex, wireInt,
+  canonicalStateBytes, checkJsonValue, dumpsBody, encodeSignature, isACEId, isConversationId, loadsBody, parseStateBytes, sha256Hex, wireInt,
 } from './encoding.js';
 import { isVerifiedPeer, type VerifiedPeer } from './discovery.js';
 import { computeConversationId } from './encryption.js';
 import { messageSignData } from './envelope.js';
-import { buildMessage } from './messages.js';
+import { applySchema, buildMessage, installedSchemas, knownSchemaDigest, type SchemaValidator } from './messages.js';
 import { repairThreadsFromDeliveries } from './inbox.js';
 import { recordRequest } from './principal.js';
-import { ThreadStateMachine } from './state-machine.js';
 import type { ACEStore } from './store.js';
 import {
-  decodePendingSend, encodePendingSend, isRequestId, restoreMachine, snapshotWithHistory, ThreadRecords,
+  archiveSent, decodePendingSend, encodePendingSend, isRequestId, sentKey, restoreMachine, snapshotWithHistory, ThreadRecords,
   type PendingSend, type ThreadRecord,
 } from './thread-store.js';
 import type { ACEIdentity, ACEMessage, JSONObject, MessageType } from './types.js';
@@ -24,6 +24,11 @@ export type { PendingSend };
 function outboxKey(requestId: string): string {
   return `outbox/${sha256Hex(requestId)}.json`;
 }
+
+type StageInput = { recipient: VerifiedPeer; type: MessageType; body: JSONObject; threadId?: string; schemaDigest?: string; requestId?: string };
+
+/** `schemas`: installed deterministic validators keyed by `schemaDigest`; `stage` refuses a rejected body before anything is persisted. */
+type OutboxOptions = { identity: ACEIdentity; store: ACEStore; clock?: () => number; commerce?: boolean; schemas?: Record<string, SchemaValidator> };
 
 type Located =
   | { kind: 'outbox'; pending: PendingSend }
@@ -39,12 +44,16 @@ export class Outbox {
   readonly #store: ACEStore;
   readonly #threads: ThreadRecords;
   readonly #clock?: () => number;
+  readonly #commerce: boolean;
+  readonly #schemas: ReadonlyMap<string, SchemaValidator>;
 
-  private constructor(o: { identity: ACEIdentity; store: ACEStore; clock?: () => number }) {
+  private constructor(o: OutboxOptions) {
     if (typeof o !== 'object' || o === null || typeof o.store !== 'object' || o.store === null || typeof o.identity !== 'object') {
       throw new ACEError('invalid_argument', 'identity and store are required');
     }
     this.#identity = o.identity;
+    this.#commerce = o.commerce === true;
+    this.#schemas = installedSchemas(o.schemas);
     this.#store = o.store;
     this.#clock = o.clock;
     const local = o.identity.getACEId();
@@ -58,7 +67,7 @@ export class Outbox {
    * between its delivery and thread writes), so staging never diverges from received history.
    * Messages are not handed over and replay state is not touched.
    */
-  static async open(o: { identity: ACEIdentity; store: ACEStore; clock?: () => number }): Promise<Outbox> {
+  static async open(o: OutboxOptions): Promise<Outbox> {
     const outbox = new Outbox(o);
     await repairThreadsFromDeliveries(o.store, outbox.#threads);
     return outbox;
@@ -73,20 +82,40 @@ export class Outbox {
    * exists it is returned unchanged (idempotent staging). An economic message on a thread that
    * already has a different pending send is `pending_send_conflict`.
    */
-  async stage(o: { recipient: VerifiedPeer; type: MessageType; body: JSONObject; threadId?: string; requestId?: string }): Promise<PendingSend> {
+  async stage(o: StageInput): Promise<PendingSend> {
     if (typeof o !== 'object' || o === null) throw new ACEError('invalid_argument', 'options are required');
+    checkJsonValue(o.body);
+    // Own the intent before waiting on another process or a hardware signer. Caller mutation
+    // must not make the operation digest describe different bytes from the signed message.
+    const input = { ...o, body: loadsBody(dumpsBody(o.body)) };
+    return this.#threads.withLock(() => this.#stage(input));
+  }
+
+  async #stage(o: StageInput): Promise<PendingSend> {
     const requestId = o.requestId ?? crypto.randomUUID();
     if (!isRequestId(requestId)) throw new ACEError('invalid_argument', 'requestId must be 1-256 characters without control characters');
     if (!isVerifiedPeer(o.recipient)) throw new ACEError('invalid_argument', 'recipient must be a VerifiedPeer');
-    const existing = await this.#locate(requestId);
-    if (existing !== null) return existing.pending;
     const local = this.#identity.getACEId();
-    if (!isEconomicType(o.type)) {
+    const schemaDigest = o.schemaDigest ?? knownSchemaDigest(o.type);
+    if (typeof schemaDigest !== 'string' || !isConversationId(schemaDigest)) throw new ACEError('invalid_body', 'schemaDigest is required');
+    const validator = this.#schemas.get(schemaDigest);
+    if (validator !== undefined) applySchema(validator, { type: o.type, schemaDigest, threadId: o.threadId ?? null, body: o.body });
+    const metadata = { type: o.type, schemaDigest, ...(o.threadId === undefined ? {} : { threadId: o.threadId }) };
+    const intentDigest = digestIntent({ schemaDigest, from: local, to: o.recipient.aceId, type: o.type, threadId: o.threadId ?? null, body: o.body });
+    const existing = await this.#locate(requestId);
+    const prior = existing?.pending ?? await this.#readOutboxKey(sentKey(requestId));
+    if (prior !== null) {
+      if (prior.intentDigest !== intentDigest) throw new ACEError('pending_send_conflict', 'requestId is already bound to different parameters');
+      // Retrying a completed send uses the original signed envelope, never a new operation.
+      if (existing === null) await this.#writeOutbox(prior);
+      return prior;
+    }
+    if (!this.#commerce || !isEconomicType(o.type)) {
       const message = await buildMessage({
-        sender: this.#identity, recipient: o.recipient, type: o.type, body: o.body,
-        threads: new ThreadStateMachine({ localAceId: local }), threadId: o.threadId, timestamp: this.#now(),
+        sender: this.#identity, recipient: o.recipient, type: o.type, body: o.body, schemaDigest,
+        threadId: o.threadId, timestamp: this.#now(),
       });
-      const pending: PendingSend = { requestId, status: 'pending', stagedAt: this.#now(), message };
+      const pending: PendingSend = { ...metadata, requestId, status: 'pending', stagedAt: this.#now(), message, intentDigest };
       // a principal request keeps its body ttl: the retry needs it for the requests/ record (06 Appendix A)
       const ttl = o.type === 'request' ? wireInt(o.body.ttl) : null;
       if (ttl !== null) pending.requestTtl = ttl;
@@ -94,56 +123,57 @@ export class Outbox {
       return pending;
     }
     if (o.threadId === undefined) throw new ACEError('invalid_argument', 'economic messages require threadId');
-    return this.#threads.withLock(async () => {
-      const conversationId = computeConversationId(this.#identity.getEncryptionPublicKey(), o.recipient.encryptionPublicKey);
-      const record = await this.#threads.loadRecord(conversationId, o.threadId!);
-      if (record?.pending) {
-        if (record.pending.requestId === requestId) return record.pending;
-        throw new ACEError('pending_send_conflict', 'the thread already has a different pending send');
-      }
-      const machine = restoreMachine(local, record?.snapshot ?? null);
-      // a message that opens a thread is bounded per peer (pre-checked before any crypto)
-      if (record === null && machine.allowedTypes(conversationId, o.threadId!, local).includes(o.type)) {
-        await this.#threads.checkCanOpen(o.recipient.aceId);
-      }
-      const message = await buildMessage({
-        sender: this.#identity, recipient: o.recipient, type: o.type, body: o.body, threads: machine,
-        threadId: o.threadId, timestamp: this.#now(),
-      });
-      const pending: PendingSend = { requestId, status: 'pending', stagedAt: this.#now(), message };
-      await this.#threads.saveRecord({ snapshot: machine.getSnapshot(conversationId, o.threadId!)!, pending });
-      return pending;
+    const conversationId = computeConversationId(this.#identity.getEncryptionPublicKey(), o.recipient.encryptionPublicKey);
+    const record = await this.#threads.loadRecord(conversationId, o.threadId!);
+    if (record?.pending) {
+      if (record.pending.requestId === requestId) return record.pending;
+      throw new ACEError('pending_send_conflict', 'the thread already has a different pending send');
+    }
+    const machine = restoreMachine(local, record?.snapshot ?? null);
+    // a message that opens a thread is bounded per peer (pre-checked before any crypto)
+    if (record === null && machine.allowedTypes(conversationId, o.threadId!, local).includes(o.type)) {
+      await this.#threads.checkCanOpen(o.recipient.aceId);
+    }
+    const message = await buildMessage({
+      sender: this.#identity, recipient: o.recipient, type: o.type, body: o.body, threads: machine,
+      threadId: o.threadId, schemaDigest, timestamp: this.#now(),
     });
+    const pending: PendingSend = { ...metadata, requestId, status: 'pending', stagedAt: this.#now(), message, intentDigest };
+    await this.#threads.saveRecord({ snapshot: machine.getSnapshot(conversationId, o.threadId!)!, pending });
+    return pending;
   }
 
   /**
-   * Hand the pending envelope to `transport` and return what it returns. On success the send
-   * is acknowledged (economic: the thread's pending is cleared; otherwise the outbox file is
-   * deleted). An `expired` send is refused with `envelope_expired` before any transport call;
+   * Hand the pending envelope to `transport` and return what it returns. The transport is the
+   * secure delivery, `envelope => secure.deliver(envelope, peer, exchange)` (a `SecureTransport`
+   * with a `SecureRelayReplies.exchange`): it resolves only once the peer's Inbox durably
+   * committed the envelope. On success the send is acknowledged (economic: the thread's pending
+   * is cleared; otherwise the outbox file is deleted). An `expired` send is refused with `envelope_expired` before any transport call;
    * `envelope_expired` from the transport marks it `expired` (then `resign`); any other error
-   * leaves it unchanged. After a successful transport a principal `request` is recorded in
-   * `requests/` (lock `requests`) before the send is cleared; if that write fails the send stays
-   * pending and a retry writes it (06 § Durable Delivery, Sender).
+   * leaves it unchanged. Before transport, a principal `request` is recorded in `requests/` (lock `requests`).
+   * A failed write prevents sending. A lost transport acknowledgement retains the request
+   * correlation, so a controller decision is still accepted.
    */
   async deliver<T>(requestId: string, transport: (env: ACEMessage) => Promise<T>): Promise<T> {
     if (typeof transport !== 'function') throw new ACEError('invalid_argument', 'transport must be a function');
-    const found = await this.#require(requestId);
+    const found = await this.#threads.withLock(() => this.#require(requestId));
     if (found.pending.status === 'expired') throw new ACEError('envelope_expired', 'the pending send expired; resign it first');
     const message = found.pending.message;
-    let result: T;
-    try {
-      result = await transport(message);
-    } catch (e) {
-      if (e instanceof ACEError && e.code === 'envelope_expired') await this.#markExpired(requestId, message.messageId);
-      throw e;
-    }
-    if (message.type === 'request') {
+    // Persist the correlation before any transport can deliver the request or its reply.
+    if (found.pending.type === 'request') {
       const release = await this.#store.lock('requests');
       try {
         await recordRequest(this.#store, message, this.#now(), found.pending.requestTtl);
       } finally {
         await release();
       }
+    }
+    let result: T;
+    try {
+      result = await transport(message);
+    } catch (e) {
+      if (e instanceof ACEError && e.code === 'envelope_expired') await this.#markExpired(requestId, message.messageId);
+      throw e;
     }
     await this.#acknowledge(requestId, message.messageId);
     return result;
@@ -155,16 +185,18 @@ export class Outbox {
    * binds the new timestamp). Economic: the head entry is rebuilt with the new timestamp.
    */
   async resign(requestId: string): Promise<PendingSend> {
-    const found = await this.#require(requestId);
-    if (found.pending.status !== 'expired') throw new ACEError('invalid_argument', 'only an expired send can be re-signed');
-    if (found.kind === 'outbox') {
-      const pending = await this.#resigned(found.pending);
-      await this.#writeOutbox(pending);
-      return pending;
-    }
+    if (!isRequestId(requestId)) throw new ACEError('invalid_argument', 'invalid requestId');
     return this.#threads.withLock(async () => {
-      const rec = await this.#reload(found.record, requestId);
-      const pending = await this.#resigned(rec.pending!);
+      if (await this.#store.read(sentKey(requestId)) !== null) throw new ACEError('invalid_argument', 'a completed operation cannot be renewed');
+      const found = await this.#require(requestId);
+      if (found.pending.status !== 'expired') throw new ACEError('invalid_argument', 'only an expired send can be re-signed');
+      if (found.pending.requestTtl !== undefined) throw new ACEError('invalid_argument', 'a request deadline cannot be extended by transport retry');
+      const pending = await this.#resigned(found.pending);
+      if (found.kind === 'outbox') {
+        await this.#writeOutbox(pending);
+        return pending;
+      }
+      const rec = found.record;
       const h = rec.snapshot.history.slice();
       const head = h[h.length - 1];
       if (head?.messageId !== pending.message.messageId) throw new ACEError('storage_failed', 'pending send is not the thread head');
@@ -174,22 +206,27 @@ export class Outbox {
     });
   }
 
-  /** Drop a pending send (unknown requestId: no-op). Economic: if it is the thread head, the head entry is removed. */
+  /** Stop retrying and retain the operation binding. This does not revoke a delivered request. */
   async abandon(requestId: string): Promise<void> {
     if (!isRequestId(requestId)) throw new ACEError('invalid_argument', 'invalid requestId');
-    const found = await this.#locate(requestId);
-    if (found === null) return; // unknown requestId: no-op
-    if (found.kind === 'outbox') {
-      await this.#store.delete(outboxKey(requestId));
-      return;
-    }
     await this.#threads.withLock(async () => {
-      const rec = await this.#reload(found.record, requestId);
+      const found = await this.#locate(requestId);
+      if (found === null) return;
+      if (found.kind === 'outbox') {
+        await archiveSent(this.#store, found.pending);
+        await this.#store.delete(outboxKey(requestId));
+        return;
+      }
+      const rec = found.record;
       const h = rec.snapshot.history;
-      const isHead = h[h.length - 1]?.messageId === rec.pending!.message.messageId;
+      const isHead = h[h.length - 1]?.messageId === found.pending.message.messageId;
       const snapshot = isHead ? snapshotWithHistory(rec.snapshot, h.slice(0, -1)) : rec.snapshot;
-      if (snapshot === null) await this.#threads.deleteRecord(rec.snapshot);
-      else await this.#threads.saveRecord({ snapshot, pending: null });
+      if (snapshot === null) {
+        await archiveSent(this.#store, found.pending);
+        await this.#threads.deleteRecord(rec.snapshot);
+      } else {
+        await this.#threads.saveRecord({ snapshot, pending: null }, rec); // archives found.pending
+      }
     });
   }
 
@@ -227,7 +264,7 @@ export class Outbox {
       throw new ACEError('storage_failed', `${key}: unknown version`);
     }
     const p = decodePendingSend(doc, key);
-    if (outboxKey(p.requestId) !== key) throw new ACEError('storage_failed', `${key}: record does not match its key`);
+    if (outboxKey(p.requestId) !== key && sentKey(p.requestId) !== key) throw new ACEError('storage_failed', `${key}: record does not match its key`);
     return p;
   }
 
@@ -247,38 +284,27 @@ export class Outbox {
     return found;
   }
 
-  /** Re-read a thread record under the lock and require the same pending send. */
-  async #reload(record: ThreadRecord, requestId: string): Promise<ThreadRecord> {
-    const rec = await this.#threads.loadRecord(record.snapshot.conversationId, record.snapshot.threadId);
-    if (rec?.pending?.requestId !== requestId) throw new ACEError('invalid_argument', 'no pending send with this requestId');
-    return rec;
-  }
-
   async #acknowledge(requestId: string, messageId: string): Promise<void> {
-    const found = await this.#locate(requestId);
-    if (found === null) return;
-    if (found.kind === 'outbox') {
-      if (found.pending.message.messageId === messageId) await this.#store.delete(outboxKey(requestId));
-      return;
-    }
     await this.#threads.withLock(async () => {
-      const rec = await this.#threads.loadRecord(found.record.snapshot.conversationId, found.record.snapshot.threadId);
-      if (rec?.pending?.message.messageId === messageId) await this.#threads.saveRecord({ snapshot: rec.snapshot, pending: null });
+      const found = await this.#locate(requestId);
+      if (found === null || found.pending.message.messageId !== messageId) return;
+      if (found.kind === 'thread') {
+        // saveRecord archives the prior pending operation before clearing it.
+        await this.#threads.saveRecord({ snapshot: found.record.snapshot, pending: null }, found.record);
+      } else {
+        await archiveSent(this.#store, found.pending);
+        await this.#store.delete(outboxKey(requestId));
+      }
     });
   }
 
   async #markExpired(requestId: string, messageId: string): Promise<void> {
-    const found = await this.#locate(requestId);
-    if (found === null || found.pending.message.messageId !== messageId) return;
-    if (found.kind === 'outbox') {
-      await this.#writeOutbox({ ...found.pending, status: 'expired' });
-      return;
-    }
     await this.#threads.withLock(async () => {
-      const rec = await this.#threads.loadRecord(found.record.snapshot.conversationId, found.record.snapshot.threadId);
-      if (rec?.pending?.message.messageId === messageId) {
-        await this.#threads.saveRecord({ snapshot: rec.snapshot, pending: { ...rec.pending, status: 'expired' } });
-      }
+      const found = await this.#locate(requestId);
+      if (found === null || found.pending.message.messageId !== messageId) return;
+      const pending: PendingSend = { ...found.pending, status: 'expired' };
+      if (found.kind === 'outbox') await this.#writeOutbox(pending);
+      else await this.#threads.saveRecord({ snapshot: found.record.snapshot, pending });
     });
   }
 }

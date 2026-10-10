@@ -63,24 +63,24 @@ export class Agent {
     a.id = a.identity.getACEId();
     a.relay = relay;
     a.peers = new PeerStore({ store, relay, clock: clock.fn });
-    a.outbox = await Outbox.open({ identity: a.identity, store, clock: clock.fn });
+    a.outbox = await Outbox.open({ commerce: true, identity: a.identity, store, clock: clock.fn });
     return a;
   }
 
   open(o: { store?: ACEStore; offlineWindowSeconds?: number; capacity?: number; onMessage?: Host['fn'] } = {}): Promise<Inbox> {
     const store = o.store ?? this.store;
-    return Inbox.open({
+    return Inbox.open({ commerce: true,
       identity: this.identity, store, peers: new PeerStore({ store, relay: this.relay, clock: this.clock.fn }),
       onMessage: o.onMessage ?? this.host.fn, clock: this.clock.fn, offlineWindowSeconds: o.offlineWindowSeconds, capacity: o.capacity,
     });
   }
 
-  registration() {
-    return createRegistrationFile(this.identity, { name: this.name, endpoint: `https://${this.name}.example/ace` });
+  async registration() {
+    return await createRegistrationFile(this.identity, { name: this.name, endpoint: `https://${this.name}.example/ace`, timestamp: 0 });
   }
 
-  pin(other: Agent): Promise<VerifiedPeer> {
-    return this.peers.pinRegistrationFile(other.registration(), { pinnedAt: 0 });
+  async pin(other: Agent): Promise<VerifiedPeer> {
+    return this.peers.pinRegistrationFile(await other.registration());
   }
 
   async peer(other: Agent): Promise<VerifiedPeer> {

@@ -8,8 +8,6 @@ import { THREAD_RETENTION_SECONDS, ThreadRecords, threadIndexKey, threadKey } fr
 import { expectCode, wire } from './helpers.js';
 import { Agent, Clock } from './pipeline.js';
 
-const RELAY_SRC = { kind: 'relay', relayUrl: 'https://relay.example', streamId: '1-0' } as const;
-
 function rfqSnapshot(local: string, peer: string, conversationId: string, threadId: string, ts: number, from = peer): ThreadSnapshot {
   return {
     conversationId, threadId, localAceId: local, peerAceId: peer, state: 'rfq',
@@ -70,7 +68,7 @@ describe('open-thread bound per peer', () => {
     const inbox = await bob.open(); // replay state first: the filled threads model earlier receipts
     const threads = await fill(bob.store, bob.id, alice.id, conv, MAX_OPEN_THREADS_PER_PEER, clock.t);
     const env = (await alice.outbox.stage({ recipient: await alice.peer(bob), type: 'rfq', body: { need: 'x' }, threadId: 'one-more' })).message;
-    const out = await inbox.receive(wire(env), RELAY_SRC);
+    const out = await inbox.receive(wire(env));
     expect(out.kind).toBe('quarantined');
     if (out.kind === 'quarantined') expect(out.error.code).toBe('limit_exceeded');
     expect(bob.host.calls).toEqual([]);
@@ -79,7 +77,7 @@ describe('open-thread bound per peer', () => {
     await expectCode(bob.outbox.stage({ recipient: await bob.peer(alice), type: 'rfq', body: { need: 'y' }, threadId: 'mine' }), 'limit_exceeded');
     // an existing thread still advances (bob replies with an offer)
     const offer = await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'offer', body: { price: '1', currency: 'USDC' }, threadId: 'fill-7' });
-    expect(offer.message.type).toBe('offer');
+    expect(offer.type).toBe('offer');
     // freeing a slot allows a new thread again
     await threads.remove(conv, 'fill-0');
     await bob.outbox.stage({ recipient: await bob.peer(alice), type: 'rfq', body: { need: 'y' }, threadId: 'mine' });

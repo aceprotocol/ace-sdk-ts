@@ -3,20 +3,22 @@
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, isACEId, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import {
-  adoptDecision, dropExpiredPrincipal, decodeEncryptionKey, decodeSigningKey, isVerifiedPeer, mintPeer, validateProfile,
+  adoptDecision, isVerifiedPeer, mintPeer,
   verifyPeerRecord, verifyRegistrationFile, type AdoptOutcome, type VerifiedPeer,
 } from './discovery.js';
+import { parsePrincipalRecord, samePrincipalClaims, validatePrincipalRecord } from './principal.js';
 import type { RelayClient } from './relay.js';
-import { computeACEId } from './signing.js';
 import type { ACEStore } from './store.js';
-import type { AgentProfile, RegistrationFile } from './types.js';
-import { isSigningScheme } from './types.js';
+import type { RegistrationFile } from './types.js';
 
 export const DEFAULT_PEER_TTL_SECONDS = 86400;
 
 function peerKey(aceId: string): string {
   return `peers/${sha256Hex(aceId)}.json`;
 }
+
+/** Distinct verified pins remembered per PeerStore instance. */
+const VERIFIED_PINS = 256;
 
 interface PinRecord {
   peer: VerifiedPeer;
@@ -39,6 +41,7 @@ export class PeerStore {
   }
 
   readonly #store: ACEStore;
+  readonly #verified = new Map<string, PinRecord>();
   readonly #relay: RelayClient | null;
   readonly #ttl: number;
   readonly #clock?: () => number;
@@ -107,9 +110,10 @@ export class PeerStore {
     if (!isVerifiedPeer(peer)) throw new ACEError('invalid_argument', 'peer must be a VerifiedPeer');
     const release = await this.#store.lock('peers');
     try {
-      const pin = await this.#load(peer.aceId);
+      const pin = await this.#load(peer.aceId, false);
       const now = this.#now();
       const decision = adoptDecision(pin?.peer ?? null, peer, now);
+      await this.#checkPrincipalHorizon(decision.peer);
       // Every adopted or kept candidate replaces the cached record, profile and fetchedAt included (02).
       await this.#write(decision.peer, now);
       return decision;
@@ -118,9 +122,9 @@ export class PeerStore {
     }
   }
 
-  /** Verify a registration file and adopt it (`registeredAt = pinnedAt ?? now`). */
-  async pinRegistrationFile(reg: RegistrationFile, opts: { pinnedAt?: number } = {}): Promise<VerifiedPeer> {
-    const peer = verifyRegistrationFile(reg, { pinnedAt: opts.pinnedAt ?? this.#now(), clock: this.#clock });
+  /** Verify a registration file and adopt it (signed binding time). */
+  async pinRegistrationFile(reg: RegistrationFile): Promise<VerifiedPeer> {
+    const peer = verifyRegistrationFile(reg, { clock: this.#clock });
     return (await this.adopt(peer)).peer;
   }
 
@@ -131,6 +135,33 @@ export class PeerStore {
       await this.#store.delete(peerKey(aceId));
     } finally {
       await release();
+    }
+  }
+
+  // A cache eviction, unsigned profile omission or key rotation must never erase the
+  // newest signed principal already observed for this stable signing identity.
+  async #checkPrincipalHorizon(peer: VerifiedPeer, persist = true): Promise<void> {
+    const next = peer.principal;
+    if (next === undefined) return;
+    const key = `principal-horizons/${sha256Hex([peer.aceId, next.account, next.signer.scheme, next.signer.publicKey].join('\0'))}.json`;
+    const raw = await this.#store.read(key);
+    let high = null;
+    if (raw !== null) {
+      try {
+        const d = parseStateBytes(raw, key) as Record<string, unknown>;
+        if (d.version !== 1 || d.aceId !== peer.aceId) throw new Error('wrong record');
+        high = parsePrincipalRecord(d.principal);
+        if (high.account !== next.account || high.signer.scheme !== next.signer.scheme || high.signer.publicKey !== next.signer.publicKey) throw new Error('wrong authority');
+        validatePrincipalRecord(high, peer.signingPublicKey, high.issuedAt);
+      } catch { throw new ACEError('storage_failed', `${key}: invalid principal horizon`); }
+    }
+    if (high !== null && (next.issuedAt < high.issuedAt ||
+      (next.issuedAt === high.issuedAt && !samePrincipalClaims(next, high)))) {
+      throw new ACEError('invalid_principal', 'principal rolls back or conflicts with the durable horizon');
+    }
+    if (persist && (high === null || next.issuedAt > high.issuedAt)) {
+      // Write the barrier first: a crash may deny access, never restore older authority.
+      await this.#store.write(key, canonicalStateBytes({ aceId: peer.aceId, principal: next, version: 1 }));
     }
   }
 
@@ -150,46 +181,52 @@ export class PeerStore {
     await this.#store.write(peerKey(peer.aceId), canonicalStateBytes(doc));
   }
 
-  async #load(aceId: string): Promise<PinRecord | null> {
+  async #load(aceId: string, enforceHorizon = true): Promise<PinRecord | null> {
     const key = peerKey(aceId);
     const raw = await this.#store.read(key);
     if (raw === null) return null;
-    const doc = parseStateBytes(raw, key);
     const bad = (why: string) => new ACEError('storage_failed', `${key}: ${why}`);
-    if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) throw bad('not an object');
-    const d = doc as Record<string, unknown>;
-    if (d.version !== 1) throw bad('unknown version');
-    if (d.aceId !== aceId) throw bad('record belongs to another ACE ID');
-    const fetchedAt = wireInt(d.fetchedAt);
-    if (fetchedAt === null) throw bad('invalid fetchedAt');
-    if (d.profile !== null && (typeof d.profile !== 'object' || Array.isArray(d.profile))) throw bad('invalid profile');
-    let peer: VerifiedPeer;
-    try {
-      if (d.source === 'relay') {
-        peer = verifyPeerRecord({
-          aceId: d.aceId, scheme: d.scheme, encryptionPublicKey: d.encryptionPublicKey, signingPublicKey: d.signingPublicKey,
-          registrationSignature: d.registrationSignature, registeredAt: d.registeredAt, profile: d.profile,
-        }, { clock: () => fetchedAt });
-      } else if (d.source === 'registration') {
-        if (d.registrationSignature !== null || !isSigningScheme(d.scheme)) throw bad('invalid registration pin');
-        const signingKey = decodeSigningKey(d.scheme, d.signingPublicKey, 'storage_failed');
-        if (computeACEId(signingKey) !== aceId) throw bad('aceId does not match the signing key');
-        const registeredAt = wireInt(d.registeredAt);
-        if (registeredAt === null) throw bad('invalid registeredAt');
-        const profile = dropExpiredPrincipal(d.profile === null ? null : validateProfile(d.profile as AgentProfile), signingKey, fetchedAt);
-        peer = mintPeer({
-          aceId, scheme: d.scheme, signingPublicKey: signingKey,
-          encryptionPublicKey: decodeEncryptionKey(d.encryptionPublicKey, 'storage_failed'),
-          registeredAt, registrationSignature: null, source: 'registration',
-          profile,
-        });
-      } else {
-        throw bad('unknown source');
-      }
-    } catch (e) {
-      if (e instanceof ACEError && e.code === 'storage_failed') throw e;
-      throw bad(`re-verification failed (${e instanceof ACEError ? e.code : 'error'})`);
+    // Re-verification is a pure function of the stored bytes: verify each distinct pin once per instance.
+    const memo = `${aceId}:${sha256Hex(raw)}`;
+    let pin = this.#verified.get(memo);
+    if (pin === undefined) {
+      pin = verifyPin(key, aceId, raw, bad);
+      if (this.#verified.size >= VERIFIED_PINS) this.#verified.delete(this.#verified.keys().next().value!);
+      this.#verified.set(memo, pin);
     }
+    if (enforceHorizon) {
+      try {
+        await this.#checkPrincipalHorizon(pin.peer, false);
+      } catch (e) {
+        if (e instanceof ACEError && e.code === 'storage_failed') throw e;
+        throw bad(`re-verification failed (${e instanceof ACEError ? e.code : 'error'})`);
+      }
+    }
+    return pin;
+  }
+
+}
+
+/** Parse and re-verify a stored pin (`#load`); any defect is `storage_failed`. */
+function verifyPin(key: string, aceId: string, raw: Uint8Array, bad: (why: string) => ACEError): PinRecord {
+  const doc = parseStateBytes(raw, key);
+  if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) throw bad('not an object');
+  const d = doc as Record<string, unknown>;
+  if (d.version !== 1) throw bad('unknown version');
+  if (d.aceId !== aceId) throw bad('record belongs to another ACE ID');
+  const fetchedAt = wireInt(d.fetchedAt);
+  if (fetchedAt === null) throw bad('invalid fetchedAt');
+  if (d.profile !== null && (typeof d.profile !== 'object' || Array.isArray(d.profile))) throw bad('invalid profile');
+  try {
+    if (d.source !== 'relay' && d.source !== 'registration') throw bad('unknown source');
+    const verified = verifyPeerRecord({
+      aceId: d.aceId, scheme: d.scheme, encryptionPublicKey: d.encryptionPublicKey, signingPublicKey: d.signingPublicKey,
+      registrationSignature: d.registrationSignature, registeredAt: d.registeredAt, profile: d.profile,
+    }, { clock: () => fetchedAt });
+    const peer = mintPeer({ ...verified, signingPublicKey: verified.signingPublicKey, encryptionPublicKey: verified.encryptionPublicKey, source: d.source });
     return { peer, fetchedAt };
+  } catch (e) {
+    if (e instanceof ACEError && e.code === 'storage_failed') throw e;
+    throw bad(`re-verification failed (${e instanceof ACEError ? e.code : 'error'})`);
   }
 }

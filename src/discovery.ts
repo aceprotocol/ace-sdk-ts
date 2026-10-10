@@ -3,17 +3,16 @@
 import bs58 from 'bs58';
 import { ACEError, type ACEErrorCode } from './errors.js';
 import {
-  bytesEqual, canonicalJson, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, isObj, wireInt,
+  toBase64, bytesEqual, codePointLength, CONTROL_CHAR_RE, decodeB64, decodeSignature, isACEId, isHttpsUrl, isObj, wireInt,
 } from './encoding.js';
 import { KEM_PUBLIC_KEY_SIZE, MAX_REGISTRATION_FILE_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import {
   buildSignData, computeACEId, encodePayload, isValidSigningPublicKey, signingAddress, verifySignature,
 } from './signing.js';
 import { loadHttps, loadLookup, pinnedRequest, type LookupFn } from './pinned-https.js';
-import type {
-  AgentProfile, Capability, ChainInfo, PeerRecord, PrincipalRecord, ProfilePricing, RegistrationFile, SigningScheme,
-} from './types.js';
-import { isExpiredOnly, parsePrincipalRecord, validatePrincipalRecord } from './principal.js';
+import type { AgentProfile, Capability, PeerRecord, PrincipalRecord, RegistrationFile, SigningScheme } from './types.js';
+import { validateExt } from './ext.js';
+import { isExpiredOnly, parsePrincipalRecord, samePrincipalClaims, validatePrincipalRecord } from './principal.js';
 import { isSigningScheme } from './types.js';
 
 // --- VerifiedPeer ------------------------------------------------------------------------
@@ -26,7 +25,7 @@ interface PeerFields {
   signingPublicKey: Uint8Array;
   encryptionPublicKey: Uint8Array;
   registeredAt: number;
-  registrationSignature: string | null;
+  registrationSignature: string;
   source: 'relay' | 'registration';
   profile: AgentProfile | null;
 }
@@ -45,8 +44,8 @@ export class VerifiedPeer {
   readonly #signingPublicKey: Uint8Array;
   readonly #encryptionPublicKey: Uint8Array;
   readonly registeredAt: number;
-  /** The relay binding signature (`register` action); `null` for a registration-file source. */
-  readonly registrationSignature: string | null;
+  /** The verified key-binding signature (`register` action), for every discovery source. */
+  readonly registrationSignature: string;
   readonly source: 'relay' | 'registration';
   /**
    * Unverified relay metadata: self-asserted by the peer and NOT covered by the binding
@@ -142,10 +141,8 @@ function optStrList(d: Record<string, unknown>, key: string, code: ACEErrorCode,
 // --- profile ----------------------------------------------------------------------------
 
 const TAG_RE = /^[a-z0-9][a-z0-9-]*$/;
-const CAIP2_RE = /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/;
-const AMOUNT_RE = /^[0-9]+(\.[0-9]+)?$/;
 
-/** Parse the profile wire shape; unknown top-level fields are dropped; pricing is strict. */
+/** Parse the profile wire shape; unknown top-level fields are dropped; `ext` is validated and re-canonicalised. */
 function parseProfile(d: unknown): AgentProfile {
   const code: ACEErrorCode = 'invalid_profile';
   if (!isObj(d)) throw new ACEError(code, 'profile must be a JSON object');
@@ -154,19 +151,12 @@ function parseProfile(d: unknown): AgentProfile {
     const v = opt(d, k, 'string', code, 'profile');
     if (v !== undefined) out[k] = v;
   }
-  for (const k of ['tags', 'capabilities', 'chains'] as const) {
+  for (const k of ['tags', 'capabilities'] as const) {
     const v = optStrList(d, k, code, 'profile');
     if (v !== undefined) out[k] = v;
   }
-  const p = opt(d, 'pricing', 'object', code, 'profile') as Record<string, unknown> | undefined;
-  if (p !== undefined) {
-    const extra = Object.keys(p).filter((k) => k !== 'currency' && k !== 'maxAmount');
-    if (extra.length > 0) throw new ACEError(code, `profile.pricing has unknown fields: ${extra.slice(0, 3).join(',')}`);
-    const pricing: ProfilePricing = { currency: req(p, 'currency', 'string', code, 'profile.pricing') };
-    const max = opt(p, 'maxAmount', 'string', code, 'profile.pricing');
-    if (max !== undefined) pricing.maxAmount = max;
-    out.pricing = pricing;
-  }
+  const ext = validateExt(d.ext, 'profile'); // 02 § Profile Fields, incl. urn:ace:commerce:1 when present
+  if (ext !== undefined) out.ext = ext;
   return out;
 }
 
@@ -195,17 +185,7 @@ export function validateProfile(profile: AgentProfile): AgentProfile {
   }
   if (p.tags !== undefined) tagList(p.tags, 'tags', 10);
   if (p.capabilities !== undefined) tagList(p.capabilities, 'capabilities', 20);
-  if (p.chains !== undefined && (p.chains.length > 10 || !p.chains.every((c) => CAIP2_RE.test(c)))) {
-    throw new ACEError('invalid_profile', 'profile.chains must be at most 10 CAIP-2 identifiers');
-  }
   if (p.endpoint !== undefined && !isHttpsUrl(p.endpoint)) throw new ACEError('invalid_profile', 'profile.endpoint must be an HTTPS URL');
-  if (p.pricing !== undefined) {
-    text(p.pricing.currency, 'pricing.currency', 1, 16);
-    const m = p.pricing.maxAmount;
-    if (m !== undefined && (m.length > 32 || !AMOUNT_RE.test(m))) {
-      throw new ACEError('invalid_profile', 'profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)');
-    }
-  }
   if (rawPrincipal !== undefined && rawPrincipal !== null) p.principal = parsePrincipalRecord(rawPrincipal); // after the other members (08 order)
   return p;
 }
@@ -287,7 +267,10 @@ export function verifyPeerRecord(record: unknown, opts: { clock?: () => number }
 
 // --- registration files ---------------------------------------------------------------------
 
-/** Parse the registration-file wire shape (`invalid_registration`). Unknown fields dropped; null optional = absent. */
+/**
+ * Parse the registration-file wire shape (`invalid_registration`; `ext` rules are `invalid_profile`). Unknown fields
+ * dropped; null optional = absent.
+ */
 export function parseRegistrationFile(d: unknown): RegistrationFile {
   const code: ACEErrorCode = 'invalid_registration';
   if (!isObj(d)) throw new ACEError(code, 'registration file must be a JSON object');
@@ -295,6 +278,8 @@ export function parseRegistrationFile(d: unknown): RegistrationFile {
   const tier = d.tier;
   if (tier !== 0 && tier !== 1) throw new ACEError(code, 'registration.tier must be 0 or 1');
   const reg: RegistrationFile = {
+    registeredAt: d.registeredAt as number,
+    registrationSignature: req(d, 'registrationSignature', 'string', code, 'registration'),
     ace: req(d, 'ace', 'string', code, 'registration'),
     id: req(d, 'id', 'string', code, 'registration'),
     name: req(d, 'name', 'string', code, 'registration'),
@@ -324,41 +309,23 @@ export function parseRegistrationFile(d: unknown): RegistrationFile {
       if (input !== undefined) cap.input = input;
       const output = opt(c, 'output', 'string', code, 'capability');
       if (output !== undefined) cap.output = output;
-      const p = opt(c, 'pricing', 'object', code, 'capability') as Record<string, unknown> | undefined;
-      if (p !== undefined) {
-        cap.pricing = {
-          model: req(p, 'model', 'string', code, 'capability.pricing'),
-          amount: req(p, 'amount', 'string', code, 'capability.pricing'),
-          currency: req(p, 'currency', 'string', code, 'capability.pricing'),
-        };
-      }
       return cap;
     });
   }
-  const settlement = optStrList(d, 'settlement', code, 'registration');
-  if (settlement !== undefined) reg.settlement = settlement;
-  const chains = opt(d, 'chains', 'array', code, 'registration') as unknown[] | undefined;
-  if (chains !== undefined) {
-    reg.chains = chains.map((c): ChainInfo => {
-      if (!isObj(c)) throw new ACEError(code, 'registration.chains entries must be objects');
-      return { network: req(c, 'network', 'string', code, 'chain'), address: req(c, 'address', 'string', code, 'chain') };
-    });
-  }
+  const ext = validateExt(d.ext, 'profile'); // same rules and code path as a relay profile's ext
+  if (ext !== undefined) reg.ext = ext;
   if (d.principal !== undefined && d.principal !== null) reg.principal = parsePrincipalRecord(d.principal);
   return reg;
 }
 
 /**
  * Run all 01 rules (including the ID hash); failures are `invalid_registration`.
- * The peer's `registeredAt` is `pinnedAt` or now (a file has no signed timestamp).
+ * Every discovery source must prove the binding of the encryption key to the ACE identity.
  */
 export function verifyRegistrationFile(
-  reg: RegistrationFile, opts: { pinnedAt?: number; clock?: () => number } = {},
+  reg: RegistrationFile, opts: { clock?: () => number } = {},
 ): VerifiedPeer {
   const code: ACEErrorCode = 'invalid_registration';
-  if (opts.pinnedAt !== undefined && wireInt(opts.pinnedAt) === null) {
-    throw new ACEError('invalid_argument', 'pinnedAt must be an integer in [0, 2^53-1]');
-  }
   const r = parseRegistrationFile(reg);
   if (r.ace !== '1.0') throw new ACEError(code, "ace must be '1.0'");
   if (!isACEId(r.id)) throw new ACEError(code, 'id is not an ACE ID');
@@ -388,11 +355,21 @@ export function verifyRegistrationFile(
   }
   if (computeACEId(signingKey) !== r.id) throw new ACEError(code, 'id does not match the signing key');
   const encKey = decodeEncryptionKey(s.encryptionPublicKey, code);
+  const registeredAt = wireInt(r.registeredAt);
+  if (registeredAt === null) throw new ACEError(code, 'registeredAt must be a wire integer');
+  const sig = decodeSignature(r.registrationSignature, s.scheme, code);
+  if (!verifySignature(bindingSignData(r.id, registeredAt, s.encryptionPublicKey, toBase64(signingKey)), sig, s.scheme, signingKey)) {
+    throw new ACEError(code, 'registrationSignature does not verify');
+  }
   const now = Math.floor(opts.clock ? opts.clock() : Date.now() / 1000);
-  const profile = dropExpiredPrincipal(r.principal === undefined ? null : { principal: r.principal }, signingKey, now);
+  // The file supplies `profile.ext` and `profile.principal` (02 § Rollback Barrier, registration-file merge).
+  const supplied: AgentProfile = {};
+  if (r.ext !== undefined) supplied.ext = r.ext;
+  if (r.principal !== undefined) supplied.principal = r.principal;
+  const profile = dropExpiredPrincipal(Object.keys(supplied).length === 0 ? null : supplied, signingKey, now);
   return mintPeer({
     aceId: r.id, scheme: s.scheme, signingPublicKey: signingKey, encryptionPublicKey: encKey,
-    registeredAt: opts.pinnedAt ?? now, registrationSignature: null, source: 'registration', profile,
+    registeredAt, registrationSignature: r.registrationSignature, source: 'registration', profile,
   });
 }
 
@@ -400,29 +377,16 @@ export function verifyRegistrationFile(
 
 export type AdoptOutcome = 'adopted' | 'unchanged' | 'rotated';
 
-function withProfile(pin: VerifiedPeer, profile: AgentProfile | null): VerifiedPeer {
-  return mintPeer({
-    aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey, encryptionPublicKey: pin.encryptionPublicKey,
-    registeredAt: pin.registeredAt, registrationSignature: pin.registrationSignature, source: pin.source, profile,
-  });
-}
-
-/** Byte-identical comparison via canonical JSON (the serializer has no arrays, so roles are joined). */
-function samePrincipal(a: PrincipalRecord, b: PrincipalRecord): boolean {
-  const c = (r: PrincipalRecord) => canonicalJson({ ...r, roles: r.roles.join(',') });
-  return c(a) === c(b) && a.roles.length === b.roles.length;
-}
-
 /**
  * Principal monotonicity (R-P36): `next` replaces the unexpired cached principal only when it is strictly newer
- * (`issuedAt`) or byte-identical at the same `issuedAt`; otherwise the cached one stays. Expired cached ones are
+ * (`issuedAt`) or claim-identical at the same `issuedAt`; otherwise the cached one stays. Expired cached ones are
  * dropped first (R-P35).
  */
 function pickPrincipal(cached: PrincipalRecord | undefined, next: PrincipalRecord | undefined, now: number, absentClears = false): PrincipalRecord | undefined {
   const old = cached !== undefined && cached.expiresAt > now ? cached : undefined;
   if (next === undefined) return absentClears ? undefined : old;
-  if (old === undefined) return next;
-  if (next.issuedAt > old.issuedAt || (next.issuedAt === old.issuedAt && samePrincipal(next, old))) return next;
+  if (old === undefined || old.account !== next.account || old.signer.scheme !== next.signer.scheme || old.signer.publicKey !== next.signer.publicKey) return next;
+  if (next.issuedAt > old.issuedAt || (next.issuedAt === old.issuedAt && samePrincipalClaims(next, old))) return next;
   return old;
 }
 
@@ -449,9 +413,7 @@ function relayProfile(pin: VerifiedPeer, candidate: VerifiedPeer, now: number): 
 /**
  * Internal pure rule used by `PeerStore.adopt`: the binding to store and the outcome.
  *
- * Rotation to a different encryption key requires a signed (relay) binding with a strictly
- * newer `registeredAt`; an unsigned registration-file candidate is adopted only without a
- * pin, or as `unchanged` when its key equals the pin (the pin is then kept exactly).
+ * Rotation to a different encryption key requires a strictly newer signed binding.
  */
 export function adoptDecision(pin: VerifiedPeer | null, candidate: VerifiedPeer, now: number): { peer: VerifiedPeer; outcome: AdoptOutcome } {
   if (candidate.registeredAt > now + TIMESTAMP_WINDOW_SECONDS) throw new ACEError('invalid_peer', 'registeredAt is in the future');
@@ -459,25 +421,18 @@ export function adoptDecision(pin: VerifiedPeer | null, candidate: VerifiedPeer,
   if (pin.aceId !== candidate.aceId || !bytesEqual(pin.signingPublicKey, candidate.signingPublicKey) || pin.scheme !== candidate.scheme) {
     throw new ACEError('invalid_peer', 'signing key or scheme differs from the pinned binding');
   }
-  const unsigned = candidate.registrationSignature === null;
   if (bytesEqual(pin.encryptionPublicKey, candidate.encryptionPublicKey)) {
-    if (unsigned) {
-      // An unsigned source never changes the pinned binding; the kept candidate replaces the other profile members
-      // and never removes or downgrades the cached principal (R-P26).
-      return { peer: withProfile(pin, fileProfile(pin.profile, candidate.profile, now)), outcome: 'unchanged' };
-    }
     const newer = candidate.registeredAt > pin.registeredAt ? candidate : pin;
     return {
       peer: mintPeer({
         aceId: pin.aceId, scheme: pin.scheme, signingPublicKey: pin.signingPublicKey,
         encryptionPublicKey: pin.encryptionPublicKey, registeredAt: newer.registeredAt,
         registrationSignature: newer.registrationSignature, source: newer.source,
-        profile: relayProfile(pin, candidate, now),
+        profile: candidate.source === 'registration' ? fileProfile(pin.profile, candidate.profile, now) : relayProfile(pin, candidate, now),
       }),
       outcome: 'unchanged',
     };
   }
-  if (unsigned) throw new ACEError('stale_peer_binding', 'an unsigned source cannot rotate a pinned encryption key');
   if (candidate.registeredAt > pin.registeredAt) return { peer: candidate, outcome: 'rotated' };
   throw new ACEError('stale_peer_binding', 'a different encryption key requires a newer registeredAt');
 }

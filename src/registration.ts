@@ -2,41 +2,48 @@
 
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { ACEError } from './errors.js';
-import { decodeB64, decodeSignature, encodeSignature, isACEId, toBase64, wireInt } from './encoding.js';
+import { decodeB64, decodeSignature, encodeSignature, isACEId, nowOf, toBase64, wireInt } from './encoding.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
   bindingSignData, checkProfilePrincipal, decodeEncryptionKey, decodeSigningKey, mintPeer, validateProfile, verifyRegistrationFile,
   type VerifiedPeer,
 } from './discovery.js';
+import { extCanonical } from './ext.js';
 import { validatePrincipalRecord } from './principal.js';
 import { KEM_PUBLIC_KEY_SIZE, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { buildSignData, computeACEId, encodePayload, signingAddress, verifySignature } from './signing.js';
 import type {
-  ACEIdentity, AgentProfile, Capability, ChainInfo, HardwareBacking, IdentityTier, PrincipalRecord, RegistrationFile, RegistrationRequest,
+  ACEIdentity, AgentProfile, Capability, ExtMap, HardwareBacking, IdentityTier, PrincipalRecord, RegistrationFile, RegistrationRequest,
 } from './types.js';
 import { isSigningScheme } from './types.js';
 
 const KEEP = Symbol('keep');
 
 /**
- * Build the registration file (02) of any identity, software or hardware-backed; throws
- * `invalid_registration` if the inputs are invalid.
+ * Build the registration file (01) of any identity, software or hardware-backed; throws
+ * `invalid_registration` if the inputs are invalid (`invalid_profile` for an invalid `ext`). Commerce data (chains,
+ * pricing, settlement, accounts) goes in `ext['urn:ace:commerce:1']`.
  */
-export function createRegistrationFile(identity: ACEIdentity, opts: {
+export async function createRegistrationFile(identity: ACEIdentity, opts: {
   name: string;
   endpoint: string;
   description?: string;
   tier?: IdentityTier;
   hardwareBacking?: HardwareBacking;
   capabilities?: Capability[];
-  settlement?: string[];
-  chains?: ChainInfo[];
+  ext?: ExtMap;
   principal?: PrincipalRecord;
-}): RegistrationFile {
+  timestamp?: number;
+}): Promise<RegistrationFile> {
   if (typeof opts !== 'object' || opts === null) throw new ACEError('invalid_argument', 'options are required');
   const scheme = identity.getSigningScheme();
   const signingPublicKey = identity.getSigningPublicKey();
+  const registeredAt = opts.timestamp ?? nowOf();
+  if (wireInt(registeredAt) === null) throw new ACEError('invalid_argument', 'timestamp must be a wire integer');
+  const enc = toBase64(identity.getEncryptionPublicKey());
+  const registrationSignature = encodeSignature(await identity.sign(bindingSignData(identity.getACEId(), registeredAt, enc, toBase64(signingPublicKey))), scheme);
   const reg: RegistrationFile = {
+    registeredAt, registrationSignature,
     ace: '1.0',
     id: identity.getACEId(),
     name: opts.name,
@@ -52,35 +59,32 @@ export function createRegistrationFile(identity: ACEIdentity, opts: {
   if (opts.description !== undefined) reg.description = opts.description;
   if (opts.hardwareBacking !== undefined) reg.hardwareBacking = opts.hardwareBacking;
   if (opts.capabilities !== undefined) reg.capabilities = opts.capabilities;
-  if (opts.settlement !== undefined) reg.settlement = opts.settlement;
-  if (opts.chains !== undefined) reg.chains = opts.chains;
+  if (opts.ext !== undefined) reg.ext = opts.ext;
   if (opts.principal !== undefined) reg.principal = opts.principal;
   // R-P44: the principal is validated at the real now (no allow-expired, no issuedAt-relative clock)
   const now = Math.floor(Date.now() / 1000);
   if (opts.principal !== undefined) validatePrincipalRecord(opts.principal, signingPublicKey, now);
-  verifyRegistrationFile(reg, { pinnedAt: 0, clock: () => now });
+  verifyRegistrationFile(reg, { clock: () => now });
   return reg;
 }
 
-/** The `register-request` payload (02). `profile`: KEEP, null, or a validated profile. */
+/**
+ * The `register-request` payload (02 § Registration authorization). `profile`: KEEP, null, or a validated profile;
+ * `replace` appends 16 fields after `mode`: name, description, image, tags, capabilities, endpoint, canonical `ext`
+ * (or empty), then `present|absent` and the eight principal fields.
+ */
 function registrationPayload(encB64: string, sigB64: string, scheme: string, profile: AgentProfile | null | typeof KEEP): Uint8Array {
   if (profile === KEEP) return encodePayload(encB64, sigB64, scheme, 'keep');
   if (profile === null) return encodePayload(encB64, sigB64, scheme, 'remove');
-  const pr = profile.pricing;
   const pp = profile.principal;
   return encodePayload(
     encB64, sigB64, scheme, 'replace', profile.name ?? '', profile.description ?? '', profile.image ?? '',
     encodePayload(...(profile.tags ?? [])), encodePayload(...(profile.capabilities ?? [])),
-    encodePayload(...(profile.chains ?? [])), profile.endpoint ?? '',
-    pr ? 'present' : 'absent', pr ? pr.currency : '', pr ? (pr.maxAmount ?? '') : '',
+    profile.endpoint ?? '', extCanonical(profile.ext),
     pp ? 'present' : 'absent', pp ? pp.account : '', pp ? pp.roles.join(',') : '', pp ? pp.signer.scheme : '',
     pp ? pp.signer.publicKey : '', pp ? String(pp.issuedAt) : '', pp ? String(pp.expiresAt ?? 0) : '',
     pp ? (pp.scope ?? '') : '', pp ? pp.signature : '',
   );
-}
-
-function nowOf(clock?: () => number): number {
-  return Math.floor(clock ? clock() : Date.now() / 1000);
 }
 
 /**

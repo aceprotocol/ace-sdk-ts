@@ -2,14 +2,14 @@
 
 import { ACEError } from './errors.js';
 import {
-  canonicalJson, decodeB64, decodeSignature, isACEId, isConversationId, isMessageId, isObj, isThreadId,
+  canonicalJson, decodeB64, decodeSignature, isACEId, isConversationId, isMessageId, isObj,
   sha256Hex, wireInt,
 } from './encoding.js';
 import { MIN_PAYLOAD_BYTES } from './encryption.js';
 import { KEM_CIPHERTEXT_SIZE, MAX_PAYLOAD_BYTES } from './limits.js';
 import { buildSignData, encodePayload, verifySignature } from './signing.js';
 import type { ACEMessage, SigningScheme } from './types.js';
-import { isEconomicType, isMessageType, isSigningScheme } from './types.js';
+import { isSigningScheme } from './types.js';
 
 function bad(msg: string): ACEError {
   return new ACEError('invalid_envelope', msg);
@@ -37,18 +37,13 @@ export function decodeEnvelope(json: unknown): ACEMessage {
   if (!isObj(json)) throw bad('envelope must be a JSON object');
   const ace = json.ace;
   if (typeof ace !== 'string') throw bad('ace must be a string');
-  if (ace !== '1.0') throw new ACEError('unsupported_version', `unsupported ACE version ${JSON.stringify(ace.slice(0, 16))}`);
-  const { messageId, from, to, conversationId, type } = json;
+  if (ace !== '2.0') throw new ACEError('unsupported_version', `unsupported ACE version ${JSON.stringify(ace.slice(0, 16))}`);
+  const { messageId, from, to, conversationId } = json;
   if (!isMessageId(messageId)) throw bad('messageId must be a lowercase UUIDv4');
   if (!isACEId(from) || !isACEId(to)) throw bad('from/to must be ACE IDs');
   if (!isConversationId(conversationId)) throw bad('conversationId must be 64 lowercase hex characters');
-  if (!isMessageType(type)) throw bad('unknown message type');
-  let threadId: string | undefined;
-  if (json.threadId !== undefined) {
-    if (!isThreadId(json.threadId)) throw bad('threadId must be 1..256 code points without control characters');
-    threadId = json.threadId;
-  }
-  if (threadId === undefined && isEconomicType(type)) throw bad('economic messages require threadId');
+  // Application metadata belongs only in the authenticated ciphertext.
+  if ('type' in json || 'threadId' in json || 'body' in json || 'schemaDigest' in json) throw bad('application fields must be encrypted');
   const timestamp = wireInt(json.timestamp);
   if (timestamp === null) throw bad('timestamp must be an integer in [0, 2^53-1]');
   const enc = json.encryption;
@@ -60,27 +55,25 @@ export function decodeEnvelope(json: unknown): ACEMessage {
   if (!isSigningScheme(sig.scheme)) throw bad('unsupported signature scheme');
   decodeSignature(sig.value, sig.scheme, 'invalid_envelope');
   const env: ACEMessage = {
-    ace: '1.0',
+    ace: '2.0',
     messageId,
     from,
     to,
     conversationId,
-    type,
     timestamp,
     encryption: { kemCiphertext: enc.kemCiphertext as string, payload: enc.payload as string },
     signature: { scheme: sig.scheme, value: sig.value as string },
   };
-  if (threadId !== undefined) env.threadId = threadId;
   return env;
 }
 
 /** The signed `message` signData of a decoded envelope. */
 export function messageSignData(env: ACEMessage): Uint8Array {
   const payload = encodePayload(
-    env.type, env.to, env.conversationId, env.messageId, env.threadId ?? '',
+    env.to, env.conversationId, env.messageId,
     decodeKemCiphertext(env.encryption.kemCiphertext), decodePayload(env.encryption.payload),
   );
-  return buildSignData('message', env.from, env.timestamp, payload);
+  return buildSignData('packet', env.from, env.timestamp, payload);
 }
 
 /**
@@ -100,7 +93,7 @@ export function verifyEnvelopeSignature(env: ACEMessage, signer: { scheme: Signi
   }
 }
 
-/** The 10 known fields in wire shape (threadId omitted when absent). */
+/** The eight routing, encryption and authentication fields. */
 export function envelopeKnownFields(env: ACEMessage): ACEMessage {
   const out: ACEMessage = {
     ace: env.ace,
@@ -108,16 +101,14 @@ export function envelopeKnownFields(env: ACEMessage): ACEMessage {
     from: env.from,
     to: env.to,
     conversationId: env.conversationId,
-    type: env.type,
     timestamp: env.timestamp,
     encryption: { kemCiphertext: env.encryption.kemCiphertext, payload: env.encryption.payload },
     signature: { scheme: env.signature.scheme, value: env.signature.value },
   };
-  if (env.threadId !== undefined) out.threadId = env.threadId;
   return out;
 }
 
-/** Lowercase hex SHA-256 of the RFC 8785 JSON of the 10 known envelope fields. */
+/** Lowercase hex SHA-256 of the RFC 8785 JSON of the known envelope fields. */
 export function envelopeFingerprint(env: ACEMessage): string {
   if (typeof env !== 'object' || env === null || typeof env.encryption !== 'object' || typeof env.signature !== 'object') {
     throw new ACEError('invalid_argument', 'expected an ACEMessage');

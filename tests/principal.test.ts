@@ -20,7 +20,7 @@ const CONV = 'ab'.repeat(32);
 const MID = '00000000-0000-4000-8000-000000000001';
 
 describe('principal types and bodies', () => {
-  it('type lists', () => {
+  it('type lists', async () => {
     expect(MESSAGE_TYPES.slice(-3)).toEqual(['request', 'decision', 'report']);
     expect(MESSAGE_TYPES).toHaveLength(13);
     expect(ECONOMIC_TYPES).toHaveLength(8);
@@ -29,7 +29,7 @@ describe('principal types and bodies', () => {
     expect(isPrincipalType('text')).toBe(false);
   });
 
-  it('error codes are permanent', () => {
+  it('error codes are permanent', async () => {
     expect(new ACEError('invalid_principal').category).toBe('permanent');
     expect(new ACEError('wrong_principal').isTransient).toBe(false);
   });
@@ -73,7 +73,7 @@ type RecOpts = Partial<{ roles: any; scope: string | null; expiresAt: number; is
 async function rec(owner: SoftwareIdentity, subject: SoftwareIdentity, o: RecOpts = {}): Promise<PrincipalRecord> {
   return createPrincipalRecord(principalSignerFromIdentity(owner), {
     subjectSigningPublicKey: subject.getSigningPublicKey(), account: o.account ?? ACC,
-    roles: o.roles ?? ['agent', 'controller', 'agent'], scope: o.scope, expiresAt: o.expiresAt ?? NOW + 3600,
+    roles: o.roles ?? ['delegate', 'controller', 'delegate'], scope: o.scope, expiresAt: o.expiresAt ?? NOW + 3600,
     issuedAt: o.issuedAt ?? NOW - 10,
   });
 }
@@ -81,8 +81,8 @@ async function rec(owner: SoftwareIdentity, subject: SoftwareIdentity, o: RecOpt
 const keyOf = (id: SoftwareIdentity): PrincipalKey => ({ scheme: id.getSigningScheme(), publicKey: toBase64(id.getSigningPublicKey()) });
 
 describe('principal records', () => {
-  it('constants and CAIP-10', () => {
-    expect(PRINCIPAL_ROLES).toEqual(['controller', 'agent']);
+  it('constants and CAIP-10', async () => {
+    expect(PRINCIPAL_ROLES).toEqual(['controller', 'delegate']);
     expect(isCaip10(ACC)).toBe(true);
     expect(isCaip10('eip155:1:0xabc')).toBe(true);
     for (const v of ['solana:abc', 'SOL:x:y', 'ab:x:y', `a:b:${'c'.repeat(129)}`, 1, null, `${ACC}\n`]) expect(isCaip10(v)).toBe(false);
@@ -92,21 +92,21 @@ describe('principal records', () => {
     const owner = await SoftwareIdentity.generate(scheme);
     const subject = await SoftwareIdentity.generate('ed25519');
     const r = await rec(owner, subject, { scope: 'copy:solana,hl', expiresAt: NOW + 3600 });
-    expect(r.roles).toEqual(['controller', 'agent']);
+    expect(r.roles).toEqual(['controller', 'delegate']);
     expect(r.expiresAt).toBe(NOW + 3600);
     expect(validatePrincipalRecord(JSON.parse(JSON.stringify(r)), subject.getSigningPublicKey(), NOW)).toEqual(r);
     const spk = subject.getSigningPublicKey();
     expect(principalPayload(r, spk)).toEqual(
-      encodePayload(ACC, 'controller,agent', scheme, r.signer.publicKey, toBase64(spk), 'copy:solana,hl', String(NOW + 3600)));
+      encodePayload(ACC, 'controller,delegate', scheme, r.signer.publicKey, toBase64(spk), 'copy:solana,hl', String(NOW + 3600)));
     expect(principalSignData(r, spk)).toEqual(buildSignData('principal', subject.getACEId(), NOW - 10, principalPayload(r, spk)));
   });
 
   it('scope null is absent, unknown members ignored, roles canonicalized', async () => {
     const owner = await SoftwareIdentity.generate('ed25519');
     const subject = await SoftwareIdentity.generate('secp256k1');
-    const r = await rec(owner, subject, { scope: null, roles: ['agent'] });
+    const r = await rec(owner, subject, { scope: null, roles: ['delegate'] });
     expect('scope' in r).toBe(false);
-    expect(r.roles).toEqual(['agent']);
+    expect(r.roles).toEqual(['delegate']);
     const spk = subject.getSigningPublicKey();
     expect(validatePrincipalRecord({ ...r, scope: null, extra: { x: 1 } }, spk, NOW)).toEqual(r);
     expect(parsePrincipalRecord({ ...r, extra: 1 })).toEqual(r);
@@ -118,7 +118,7 @@ describe('principal records', () => {
     const owner = await SoftwareIdentity.generate('ed25519');
     const subject = await SoftwareIdentity.generate('ed25519');
     await expectCode(rec(owner, subject, { roles: ['owner'] }), 'invalid_argument');
-    await expectCode(rec(owner, subject, { roles: 'agent' }), 'invalid_argument');
+    await expectCode(rec(owner, subject, { roles: 'delegate' }), 'invalid_argument');
     await expectCode(rec(owner, subject, { roles: [] }), 'invalid_principal');
     await expectCode(rec(owner, subject, { account: 'solana:abc' }), 'invalid_principal');
     await expectCode(rec(owner, subject, { expiresAt: NOW - 10 }), 'invalid_principal');
@@ -128,12 +128,12 @@ describe('principal records', () => {
     let calls = 0;
     const signer = { ...principalSignerFromIdentity(owner), sign: async (d: Uint8Array) => { calls++; return owner.sign(d); } };
     await expectCode(createPrincipalRecord(signer, {
-      subjectSigningPublicKey: subject.getSigningPublicKey(), account: ACC, roles: ['agent'], expiresAt: NOW, issuedAt: NOW,
+      subjectSigningPublicKey: subject.getSigningPublicKey(), account: ACC, roles: ['delegate'], expiresAt: NOW, issuedAt: NOW,
     }), 'invalid_principal');
     expect(calls).toBe(0);
     expect(await createPrincipalRecord(signer, {
-      subjectSigningPublicKey: subject.getSigningPublicKey(), account: ACC, roles: ['agent'], expiresAt: NOW + MAX_LIFE - 1, issuedAt: NOW - 1,
-    })).toMatchObject({ roles: ['agent'] });
+      subjectSigningPublicKey: subject.getSigningPublicKey(), account: ACC, roles: ['delegate'], expiresAt: NOW + MAX_LIFE - 1, issuedAt: NOW - 1,
+    })).toMatchObject({ roles: ['delegate'] });
     expect(calls).toBe(1);
   });
 
@@ -141,11 +141,11 @@ describe('principal records', () => {
     (d: any) => { d.account = 'solana:abc'; },
     (d: any) => { delete d.account; },
     (d: any) => { d.roles = []; },
-    (d: any) => { d.roles = ['agent', 'controller']; },
+    (d: any) => { d.roles = ['delegate', 'controller']; },
     (d: any) => { d.roles = ['controller', 'controller']; },
-    (d: any) => { d.roles = ['controller,agent']; },
+    (d: any) => { d.roles = ['controller,delegate']; },
     (d: any) => { d.roles = ['owner']; },
-    (d: any) => { d.roles = 'agent'; },
+    (d: any) => { d.roles = 'delegate'; },
     (d: any) => { delete d.signer; },
     (d: any) => { d.signer.scheme = 'p256'; },
     (d: any) => { d.signer.publicKey = 'QQ=='; },
@@ -203,7 +203,7 @@ describe('same-account rules', () => {
     const agentId = await SoftwareIdentity.generate('secp256k1');
     const pCtrl = await rec(owner, ctrl, { roles: ['controller'] });
     const pCtrl2 = await rec(owner, ctrl2, { roles: ['controller'] });
-    const pAgent = await rec(owner, agentId, { roles: ['agent'] });
+    const pAgent = await rec(owner, agentId, { roles: ['delegate'] });
     const open = new Map<string, string>([[MID, ctrl.getACEId()]]);
     const ctx: PrincipalContext = {
       account: ACC, selfSigner: keyOf(owner),
@@ -256,11 +256,11 @@ describe('same-account rules', () => {
     await chk('request', req, pAgent, agentId, { selfSigner: undefined, trustedSigners: [keyOf(owner)] });
     // A forged record: another key claims the same account string.
     const forger = await SoftwareIdentity.generate('ed25519');
-    const forged = await rec(forger, agentId, { roles: ['agent'] });
+    const forged = await rec(forger, agentId, { roles: ['delegate'] });
     await expectCode(chk('request', req, forged, agentId), 'wrong_principal');
     await expectCode(chk('request', req, forged, agentId, { trustedSigners: [keyOf(owner)] }), 'wrong_principal');
     // Signer binding precedes the account comparison (both fail -> still wrong_principal).
-    const other = await rec(forger, agentId, { roles: ['agent'], account: 'solana:abcd:x' });
+    const other = await rec(forger, agentId, { roles: ['delegate'], account: 'solana:abcd:x' });
     await expectCode(chk('request', req, other, agentId), 'wrong_principal');
   });
 
@@ -271,7 +271,7 @@ describe('same-account rules', () => {
     const addr = signingAddress('secp256k1', root.getSigningPublicKey());
     for (const a of [addr, addr.toLowerCase(), '0x' + addr.slice(2).toUpperCase()]) {
       const account = `eip155:8453:${a}`;
-      const p = await rec(root, agentId, { roles: ['agent'], account });
+      const p = await rec(root, agentId, { roles: ['delegate'], account });
       await checkPrincipalRules('request', req, {
         conversationId: CONV, senderPrincipal: p, senderSigningPublicKey: agentId.getSigningPublicKey(), selfAccount: account, now: NOW,
       });
@@ -287,7 +287,7 @@ describe('same-account rules', () => {
       [root, `solana:8453:${addr}`],
     ];
     for (const [signer, account] of cases) {
-      const p = await rec(signer, agentId, { roles: ['agent'], account });
+      const p = await rec(signer, agentId, { roles: ['delegate'], account });
       await expectCode(checkPrincipalRules('request', req, {
         conversationId: CONV, senderPrincipal: p, senderSigningPublicKey: agentId.getSigningPublicKey(), selfAccount: account, now: NOW,
       }), 'wrong_principal');
@@ -422,14 +422,14 @@ describe('principal in registration and peers', () => {
     const opts = (principal: PrincipalRecord) => ({ name: 'M', endpoint: 'https://m.example/ace', principal });
     // future issuedAt (beyond the 5-minute window)
     const future = await rec(owner, me, { issuedAt: NOW + 3600, expiresAt: NOW + 7200 });
-    expect(codeOf(() => createRegistrationFile(me, opts(future)))).toBe('invalid_principal');
+    await expectCode(createRegistrationFile(me, opts(future)), 'invalid_principal');
     await expectCode(createRegistrationRequest(me, { name: 'A', principal: future }), 'invalid_principal');
     // expired: valid at its own issuedAt, not now
     const expired = await rec(owner, me, { issuedAt: NOW - 100, expiresAt: NOW - 1 });
-    expect(codeOf(() => createRegistrationFile(me, opts(expired)))).toBe('invalid_principal');
+    await expectCode(createRegistrationFile(me, opts(expired)), 'invalid_principal');
     await expectCode(createRegistrationRequest(me, { name: 'A', principal: expired }), 'invalid_principal');
     // a current one still works
-    expect(createRegistrationFile(me, opts(await rec(owner, me))).principal).toBeDefined();
+    expect((await createRegistrationFile(me, opts(await rec(owner, me)))).principal).toBeDefined();
   });
 
   it('registration request round trip and rejection', async () => {
@@ -441,7 +441,7 @@ describe('principal in registration and peers', () => {
     const v = verifyRegistrationRequest(JSON.parse(JSON.stringify(req)), { clock: () => NOW });
     expect(v.peer.principal?.account).toBe(ACC);
     await expectCode(createRegistrationRequest(me, { name: 'A', principal: await rec(owner, other) }, NOW), 'invalid_principal');
-    const bad = { ...req, profile: { name: 'A', principal: { ...good, roles: ['agent', 'controller'] } } };
+    const bad = { ...req, profile: { name: 'A', principal: { ...good, roles: ['delegate', 'controller'] } } };
     expect(codeOf(() => verifyRegistrationRequest(bad, { clock: () => NOW }))).toBe('invalid_principal');
   });
 
@@ -450,7 +450,7 @@ describe('principal in registration and peers', () => {
     const me = await SoftwareIdentity.generate('ed25519');
     const other = await SoftwareIdentity.generate('ed25519');
     const r: any = await peerRecord(me, { name: 'A', principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
-    expect(verifyPeerRecord(r, { clock: () => NOW }).principal?.roles).toEqual(['controller', 'agent']);
+    expect(verifyPeerRecord(r, { clock: () => NOW }).principal?.roles).toEqual(['controller', 'delegate']);
     r.profile.principal = await rec(owner, other);
     expect(codeOf(() => verifyPeerRecord(r, { clock: () => NOW }))).toBe('invalid_principal');
     // expired AND for another subject: not expiry-only, still rejected
@@ -477,12 +477,12 @@ describe('principal in registration and peers', () => {
     const owner = await SoftwareIdentity.generate('ed25519');
     const me = await SoftwareIdentity.generate('secp256k1');
     const other = await SoftwareIdentity.generate('ed25519');
-    const reg = createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
-    const peer = verifyRegistrationFile(reg, { pinnedAt: NOW, clock: () => NOW + 50 });
+    const reg = await createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal: await rec(owner, me, { expiresAt: NOW + 50 }) });
+    const peer = verifyRegistrationFile(reg, { clock: () => NOW + 50 });
     expect(peer.profile).toBeNull();
     expect(peer.aceId).toBe(me.getACEId());
     const wrong = { ...reg, principal: await rec(owner, other, { expiresAt: NOW + 50 }) };
-    expect(codeOf(() => verifyRegistrationFile(wrong, { pinnedAt: NOW, clock: () => NOW + 50 }))).toBe('invalid_principal');
+    expect(codeOf(() => verifyRegistrationFile(wrong, { clock: () => NOW + 50 }))).toBe('invalid_principal');
     const req = await createRegistrationRequest(me, { name: 'A', principal: await rec(owner, me, { expiresAt: NOW + 50 }) }, NOW);
     expect(codeOf(() => verifyRegistrationRequest(JSON.parse(JSON.stringify(req)), { clock: () => NOW + 50 }))).toBe('invalid_principal');
   });
@@ -500,10 +500,10 @@ describe('principal in registration and peers', () => {
   it('registration file principal', async () => {
     const owner = await SoftwareIdentity.generate('ed25519');
     const me = await SoftwareIdentity.generate('secp256k1');
-    const reg = createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal: await rec(owner, me) });
-    const peer = verifyRegistrationFile(reg, { pinnedAt: NOW, clock: () => NOW });
+    const reg = await createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal: await rec(owner, me) });
+    const peer = verifyRegistrationFile(reg, { clock: () => NOW });
     expect(peer.profile).toEqual({ principal: reg.principal });
-    expect(verifyRegistrationFile(createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace' }), { pinnedAt: 0 }).profile).toBeNull();
+    expect(verifyRegistrationFile(await createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace' })).profile).toBeNull();
   });
 
   it('an expired pin still loads (re-verified at fetchedAt)', async () => {
@@ -534,18 +534,18 @@ describe('principal in registration and peers', () => {
     const ps = new PeerStore({ store, clock: () => NOW });
     const cached = await rec(owner, me, { issuedAt: NOW - 10 });
     await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Relay', principal: cached }), { clock: () => NOW }));
-    const file = (principal?: PrincipalRecord) =>
-      verifyRegistrationFile(createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal }), { pinnedAt: NOW, clock: () => NOW });
+    const file = async (principal?: PrincipalRecord) =>
+      verifyRegistrationFile(await createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace', principal }), { clock: () => NOW });
     // no principal in file: cached kept, other members carry over
-    let r = await ps.adopt(file());
+    let r = await ps.adopt(await file());
     expect(r.peer.principal).toEqual(cached);
     expect(r.peer.profile?.name).toBe('Relay');
     // older issuedAt: kept
-    r = await ps.adopt(file(await rec(owner, me, { issuedAt: NOW - 100 })));
+    r = await ps.adopt(await file(await rec(owner, me, { issuedAt: NOW - 100 })));
     expect(r.peer.principal).toEqual(cached);
     // newer: replaces
     const newer = await rec(owner, me, { issuedAt: NOW - 5 });
-    r = await ps.adopt(file(newer));
+    r = await ps.adopt(await file(newer));
     expect(r.peer.principal).toEqual(newer);
     expect((await ps.get(me.getACEId()))?.principal).toEqual(newer);
     // a relay record without a principal clears it
@@ -561,7 +561,7 @@ describe('principal in registration and peers', () => {
     const ps = new PeerStore({ store, clock: () => t });
     await ps.adopt(verifyPeerRecord(await peerRecord(me, { name: 'Relay', principal: await rec(owner, me, { expiresAt: NOW + 5 }) }), { clock: () => NOW }));
     t = NOW + 100;
-    const file = verifyRegistrationFile(createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace' }), { pinnedAt: NOW, clock: () => t });
+    const file = verifyRegistrationFile(await createRegistrationFile(me, { name: 'M', endpoint: 'https://m.example/ace' }), { clock: () => t });
     const r = await ps.adopt(file);
     expect(r.peer.principal).toBeUndefined();
     expect(r.peer.profile?.name).toBe('Relay');
@@ -571,7 +571,7 @@ describe('principal in registration and peers', () => {
     const me2 = await SoftwareIdentity.generate('ed25519');
     const keep = await rec(owner, me2, { expiresAt: NOW + 500 });
     await ps.adopt(verifyPeerRecord(await peerRecord(me2, { principal: keep }), { clock: () => NOW }));
-    const r2 = await ps.adopt(verifyRegistrationFile(createRegistrationFile(me2, { name: 'M', endpoint: 'https://m.example/ace' }), { pinnedAt: NOW, clock: () => t }));
+    const r2 = await ps.adopt(verifyRegistrationFile(await createRegistrationFile(me2, { name: 'M', endpoint: 'https://m.example/ace' }), { clock: () => t }));
     expect(r2.peer.principal).toEqual(keep);
   });
 
@@ -608,19 +608,74 @@ describe('principal in registration and peers', () => {
   });
 });
 
+describe('durable principal horizon', () => {
+  it('accepts a fresh valid proof of identical claims after cache eviction', async () => {
+    const owner = await SoftwareIdentity.generate('secp256k1'), subject = await SoftwareIdentity.generate('ed25519');
+    const store = new MemoryStore();
+    const peers = new PeerStore({ store, clock: () => NOW });
+    const a = await rec(owner, subject), b = await rec(owner, subject);
+    expect(a.signature).not.toBe(b.signature);
+    for (const principal of [a, b]) {
+      const peer = verifyPeerRecord(await peerRecord(subject, { principal }), { clock: () => NOW });
+      await peers.adopt(peer);
+      await peers.remove(subject.getACEId());
+    }
+    const changed = await rec(owner, subject, { roles: ['delegate'] });
+    await expectCode(peers.adopt(verifyPeerRecord(await peerRecord(subject, { principal: changed }), { clock: () => NOW })), 'invalid_principal');
+  });
+  it.each(['strip', 'expire', 'remove', 'rotate'])('survives %s and process restart', async (event) => {
+    const owner = await SoftwareIdentity.generate('ed25519');
+    const subject = await SoftwareIdentity.generate('ed25519');
+    const store = new MemoryStore();
+    let now = NOW;
+    let peers = new PeerStore({ store, clock: () => now });
+    const latest = await rec(owner, subject, { issuedAt: NOW - 5, expiresAt: NOW + 10, roles: ['delegate'] });
+    const older = await rec(owner, subject, { issuedAt: NOW - 10, roles: ['controller'] });
+    const peer = async (id: SoftwareIdentity, principal?: PrincipalRecord) =>
+      verifyPeerRecord(await peerRecord(id, principal ? { principal } : {}, now), { clock: () => now });
+    await peers.adopt(await peer(subject, latest));
+    now += 20;
+    let identity = subject;
+    if (event === 'remove') await peers.remove(subject.getACEId());
+    else {
+      if (event === 'rotate') identity = SoftwareIdentity.fromExport({ ...subject.exportPrivateKey(), encryptionPrivateKey: toBase64(new Uint8Array(32).fill(42)) });
+      await peers.adopt(await peer(identity));
+    }
+    peers = new PeerStore({ store, clock: () => now });
+    await expectCode(peers.adopt(await peer(identity, older)), 'invalid_principal');
+    expect((await peers.get(subject.getACEId()))?.principal).toBeUndefined();
+  });
+  it('an unrelated issuer cannot poison a trusted issuer horizon', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519'), attacker = await SoftwareIdentity.generate('ed25519');
+    const subject = await SoftwareIdentity.generate('ed25519'), store = new MemoryStore();
+    const peers = new PeerStore({ store, clock: () => NOW });
+    const valid = await rec(owner, subject, { roles: ['delegate'] });
+    const poison = await rec(attacker, subject, { issuedAt: NOW + 100, roles: ['controller'] });
+    await peers.adopt(verifyPeerRecord(await peerRecord(subject, { principal: valid }), { clock: () => NOW }));
+    await peers.adopt(verifyPeerRecord(await peerRecord(subject, { principal: poison }), { clock: () => NOW }));
+    const recovered = await peers.adopt(verifyPeerRecord(await peerRecord(subject, { principal: valid }), { clock: () => NOW }));
+    expect(recovered.peer.principal).toEqual(valid);
+  });
+  it('never treats an opaque scope as unrestricted permission', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519'), subject = await SoftwareIdentity.generate('ed25519');
+    await expectCode(checkPrincipalRules('request', { action: 'pay', summary: 's' }, {
+      conversationId: CONV, senderPrincipal: await rec(owner, subject, { scope: 'read-only' }),
+      senderSigningPublicKey: subject.getSigningPublicKey(), selfAccount: ACC, now: NOW, selfSigner: keyOf(owner),
+    }), 'wrong_principal');
+  });
+});
+
 // --- pipeline: step 7, Inbox principal context, decision fill, Outbox request ledger (Task 13) ---------------------
 
 import {
   Inbox, Outbox, ReplayDetector, ThreadStateMachine, createMessage, parseMessage, type ACEStore, type ReceiveOutcome,
-  type ReceiveSource, type RelayClient,
+  type RelayClient,
 } from '../src/index.js';
 import { decodePendingSend, encodePendingSend } from '../src/thread-store.js';
 import { Agent, Clock, CountingStore } from './pipeline.js';
 import { wire } from './helpers.js';
 
-const RELAY = 'https://relay.example';
 const RID2 = '00000000-0000-4000-8000-0000000000bb';
-const SRC = (n: number): ReceiveSource => ({ kind: 'relay', relayUrl: RELAY, streamId: `${n}-0` });
 const signerOf = (o: SoftwareIdentity): PrincipalKey => ({ scheme: o.getSigningScheme(), publicKey: toBase64(o.getSigningPublicKey()) });
 
 /** A relay stub: `lookupPeer` only (what PeerStore uses). */
@@ -649,8 +704,8 @@ async function pairP(o: { rolesA?: any; rolesB?: any; accB?: string; relay?: Stu
   const owner = await SoftwareIdentity.generate('ed25519');
   const a = await Agent.create('a', 'ed25519', clock, new MemoryStore(), o.relay && asRelay(o.relay));
   const b = await Agent.create('b', 'secp256k1', clock);
-  const pa = await rec(owner, a.identity, { roles: o.rolesA ?? ['controller', 'agent'] });
-  const pb = await rec(owner, b.identity, { roles: o.rolesB ?? ['agent'], account: o.accB });
+  const pa = await rec(owner, a.identity, { roles: o.rolesA ?? ['controller', 'delegate'] });
+  const pb = await rec(owner, b.identity, { roles: o.rolesB ?? ['delegate'], account: o.accB });
   await pinRelay(a.peers, b.identity, o.pinB === false ? undefined : pb, 'b');
   await pinRelay(b.peers, a.identity, pa, 'a');
   return { clock, owner, a, b, pa, pb };
@@ -659,7 +714,7 @@ async function pairP(o: { rolesA?: any; rolesB?: any; accB?: string; relay?: Stu
 function openP(x: Agent, o: { owner?: SoftwareIdentity; principal?: unknown; store?: ACEStore } = {}): Promise<Inbox> {
   const store = o.store ?? x.store;
   const principal = 'principal' in o ? o.principal : { account: ACC, ...(o.owner ? { selfSigner: signerOf(o.owner) } : {}) };
-  return Inbox.open({
+  return Inbox.open({ commerce: true,
     identity: x.identity, store, peers: new PeerStore({ store, relay: x.relay, clock: x.clock.fn }), onMessage: x.host.fn,
     clock: x.clock.fn, principal,
   } as any);
@@ -667,7 +722,7 @@ function openP(x: Agent, o: { owner?: SoftwareIdentity; principal?: unknown; sto
 
 async function sendP(s: Agent, inbox: Inbox, r: Agent, type: any, body: any, n: number) {
   const p = await s.outbox.stage({ recipient: (await s.peers.get(r.id))!, type, body });
-  const out: ReceiveOutcome = await s.outbox.deliver(p.requestId, (env) => inbox.receive(wire(env), SRC(n)));
+  const out: ReceiveOutcome = await s.outbox.deliver(p.requestId, (env) => inbox.receive(wire(env)));
   return { out, p };
 }
 
@@ -719,12 +774,27 @@ class OrderStore extends CountingStore {
 }
 
 describe('principal pipeline', () => {
-  it('parseMessage without a context is wrong_principal; with one it parses', async () => {
+  it.each([false, true])('accepts a controller reply before the request ACK (lost=%s)', async (lost) => {
+    const { owner, a, b } = await pairP();
+    const ia = await openP(a, { owner }), ib = await openP(b, { owner });
+    const p = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's', ttl: 60 } });
+    const send = b.outbox.deliver(p.requestId, async env => {
+      expect((await ia.receive(wire(env))).kind).toBe('delivered');
+      const decision = await sendP(a, ib, b, 'decision', { requestId: env.messageId, outcome: 'approve' }, 1);
+      expect(decision.out.kind).toBe('delivered');
+      if (lost) throw new Error('ACK lost');
+    });
+    if (lost) await expect(send).rejects.toThrow('ACK lost'); else await send;
+    expect((await loadRequestRecord(b.store, p.message.conversationId, p.message.messageId))?.decision?.outcome).toBe('approve');
+    await ia.close(); await ib.close();
+  });
+
+  it('principal policy is explicitly installed; generic parsing does not authorize execution', async () => {
     const { clock, owner, a, b } = await pairP();
     const env = await createMessage({ sender: b.identity, recipient: (await b.peers.get(a.id))!, type: 'request',
       body: { action: 'pay', summary: 's' }, threads: new ThreadStateMachine({ localAceId: b.id }), timestamp: NOW });
     const opts = () => ({ threads: new ThreadStateMachine({ localAceId: a.id }), replay: new ReplayDetector({ horizon: NOW - 100 }), clock: clock.fn });
-    await expectCode(parseMessage(env, a.identity, (await a.peers.get(b.id))!, opts()), 'wrong_principal');
+    expect((await parseMessage(env, a.identity, (await a.peers.get(b.id))!, opts())).type).toBe('request');
     const ctx: PrincipalContext = { account: ACC, openRequestTo: () => null, selfSigner: signerOf(owner) };
     const parsed = await parseMessage(env, a.identity, (await a.peers.get(b.id))!, { ...opts(), principal: ctx });
     expect(parsed.type).toBe('request');
@@ -759,7 +829,7 @@ describe('principal pipeline', () => {
     expect(errCode(d2.out)).toBe('bad_reference');
     expect((await loadRequestRecord(b.store, conv, req.message.messageId))!.decision).toEqual(dec);
     // replay of the accepted decision: duplicate, record unchanged
-    expect((await ib.receive(wire(d1.p.message), SRC(3))).kind).toBe('duplicate');
+    expect((await ib.receive(wire(d1.p.message))).kind).toBe('duplicate');
     expect((await loadRequestRecord(b.store, conv, req.message.messageId))!.decision).toEqual(dec);
   });
 
@@ -775,8 +845,8 @@ describe('principal pipeline', () => {
     expect(errCode(d.out)).toBe('bad_reference');
   });
 
-  it('a decision from an agent and a report from another account are wrong_principal', async () => {
-    const { owner, a, b } = await pairP({ rolesA: ['agent'] });
+  it('a decision from a delegate and a report from another account are wrong_principal', async () => {
+    const { owner, a, b } = await pairP({ rolesA: ['delegate'] });
     const ia = await openP(a, { owner });
     const ib = await openP(b, { owner });
     const { p: req } = await sendP(b, ia, a, 'request', { action: 'pay', summary: 's' }, 1);
@@ -788,12 +858,11 @@ describe('principal pipeline', () => {
     expect(errCode(r.out)).toBe('wrong_principal');
   });
 
-  it('an Inbox without a principal rejects principal types; open validates the option', async () => {
+  it('an Inbox without a principal delivers data; open validates installed policy', async () => {
     const { owner, a, b } = await pairP();
     const ia = await openP(a, { principal: undefined });
     const r = await sendP(b, ia, a, 'report', { action: 'pay', summary: 's', outcome: 'ok' }, 1);
-    expect(r.out.kind).toBe('quarantined');
-    expect(errCode(r.out)).toBe('wrong_principal');
+    expect(r.out.kind).toBe('delivered');
     await ia.close();
     for (const bad of [
       { account: 'nope' }, 'solana:x:y', null, { account: ACC, selfSigner: { scheme: 'rsa', publicKey: 'AA==' } },
@@ -849,28 +918,25 @@ describe('principal pipeline', () => {
     expect(relay.calls).toBe(1); // pin now usable: no refresh
   });
 
-  it('a transient refresh failure is retryable (cursor unchanged), then the redelivery is accepted', async () => {
+  it('a transient refresh failure is retryable, then the redelivery is accepted', async () => {
     const relay = new StubRelay();
     relay.error = new ACEError('relay_unavailable', 'down');
     const { owner, a, b, pb } = await pairP({ relay, pinB: false });
     const ia = await openP(a, { owner });
     const p = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's' } });
-    let r = await ia.receive(wire(p.message), SRC(1));
+    let r = await ia.receive(wire(p.message));
     expect(r.kind).toBe('retryable');
     expect(errCode(r)).toBe('relay_unavailable');
     expect(relay.calls).toBe(1);
-    expect(await a.store.read('cursors.json')).toBeNull();
     relay.error = new Error('socket closed'); // a non-ACE error is relay_unavailable too
-    r = await ia.receive(wire(p.message), SRC(1));
+    r = await ia.receive(wire(p.message));
     expect(r.kind).toBe('retryable');
     expect(errCode(r)).toBe('relay_unavailable');
-    expect(await a.store.read('cursors.json')).toBeNull();
     relay.error = null;
     relay.record = await peerRecord(b.identity, { principal: pb }, NOW);
-    r = await ia.receive(wire(p.message), SRC(1));
+    r = await ia.receive(wire(p.message));
     expect(r.kind).toBe('delivered');
     expect(relay.calls).toBe(3);
-    expect(JSON.parse(new TextDecoder().decode((await a.store.read('cursors.json'))!)).cursors[RELAY]).toBe('1-0');
   });
 
   it('a permanent or useless refresh leaves the pinned binding: wrong_principal', async () => {
@@ -906,11 +972,11 @@ describe('principal pipeline', () => {
     const sig = Buffer.from(forged.signature.value, 'base64');
     sig[5] ^= 0x01;
     forged.signature.value = sig.toString('base64');
-    let r = await ia.receive(wire(forged), SRC(1));
+    let r = await ia.receive(wire(forged));
     expect(r.kind).toBe('quarantined');
     expect(errCode(r)).toBe('invalid_signature');
     expect(relay.calls).toBe(0);
-    r = await ia.receive(wire(p.message), SRC(2));
+    r = await ia.receive(wire(p.message));
     expect(r.kind).toBe('delivered');
     expect(relay.calls).toBe(1);
   });
@@ -921,22 +987,22 @@ describe('principal pipeline', () => {
     relay.record = await peerRecord(b.identity, { name: 'b' }, NOW); // useless refresh: the pin stays unusable
     const ia = await openP(a, { owner });
     const p = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's' } });
-    let r = await ia.receive(wire(p.message), SRC(1));
+    let r = await ia.receive(wire(p.message));
     expect(errCode(r)).toBe('wrong_principal');
     expect(relay.calls).toBe(1);
     // the verified envelope is one-shot: its redelivery is a duplicate without a relay lookup
-    r = await ia.receive(wire(p.message), SRC(2));
+    r = await ia.receive(wire(p.message));
     expect(r.kind).toBe('duplicate');
     expect(relay.calls).toBe(1);
     // misaddressed (to rewritten: the signature no longer matters, the recipient check fails first)
     const q = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's2' } });
-    r = await ia.receive(wire({ ...q.message, to: b.id }), SRC(3));
+    r = await ia.receive(wire({ ...q.message, to: b.id }));
     expect(r.kind).toBe('quarantined');
     expect(errCode(r)).toBe('wrong_recipient');
     expect(relay.calls).toBe(1);
     // stale: outside the acceptance window (timestamp more than 300 s in the future)
     clock.t = NOW - 1000;
-    r = await ia.receive(wire(q.message), SRC(4));
+    r = await ia.receive(wire(q.message));
     expect(errCode(r)).toBe('stale_timestamp');
     expect(relay.calls).toBe(1);
   });
@@ -965,7 +1031,7 @@ describe('principal pipeline', () => {
     for (const outcome of ['approve', 'deny']) {
       ps.push(await a.outbox.stage({ recipient: (await a.peers.get(b.id))!, type: 'decision', body: { requestId: req.message.messageId, outcome } }));
     }
-    const results = await Promise.all(ps.map((p, i) => ib.receive(wire(p.message), SRC(i + 1))));
+    const results = await Promise.all(ps.map((p, i) => ib.receive(wire(p.message))));
     expect(results.map((r) => [r.kind, errCode(r)]).sort()).toEqual([['delivered', null], ['quarantined', 'bad_reference']]);
     const winner = ps[results.findIndex((r) => r.kind === 'delivered')];
     expect((await loadRequestRecord(b.store, req.message.conversationId, req.message.messageId))!.decision?.messageId)
@@ -976,18 +1042,18 @@ describe('principal pipeline', () => {
     const { clock, owner, a, b } = await pairP();
     const ia = await openP(a, { owner });
     const store = new OrderStore(b.store, 'requests/');
-    let outbox = await Outbox.open({ identity: b.identity, store, clock: clock.fn });
+    let outbox = await Outbox.open({ commerce: true, identity: b.identity, store, clock: clock.fn });
     const p = await outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's', ttl: 30 } });
-    const transport = (env: any) => ia.receive(wire(env), SRC(1));
+    const transport = (env: any) => ia.receive(wire(env));
     await expectCode(outbox.deliver(p.requestId, transport), 'storage_failed');
     const conv = p.message.conversationId;
     expect(await loadRequestRecord(b.store, conv, p.message.messageId)).toBeNull();
     expect((await outbox.pending()).map((x) => x.requestId)).toEqual([p.requestId]);
     // a restart keeps requestTtl with the pending send; the retry writes the record, then clears
-    outbox = await Outbox.open({ identity: b.identity, store, clock: clock.fn });
+    outbox = await Outbox.open({ commerce: true, identity: b.identity, store, clock: clock.fn });
     expect((await outbox.pending())[0].requestTtl).toBe(30);
     const res = await outbox.deliver(p.requestId, transport);
-    expect(res.kind).toBe('duplicate');
+    expect(res.kind).toBe('delivered');
     expect(await loadRequestRecord(b.store, conv, p.message.messageId)).toMatchObject({
       to: a.id, expiresAt: p.message.timestamp + 30, sentAt: NOW,
     });
@@ -998,19 +1064,13 @@ describe('principal pipeline', () => {
     expect(await outbox.pending()).toEqual([]);
   });
 
-  it('requestTtl survives resign; non-request sends carry none', async () => {
+  it('transport retry cannot renew a request deadline', async () => {
     const { clock, a, b } = await pairP();
     const p = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'request', body: { action: 'pay', summary: 's', ttl: 30 } });
     await expectCode(b.outbox.deliver(p.requestId, async () => { throw new ACEError('envelope_expired', 'x'); }), 'envelope_expired');
     clock.t = NOW + 50;
-    const q = await b.outbox.resign(p.requestId);
-    expect(q.requestTtl).toBe(30);
-    expect(encodePendingSend(q).requestTtl).toBe(30);
-    const t = await b.outbox.stage({ recipient: (await b.peers.get(a.id))!, type: 'text', body: { message: 'hi' } });
-    expect('requestTtl' in encodePendingSend(t)).toBe(false);
-    expect(t.requestTtl).toBeUndefined();
-    await b.outbox.deliver(p.requestId, async () => null);
-    expect((await loadRequestRecord(b.store, p.message.conversationId, p.message.messageId))!.expiresAt).toBe(NOW + 50 + 30);
+    await expectCode(b.outbox.resign(p.requestId), 'invalid_argument');
+    expect((await loadRequestRecord(b.store, p.message.conversationId, p.message.messageId))!.expiresAt).toBe(NOW + 30);
   });
 
   it('a pending send requestTtl is a wire integer, only on a request', async () => {
@@ -1044,7 +1104,7 @@ describe('principal pipeline', () => {
     // crash: the decision's delivery record is written, the requests/ fill fails
     store.failAt = store.writes.length + 2;
     const p = await a.outbox.stage({ recipient: (await a.peers.get(b.id))!, type: 'decision', body: { requestId: req.message.messageId, outcome: 'approve' } });
-    const res = await ib.receive(wire(p.message), SRC(1));
+    const res = await ib.receive(wire(p.message));
     expect(res.kind).toBe('retryable');
     expect(store.writes.at(-2)!.startsWith('deliveries/')).toBe(true);
     expect(store.writes.at(-1)!.startsWith('requests/')).toBe(true);
@@ -1055,7 +1115,7 @@ describe('principal pipeline', () => {
     const dec = (await loadRequestRecord(b.store, conv, req.message.messageId))!.decision;
     expect(dec).toMatchObject({ messageId: p.message.messageId, outcome: 'approve' });
     expect(b.host.effects.has(`${a.id}|${p.message.messageId}`)).toBe(true);
-    expect((await ib2.receive(wire(p.message), SRC(1))).kind).toBe('duplicate');
+    expect((await ib2.receive(wire(p.message))).kind).toBe('duplicate');
     await ib2.close();
     await (await openP(b, { owner })).close(); // recovery again: the same decision is a no-op
     expect((await loadRequestRecord(b.store, conv, req.message.messageId))!.decision).toEqual(dec);
@@ -1068,7 +1128,7 @@ describe('principal pipeline', () => {
     const a = await Agent.create('a', 'ed25519', clock);
     const b = await Agent.create('b', 'secp256k1', clock, new MemoryStore(), asRelay(relay));
     const pa = await rec(owner, a.identity);
-    await pinRelay(a.peers, b.identity, await rec(owner, b.identity, { roles: ['agent'] }), 'b');
+    await pinRelay(a.peers, b.identity, await rec(owner, b.identity, { roles: ['delegate'] }), 'b');
     await pinRelay(b.peers, a.identity, undefined, 'a'); // b's pin of a lacks the principal
     relay.record = await peerRecord(a.identity, { principal: pa }, NOW);
     const ia = await openP(a, { owner });
