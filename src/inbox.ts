@@ -40,8 +40,9 @@ export interface InboxOptions {
   offlineWindowSeconds?: number;
   clock?: () => number;
   /**
-   * The receiver's principal (09): enables `request` / `decision` / `report`. Without it every principal message is
-   * `wrong_principal`.
+   * The receiver's principal (09): installs the account policy for `request` / `decision` / `report` (same-account
+   * rules, `wrong_principal`). Without it they are delivered as plain data, unverified, and a `decision` never fills
+   * `requests/`; their type is never authority.
    */
   principal?: InboxPrincipal;
   /** Explicit opt-in to the economic application state machine. */

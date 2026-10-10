@@ -861,9 +861,15 @@ describe('principal pipeline', () => {
   it('an Inbox without a principal delivers data; open validates installed policy', async () => {
     const { owner, a, b } = await pairP();
     const ia = await openP(a, { principal: undefined });
+    const ib = await openP(b, { principal: undefined });
     const r = await sendP(b, ia, a, 'report', { action: 'pay', summary: 's', outcome: 'ok' }, 1);
     expect(r.out.kind).toBe('delivered');
-    await ia.close();
+    // without a policy a decision is plain data: delivered, and it never fills the request ledger
+    const { p: req } = await sendP(b, ia, a, 'request', { action: 'pay', summary: 's' }, 2);
+    const d = await sendP(a, ib, b, 'decision', { requestId: req.message.messageId, outcome: 'approve' }, 1);
+    expect(d.out.kind).toBe('delivered');
+    expect((await loadRequestRecord(b.store, req.message.conversationId, req.message.messageId))!.decision).toBeNull();
+    await ia.close(); await ib.close();
     for (const bad of [
       { account: 'nope' }, 'solana:x:y', null, { account: ACC, selfSigner: { scheme: 'rsa', publicKey: 'AA==' } },
       { account: ACC, selfSigner: 'k' }, { account: ACC, trustedSigners: { scheme: 'ed25519' } },
