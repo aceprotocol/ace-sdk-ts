@@ -377,15 +377,22 @@ export function verifyRegistrationFile(
 
 export type AdoptOutcome = 'adopted' | 'unchanged' | 'rotated';
 
+const sameAuthorityDomain = (a: PrincipalRecord, b: PrincipalRecord) =>
+  a.account === b.account && a.signer.scheme === b.signer.scheme && a.signer.publicKey === b.signer.publicKey;
+
 /**
- * Principal monotonicity (R-P36): `next` replaces the unexpired cached principal only when it is strictly newer
- * (`issuedAt`) or claim-identical at the same `issuedAt`; otherwise the cached one stays. Expired cached ones are
- * dropped first (R-P35).
+ * Principal monotonicity (R-P36): within one (subject, account, signer) authority domain, `next` replaces the unexpired
+ * cached principal only when it is strictly newer (`issuedAt`) or claim-identical at the same `issuedAt`. Another
+ * domain's `next` replaces it only when `crossDomain` (a relay record; never a registration file, 02). Expired cached
+ * ones are dropped first (R-P35).
  */
-function pickPrincipal(cached: PrincipalRecord | undefined, next: PrincipalRecord | undefined, now: number, absentClears = false): PrincipalRecord | undefined {
+function pickPrincipal(
+  cached: PrincipalRecord | undefined, next: PrincipalRecord | undefined, now: number, o: { absentClears?: boolean; crossDomain: boolean },
+): PrincipalRecord | undefined {
   const old = cached !== undefined && cached.expiresAt > now ? cached : undefined;
-  if (next === undefined) return absentClears ? undefined : old;
-  if (old === undefined || old.account !== next.account || old.signer.scheme !== next.signer.scheme || old.signer.publicKey !== next.signer.publicKey) return next;
+  if (next === undefined) return o.absentClears ? undefined : old;
+  if (old === undefined) return next;
+  if (!sameAuthorityDomain(old, next)) return o.crossDomain ? next : old;
   if (next.issuedAt > old.issuedAt || (next.issuedAt === old.issuedAt && samePrincipalClaims(next, old))) return next;
   return old;
 }
@@ -396,18 +403,18 @@ function withPrincipal(base: AgentProfile | null, principal: PrincipalRecord | u
   return { ...rest, principal };
 }
 
-/** Registration-file merge: supplied members replace, absent ones carry over; the principal only moves forward (R-P26). */
+/** Registration-file merge: supplied members replace, absent ones carry over; the principal only moves forward in its own authority domain (R-P26). */
 function fileProfile(cached: AgentProfile | null, cand: AgentProfile | null, now: number): AgentProfile | null {
   const { principal: _a, ...base } = cached ?? {};
   const { principal: _b, ...supplied } = cand ?? {};
   const merged = cached === null && cand === null ? null : { ...base, ...supplied };
-  return withPrincipal(merged, pickPrincipal(cached?.principal, cand?.principal, now));
+  return withPrincipal(merged, pickPrincipal(cached?.principal, cand?.principal, now, { crossDomain: false }));
 }
 
 /** Relay (signed) merge: replaces the profile only when not older than the pin; an older record keeps it (R-P36). */
 function relayProfile(pin: VerifiedPeer, candidate: VerifiedPeer, now: number): AgentProfile | null {
-  if (candidate.registeredAt < pin.registeredAt) return withPrincipal(pin.profile, pickPrincipal(pin.profile?.principal, undefined, now));
-  return withPrincipal(candidate.profile, pickPrincipal(pin.profile?.principal, candidate.profile?.principal, now, true));
+  if (candidate.registeredAt < pin.registeredAt) return withPrincipal(pin.profile, pickPrincipal(pin.profile?.principal, undefined, now, { crossDomain: true }));
+  return withPrincipal(candidate.profile, pickPrincipal(pin.profile?.principal, candidate.profile?.principal, now, { absentClears: true, crossDomain: true }));
 }
 
 /**

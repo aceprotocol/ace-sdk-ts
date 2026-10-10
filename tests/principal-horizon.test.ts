@@ -7,10 +7,11 @@ import { toBase64 } from '../src/encoding.js';
 
 const NOW = 1_800_000_000;
 const ACC = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
+const ACC2 = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:9xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
 
-const rec = (owner: SoftwareIdentity, subject: SoftwareIdentity, o: { issuedAt?: number; roles?: any } = {}) =>
+const rec = (owner: SoftwareIdentity, subject: SoftwareIdentity, o: { issuedAt?: number; roles?: any; account?: string } = {}) =>
   createPrincipalRecord(principalSignerFromIdentity(owner), {
-    subjectSigningPublicKey: subject.getSigningPublicKey(), account: ACC, roles: o.roles ?? ['controller'],
+    subjectSigningPublicKey: subject.getSigningPublicKey(), account: o.account ?? ACC, roles: o.roles ?? ['controller'],
     expiresAt: NOW + 3600, issuedAt: o.issuedAt ?? NOW - 10,
   });
 
@@ -48,5 +49,29 @@ describe('principal horizon', () => {
     const peer = await peers.pinRegistrationFile(file);
     expect(toBase64(peer.encryptionPublicKey)).toBe(toBase64(rotated.getEncryptionPublicKey()));
     expect(peer.principal).toEqual(principal);
+  });
+
+  it('a registration file never moves an unexpired principal to another authority domain', async () => {
+    const x = await SoftwareIdentity.generate('ed25519'), y = await SoftwareIdentity.generate('ed25519');
+    const subject = await SoftwareIdentity.generate('ed25519');
+    const peers = new PeerStore({ store: new MemoryStore(), clock: () => NOW });
+    const inX = await rec(x, subject, { issuedAt: NOW - 100 });
+    const inY = await rec(y, subject, { issuedAt: NOW - 10, account: ACC2, roles: ['delegate'] });
+    await peers.adopt(await relayRecord(subject, { principal: inX }, NOW - 60));
+    await peers.adopt(await relayRecord(subject, { principal: inY }, NOW - 50)); // the relay may move it
+    const file = await createRegistrationFile(subject, { name: 'n', endpoint: 'https://a.example/ace', timestamp: NOW - 50 });
+    (file as any).principal = inX; // an endpoint re-attaches the older account's principal
+    expect((await peers.pinRegistrationFile(file)).principal).toEqual(inY);
+  });
+
+  it('a registration file cannot swap in a principal signed by someone else', async () => {
+    const owner = await SoftwareIdentity.generate('ed25519'), attacker = await SoftwareIdentity.generate('ed25519');
+    const subject = await SoftwareIdentity.generate('ed25519');
+    const peers = new PeerStore({ store: new MemoryStore(), clock: () => NOW });
+    const legit = await rec(owner, subject);
+    await peers.adopt(await relayRecord(subject, { principal: legit }, NOW - 50));
+    const file = await createRegistrationFile(subject, { name: 'n', endpoint: 'https://a.example/ace', timestamp: NOW - 50 });
+    (file as any).principal = await rec(attacker, subject, { issuedAt: NOW - 5 });
+    expect((await peers.pinRegistrationFile(file)).principal).toEqual(legit);
   });
 });
