@@ -88,7 +88,7 @@ export function principalSignerFromIdentity(identity: ACEIdentity): PrincipalSig
 
 /**
  * `encodePayload(account, join(roles), signer.scheme, signer.publicKey, subjectKeyB64, scopeOrEmpty,
- * decimal(expiresAtOr0))` (09 § Signing Context).
+ * decimal(expiresAt))` (09 § Signing Context).
  */
 export function principalPayload(r: PrincipalRecord, subjectSigningPublicKey: Uint8Array): Uint8Array {
   return encodePayload(
