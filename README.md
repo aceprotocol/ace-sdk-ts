@@ -39,7 +39,8 @@ Spec: `ace-spec` chapters 00–08 (packet version `"1"`). Every signature is ML-
   `RelayClient`), installed profiles (names or manifests; `'commerce'` adds `commerceRules` and `client.threads`) and a
   `MessageLog` (`client.messages`: indexed unread cap, ack, filters). Methods: `publish({force})` (registers on
   demand), `discover`, `importAgent`, `lookup`, `agent`, `connect`, `requests`, `accept`, `reject`, `block`, `unblock`,
-  `createInvitation`, `importInvitation`, `send`, `flush`, `pull`, `follow`, `maintain`, `close`; the `onReceipt` hook
+  `createInvitation`, `importInvitation`, `send`, `flush`, `pull`, `follow`, `maintain`, `setWake`, `clearWake` (07 § Wake
+  hints), `close`; the `onReceipt` hook
   sees each receipt with its settled Outbox entry. `receive: false` opens a send-only client.
 - **Agent tools** — `@ace-protocol/sdk/tools`: `AGENT_TOOLS`, the tool table (`ace_identity`, `ace_network`,
   `ace_send`, `ace_inbox`, `ace_outbox`, `ace_threads`) every MCP surface serves, with JSON Schema inputs, scopes per

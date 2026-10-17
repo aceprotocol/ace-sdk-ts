@@ -28,6 +28,7 @@ export class FakeRelay {
   kels = new Map<string, KelState>();
   descriptors = new Map<string, PublishedAgent>();
   blocks = new Map<string, { blocked: boolean; revision: number }>();
+  wakes = new Map<string, { gateway: string; token: string }>();
   queues = new Map<string, Entry[]>();
   nonces = new Set<string>();
   seq = 0;
@@ -157,6 +158,15 @@ export class FakeRelay {
       const k = `${owner}|${body.peer}`, old = this.blocks.get(k);
       if (old && body.revision <= old.revision) throw new HTTPError(409, 'stale_revision');
       this.blocks.set(k, { blocked: body.blocked, revision: body.revision });
+      return { ok: true };
+    }
+    if (method === 'PUT' && path === '/v1/wake') {
+      const owner = this.#auth(headers, { action: 'wake', gateway: body?.gateway, token: body?.token });
+      this.wakes.set(owner, { gateway: body.gateway, token: body.token });
+      return { ok: true };
+    }
+    if (method === 'DELETE' && path === '/v1/wake') {
+      this.wakes.delete(this.#auth(headers, { action: 'wake' }));
       return { ok: true };
     }
     if (method === 'POST' && path === '/v1/send') {

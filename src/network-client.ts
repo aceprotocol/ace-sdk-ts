@@ -633,6 +633,19 @@ export class NetworkClient {
     await this.admission.clearBlock(aceId, revision);
   }
 
+  /**
+   * Ask the home relay to wake `gateway` with `token` when entries are queued for us (07 § Wake hints). A hint only:
+   * delivery still comes from `pull` / `follow`.
+   */
+  async setWake(gateway: string, token: string): Promise<void> {
+    await this.relay.setWake(this.identity, gateway, token);
+  }
+
+  /** Remove the home relay's wake registration. */
+  async clearWake(): Promise<void> {
+    await this.relay.clearWake(this.identity);
+  }
+
   // --- inbox hooks --------------------------------------------------------------------------
 
   async #onReceipt(from: string, body: ReceiptBody): Promise<void> {

@@ -51,7 +51,7 @@ export { MessageLog, type StoredMessage, type MessageFilter, type MessageRef } f
 export { RelayClient, compareStreamIds, type RelayClientOptions, type InboxPage, type ListenEvent } from './relay.js';
 export { isCanonicalRelayUrl, normalizeRelayUrl } from './relay-url.js';
 // Relay side (07): the reference relay imports these verifiers and network helpers.
-export { createAuthHeaders, parseAuthHeaders, verifyAuthHeaders, type AuthHeaders, type RelayAuth, type RelayAuthRequest } from './auth.js';
+export { createAuthHeaders, parseAuthHeaders, verifyAuthHeaders, WAKE_TOKEN_RE, type AuthHeaders, type RelayAuth, type RelayAuthRequest } from './auth.js';
 export { createRegistrationRequest, verifyRegistrationRequest, type RegistrationRequest, type VerifiedRegistration } from './registration.js';
 export { isBlockedAddress, networkKey, parseIp, type ParsedIp } from './pinned-https.js';
 

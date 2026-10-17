@@ -416,6 +416,22 @@ describe('vectors: auth, registration, relay errors', () => {
       expect(await codeOf(() => verifyRegistrationRequest(n.request, { audience: n.audience, clock: () => n.now })), n.name).toBe(n.error);
     }
   });
+  it('wake registration bodies', async () => {
+    const w = V.auth.wake;
+    const sent: unknown[] = [];
+    const fetch = async (_u: unknown, init?: RequestInit) => {
+      sent.push(JSON.parse(String(init!.body)));
+      return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const client = new RelayClient('https://relay.example', { fetch: fetch as typeof globalThis.fetch, clock: () => NOW });
+    const me = SoftwareIdentity.fromExport(V.agents.bob.export, NOW);
+    for (const b of w.valid) await client.setWake(me, b.gateway, b.token);
+    expect(sent).toEqual(w.valid);
+    for (const c of w.invalid) {
+      if (Object.keys(c.body).sort().join() !== 'gateway,token') continue; // closed-object cases: the typed call cannot build them
+      expect(await codeOf(() => client.setWake(me, c.body.gateway, c.body.token)), c.name).toBe(c.error);
+    }
+  });
   it.each(V.relayErrors.cases.map((c: Any) => [c.name, c]))('relay error: %s', (_n, c: Any) => {
     const retry = Object.entries<string>(c.headers).find(([k]) => k.toLowerCase() === 'retry-after')?.[1] ?? null;
     const e = relayErrorFor(c.status, retry, c.body);

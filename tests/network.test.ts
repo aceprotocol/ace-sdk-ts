@@ -232,4 +232,19 @@ describe('NetworkClient', () => {
     }
     expect(kinds).toEqual(['contact']);
   });
+
+  it('wake hints go to the home relay (07 § Wake hints)', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock);
+    const A = alice.id.getACEId();
+    await alice.client.setWake('https://push.example/ace', 'w'.repeat(32));
+    expect(relay.wakes.get(A)).toEqual({ gateway: 'https://push.example/ace', token: 'w'.repeat(32) });
+    await alice.client.clearWake();
+    await alice.client.clearWake(); // idempotent
+    expect(relay.wakes.has(A)).toBe(false);
+    // Malformed gateways and tokens are covered by the vectors (auth.wake.invalid).
+    relay.inject.push({ path: '/v1/wake', status: 404, code: 'not_found' });
+    await expect(alice.client.setWake('https://push.example/ace', 'w'.repeat(32))).rejects.toMatchObject({ code: 'relay_rejected', relayCode: 'not_found' });
+  });
 });

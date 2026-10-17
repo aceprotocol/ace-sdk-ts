@@ -22,7 +22,12 @@ export type RelayAuthRequest =
   | { action: 'inbox-ack'; through: string }
   | { action: 'unregister' }
   /** payload (peer, "block" | "unblock", decimal(revision)); revision strictly increases per (owner, peer) */
-  | { action: 'block'; peer: string; blocked: boolean; revision: number };
+  | { action: 'block'; peer: string; blocked: boolean; revision: number }
+  /** payload (gateway, token) for `PUT /v1/wake`; both omitted (empty payload) for `DELETE /v1/wake` */
+  | { action: 'wake'; gateway?: string; token?: string };
+
+/** A wake token (07 § Wake hints): opaque, issued by the gateway. */
+export const WAKE_TOKEN_RE = /^[A-Za-z0-9_-]{22,512}$/;
 
 export interface AuthHeaders {
   'X-ACE-Audience': string;
@@ -85,6 +90,13 @@ export function authPayload(req: RelayAuthRequest): Uint8Array {
       return encodePayload(req.peer, req.blocked ? 'block' : 'unblock', decimal(req.revision));
     case 'unregister':
       return new Uint8Array(0);
+    case 'wake':
+      if (req.gateway === undefined && req.token === undefined) return new Uint8Array(0);
+      // Loopback HTTP is a development gateway; the caller applies its own loopback policy.
+      if (typeof req.gateway !== 'string' || !isCanonicalRelayUrl(req.gateway, { allowLoopback: true }) || typeof req.token !== 'string' || !WAKE_TOKEN_RE.test(req.token)) {
+        throw bad('wake needs a canonical https gateway and a token');
+      }
+      return encodePayload(req.gateway, req.token);
     default:
       throw bad('unknown action');
   }

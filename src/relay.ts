@@ -334,6 +334,24 @@ export class RelayClient {
   }
 
   /**
+   * `PUT /v1/wake`: register (or replace) the gateway this relay wakes when entries are queued for `identity` (07 §
+   * Wake hints); `token` is the gateway's opaque token. A relay without wake hints answers `relay_rejected` with relay
+   * code `not_found`.
+   */
+  async setWake(identity: ACEIdentity, gateway: string, token: string): Promise<void> {
+    // The auth payload checks gateway and token; a loopback http gateway is this client's development policy.
+    if (this.#verify.allowLoopbackRelays !== true && typeof gateway === 'string' && gateway.startsWith('http://')) {
+      throw new ACEError('invalid_argument', 'wake gateway must be https');
+    }
+    await this.#authed(identity, { action: 'wake', gateway, token }, 'PUT', this.#url('/v1/wake'), { gateway, token });
+  }
+
+  /** `DELETE /v1/wake`: remove the wake registration (idempotent). */
+  async clearWake(identity: ACEIdentity): Promise<void> {
+    await this.#authed(identity, { action: 'wake' }, 'DELETE', this.#url('/v1/wake'));
+  }
+
+  /**
    * `POST /v1/send {packet, permit?}`. `{ok: true}` means the relay stored it, not that it was delivered (only a
    * receipt says that). Without a permit the recipient must be public (stranger quota).
    */
