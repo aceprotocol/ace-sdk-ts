@@ -1,0 +1,74 @@
+{
+  "name": "@ace-protocol/sdk",
+  "version": "0.5.0",
+  "description": "ACE Protocol SDK: post-quantum agent identity, prekey-encrypted packets and profile-based interaction vocabularies",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    },
+    "./tools": {
+      "types": "./dist/tools.d.ts",
+      "import": "./dist/tools.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc",
+    "prebuild": "node -e \"require('node:fs').rmSync('dist', {recursive:true,force:true})\"",
+    "gen:profiles": "node scripts/gen-profiles.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit && tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck examples/quickstart.ts",
+    "prepublishOnly": "npm run lint && npm run test && npm run build"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "keywords": [
+    "ace",
+    "protocol",
+    "agent",
+    "cryptography",
+    "e2e-encryption",
+    "post-quantum",
+    "x-wing",
+    "ml-kem",
+    "digital-signature",
+    "ml-dsa",
+    "prekey"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aceprotocol/ace-sdk-ts.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.0.0",
+    "@noble/post-quantum": "^0.7.1"
+  },
+  "devDependencies": {
+    "@types/fs-ext": "^2.0.3",
+    "@types/node": "^25.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.11"
+  },
+  "license": "Apache-2.0",
+  "optionalDependencies": {
+    "fs-ext": "^2.1.1"
+  }
+}
