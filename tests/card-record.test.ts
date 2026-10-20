@@ -114,6 +114,52 @@ describe('card record over the relay', () => {
     expect((await relay.client().handle('alice')).card.aceId).toBe(alice.id.getACEId());
   });
 
+  it('a handle lookup is checked against the handle pin too', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const bob = await agent(relay, clock);
+    const A = alice.id.getACEId();
+    expect((await bob.client.lookup('@alice@relay.test')).descriptor.aceId).toBe(A); // pins A -> alice
+    // A relay that binds a second handle to the same identity at the same home
+    relay.cards.set(A, await createCardRecord(alice.id, { home: RELAY, handle: 'alice2', contact: 'open', listed: false, now: clock.t + 1 }));
+    relay.handles.set('alice2', A);
+    await expect(bob.client.lookup('@alice2@relay.test')).rejects.toThrow(code('invalid_authorization'));
+    await expect(bob.client.lookupCard('@alice2@relay.test')).rejects.toThrow(code('invalid_authorization'));
+  });
+
+  it('moving home: the old relay keeps the binding, resolves unknown_peer and never reassigns the handle', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { handle: 'alice' });
+    const mallory = await agent(relay, clock);
+    const A = alice.id.getACEId();
+    await relay.client().publishCard(await createCardRecord(alice.id, { home: 'https://relay-b.test', contact: 'closed', listed: false, now: clock.t + 1 }));
+    expect((await relay.client().card(A)).card.home).toBe('https://relay-b.test');
+    expect(relay.handles.get('alice')).toBe(A);
+    await expect(relay.client().handle('alice')).rejects.toThrow(code('unknown_peer'));
+    const taken = await createCardRecord(mallory.id, { home: RELAY, handle: 'alice', contact: 'closed', listed: false, now: clock.t + 2 });
+    await expect(relay.client().publishCard(taken)).rejects.toMatchObject({ relayCode: 'handle_taken' });
+    // a client that pinned alice at the old home accepts the record at the new home
+    const bob = await agent(relay, clock);
+    await bob.client.lookupCard(A);
+  });
+
+  it('a new dlg re-signs the card at upkeep', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const bob = await agent(relay, clock);
+    const A = alice.id.getACEId();
+    const before = (await bob.client.lookupCard(A)).record.signature.seq;
+    clock.advance(10);
+    await alice.id.delegate({ now: clock.t });
+    await alice.client.maintain();
+    const after = await bob.client.lookupCard(A);
+    expect(after.record.signature.seq).toBeGreaterThan(before);
+    expect(after.record.handle).toBe('alice');
+  });
+
   it('no card means closed', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
@@ -137,7 +183,7 @@ describe('card record over the relay', () => {
     });
     relay.queues.set(bobId.getACEId(), [{ streamId: `${clock.t * 1000}-0`, packet, raw: JSON.stringify(packet) }]);
     const [outcome] = await bob.pull();
-    expect(outcome.kind).toBe('dropped');
+    expect(outcome).toMatchObject({ kind: 'dropped', error: { code: 'not_permitted', message: expect.stringMatching(/sender is not admitted/) } });
     expect(await bob.requests()).toEqual([]);
   });
 

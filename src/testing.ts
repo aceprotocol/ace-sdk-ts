@@ -154,10 +154,13 @@ export class FakeRelay {
         throw new HTTPError(409, 'stale_descriptor');
       }
       // 07 § Descriptors and cards: a handle is set once per identity and never reassigned.
+      // A record naming another home claims nothing here (an existing binding stays).
       const bound = this.#handleOf(record.aceId);
-      if (bound !== undefined) {
-        if (record.home !== this.baseUrl || record.handle !== bound) throw new HTTPError(400, 'invalid_argument');
-      } else if (record.home === this.baseUrl && record.handle !== undefined) {
+      if (record.home !== this.baseUrl) {
+        // nothing to claim
+      } else if (bound !== undefined) {
+        if (record.handle !== bound) throw new HTTPError(400, 'invalid_argument');
+      } else if (record.handle !== undefined) {
         if (this.handles.has(record.handle)) throw new HTTPError(409, 'handle_taken');
         this.handles.set(record.handle, record.aceId);
       }
@@ -175,7 +178,7 @@ export class FakeRelay {
     if (method === 'GET' && m) {
       const owner = this.handles.get(m[1]);
       const c = owner !== undefined && this.kels.has(owner) ? this.cards.get(owner) : undefined;
-      if (!c) throw new HTTPError(404, 'unknown_peer');
+      if (!c || c.card.home !== this.baseUrl) throw new HTTPError(404, 'unknown_peer');
       return c;
     }
     if (method === 'GET' && path === '/v1/descriptors') {

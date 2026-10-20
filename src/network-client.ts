@@ -94,7 +94,7 @@ export interface NetworkClientOptions {
 interface SelfRecord { agent: PublishedAgent; params: string; card?: CardBundle; cardParams?: string }
 const SELF_KEY = 'network/self.json';
 const agentKey = (id: string) => `network/agents/${sha256Hex(id)}.json`;
-/** The handle first seen in a peer's card record (set once, so a later record must carry it). */
+/** The handle first seen in a peer's card record at its home (set once, so a later record at that home must carry it). */
 const handlePinKey = (id: string) => `network/handles/${sha256Hex(id)}.json`;
 const HANDLE_RE = /^@([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/;
 
@@ -325,22 +325,30 @@ export class NetworkClient {
   async lookup(target: string): Promise<PublishedAgent> {
     if (isACEId(target)) return this.agent(target);
     const { bundle, relay } = await this.#cardByHandle(target);
+    await this.#checkCard(bundle);
     return this.#fetchAgent(bundle.card.aceId, [relay.baseUrl]);
   }
 
   /**
    * The verified card record of `target` (an ACE ID or `@name@relay-host`). A handle resolves only to a record whose
-   * `home` is the queried relay and whose `handle` is the queried one (`unknown_peer`). A handle is set once: after a
-   * record with a handle was seen for an identity, a record of it with another or no handle is `invalid_authorization`.
+   * `home` is the queried relay and whose `handle` is the queried one (`unknown_peer`). A handle is set once per home:
+   * after a record with a handle was seen for an identity, a record of it naming the same home with another or no handle
+   * is `invalid_authorization`.
    */
   async lookupCard(target: string): Promise<VerifiedCard> {
-    const bundle = isACEId(target) ? await this.#fetchCard(target) : (await this.#cardByHandle(target)).bundle;
+    return this.#checkCard(isACEId(target) ? await this.#fetchCard(target) : (await this.#cardByHandle(target)).bundle);
+  }
+
+  /** Verify a fetched card record against the identity's pin and its handle pin (written on first sight). */
+  async #checkCard(bundle: CardBundle): Promise<VerifiedCard> {
     const id = bundle.card.aceId;
     const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
     await withLock(this.store, 'network-handles', async () => {
-      const pin = await this.#read<{ handle: string }>(handlePinKey(id));
-      if (pin !== null && pin.handle !== v.record.handle) throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
-      if (pin === null && v.record.handle !== undefined) await this.store.write(handlePinKey(id), canonicalStateBytes({ handle: v.record.handle }));
+      // Set once per home relay: a record naming the pinned home must carry the pinned handle; a new home re-pins.
+      const r = v.record;
+      const pin = await this.#read<{ home: string; handle: string }>(handlePinKey(id));
+      if (pin !== null && pin.home === r.home && pin.handle !== r.handle) throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
+      if (r.handle !== undefined && (pin === null || pin.home !== r.home)) await this.store.write(handlePinKey(id), canonicalStateBytes({ home: r.home, handle: r.handle }));
     });
     return v;
   }
