@@ -21,7 +21,7 @@ Spec: `ace-spec` chapters 00–08 (packet version `"1"`). Every signature is ML-
 - **Card record** — `createCardRecord` / `verifyCardBundle`: the durable identity record `{kel, card}` with its home
   relay, set-once handle, card, `pay` (CAIP-10 accounts), `contact` (`open` takes stranger contact requests) and
   `listed` (directory). No expiry; re-signed after a new `dlg`. `NetworkClient.lookupCard` resolves an ACE ID or
-  `@name@host`.
+  `@name@host`; with no live descriptor it verifies under the bundle's own KEL and says `kelLive: false`.
 - **Descriptor** — `createDescriptor` / `verifyPublishedAgent`: relays, prekey, profiles, `ext`, Delegation credentials and ERC-8004 bindings
   (`verifyErc8004Registration` checks the reverse direction against the registration file's `services`; the host
   reads the chain). Every operational signature is checked by one `verifyOperationalSignature` (01 rules 1–5: the

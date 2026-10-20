@@ -346,17 +346,19 @@ export class NetworkClient {
    * after a record with a handle was seen for an identity, a record of it naming the same home with another or no handle
    * is `invalid_authorization`. A handle's first resolution pins its ACE ID; a later resolution to another one is
    * `invalid_authorization`. Without a KEL pin for the identity, its descriptor is looked up first and its KEL pinned, so
-   * the card is verified under the current KEL, never one a relay chose.
+   * the card is verified under the current KEL, never one a relay chose. When the identity has no live descriptor
+   * (`unknown_peer`: offline past its lifetime), the card is verified under the bundle's own KEL instead, that KEL is
+   * pinned as a descriptor's would be, and the result says `kelLive: false` (04 § Card record).
    */
   async lookupCard(target: string): Promise<VerifiedCard> {
     if (isACEId(target)) {
-      await this.#pinKel(target, () => this.agent(target));
-      return this.#checkCard(await this.#fetchCard(target));
+      const live = await this.#pinCardKel(target, () => this.agent(target), () => this.#fetchCard(target));
+      return this.#checkCard(live.bundle ?? await this.#fetchCard(target), undefined, live.kelLive);
     }
     const { bundle, relay, handle } = await this.#cardByHandle(target);
     const id = bundle.card.aceId;
-    await this.#pinKel(id, () => this.#fetchAgent(id, [relay.baseUrl]));
-    return this.#checkCard(bundle, { home: relay.baseUrl, handle });
+    const live = await this.#pinCardKel(id, () => this.#fetchAgent(id, [relay.baseUrl]), async () => bundle);
+    return this.#checkCard(bundle, { home: relay.baseUrl, handle }, live.kelLive);
   }
 
   /** When `id` has no KEL pin, pin it through `fetch` (a descriptor lookup) and return what it fetched; else null. */
@@ -365,30 +367,61 @@ export class NetworkClient {
   }
 
   /**
+   * #pinKel for a card lookup. Only when the descriptor lookup finds none (`unknown_peer`) does the card's own bundle
+   * (`card`) pin the KEL: the bundle is verified, its KEL adopted under the fork rules, and the bundle returned with
+   * `kelLive: false`. Every other failure propagates.
+   */
+  async #pinCardKel(id: string, fetch: () => Promise<PublishedAgent>, card: () => Promise<CardBundle>): Promise<{ kelLive: boolean; bundle?: CardBundle }> {
+    try {
+      await this.#pinKel(id, fetch);
+      return { kelLive: true };
+    } catch (e) {
+      if (!(e instanceof ACEError) || e.code !== 'unknown_peer') throw e;
+    }
+    const bundle = await card();
+    const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
+    if (v.aceId !== id) throw new ACEError('invalid_authorization', 'the card record names another identity');
+    await this.peers.adopt(structuredClone(v.kelState.events), async ({ state: pin }) => {
+      // As for a descriptor: another path advanced the pin past the state the card verified under.
+      if (pin.lastHash !== v.kelState.lastHash) throw new ACEError('stale_peer_binding', 'the pin advanced past the card record');
+    });
+    return { kelLive: false, bundle };
+  }
+
+  /** A stored pin object, null when absent; anything else that is not an object is `storage_failed`, never no pin. */
+  async #readPin<T>(key: string): Promise<T | null> {
+    const raw = await this.store.read(key);
+    if (raw === null) return null;
+    const v = parseStateBytes(raw, key);
+    if (!isObj(v)) throw new ACEError('storage_failed', `${key} is invalid`);
+    return v as T;
+  }
+
+  /**
    * Verify a fetched card record against the identity's KEL pin and its card pin (written on first sight, persisted):
    * no rollback first (an older `issuedAt`, or an equal one with other claims, is `stale_descriptor`), then the
    * set-once handle per home (a record naming the pinned home must carry the pinned handle; a new home re-pins). A
    * record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
    */
-  async #checkCard(bundle: CardBundle, resolved?: { home: string; handle: string }): Promise<VerifiedCard> {
+  async #checkCard(bundle: CardBundle, resolved?: { home: string; handle: string }, kelLive = true): Promise<VerifiedCard> {
     const id = bundle.card.aceId;
     const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
     await withLock(this.store, 'network-handles', async () => {
-      const owner = resolved ? await this.#read<HandleOwnerPin>(handleOwnerKey(resolved.home, resolved.handle)) : null;
+      const owner = resolved ? await this.#readPin<HandleOwnerPin>(handleOwnerKey(resolved.home, resolved.handle)) : null;
       if (owner !== null && owner.aceId !== id) throw new ACEError('invalid_authorization', 'the handle resolved to another identity than before');
       await this.#advanceCardPin(v.record);
       if (resolved && owner === null) {
         await this.store.write(handleOwnerKey(resolved.home, resolved.handle), canonicalStateBytes({ ...resolved, aceId: id }));
       }
     });
-    return v;
+    return { ...v, kelLive };
   }
 
   /** The card pin checks and update of #checkCard, under the `network-handles` lock. */
   async #advanceCardPin(r: CardRecord): Promise<void> {
     const id = r.aceId;
     const digest = documentDigest(r);
-    const pin = await this.#read<CardPin>(handlePinKey(id));
+    const pin = await this.#readPin<CardPin>(handlePinKey(id));
     if (pin !== null && pin.issuedAt !== undefined) {
       if (r.issuedAt < pin.issuedAt) throw new ACEError('stale_descriptor', 'an older card record than one already verified');
       if (r.issuedAt === pin.issuedAt) {

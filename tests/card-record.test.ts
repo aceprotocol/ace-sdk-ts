@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   MemoryStore, NetworkClient, contactContent, createCardRecord, createPacket, verifyCardBundle, isCaip10Account, MAX_CARD_RECORD_BYTES,
-  type CardBundle,
+  sha256Hex, type CardBundle,
 } from './sdk.js';
-import { Clock, FakeRelay, NOW, RELAY, agent, identity } from './helpers.js';
+import { Clock, FakeRelay, NOW, RELAY, agent, identity, stateOf } from './helpers.js';
 
 const code = (c: string) => expect.objectContaining({ code: c });
 const SOL = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
@@ -162,6 +162,65 @@ describe('card record over the relay', () => {
     await expect(bob.client.lookupCard(A)).rejects.toThrow(code('stale_peer_binding'));
     // The KEL was pinned from the descriptor lookup, before the card was checked.
     expect((await bob.client.peers.get(A))?.events.length).toBe(alice.id.getKel().length);
+  });
+
+  it('lookupCard falls back to the bundle KEL when no live descriptor', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice', pay: [SOL] });
+    const A = alice.id.getACEId();
+    // Alice is offline past her descriptor's lifetime: the relay serves her card record but no descriptor.
+    clock.advance(8 * 86400);
+    await expect(relay.client().getDescriptor(A)).rejects.toThrow(code('unknown_peer'));
+    for (const target of [A, '@alice@relay.test']) {
+      const bob = await agent(relay, clock);
+      const v = await bob.client.lookupCard(target);
+      expect(v.kelLive).toBe(false);
+      expect(v.record).toMatchObject({ aceId: A, handle: 'alice', pay: [SOL] });
+      // The bundle's KEL is pinned, under the same rules as a descriptor's.
+      expect((await bob.client.peers.get(A))?.lastHash).toBe(stateOf(alice.id, clock.t).lastHash);
+      // The card pin still applies: a rollback is refused.
+      relay.cards.set(A, await createCardRecord(alice.id, { home: RELAY, handle: 'alice', contact: 'closed', listed: false, now: v.record.issuedAt - 1 }));
+      await expect(bob.client.lookupCard(target)).rejects.toThrow(code('stale_descriptor'));
+      relay.cards.set(A, v.bundle);
+    }
+    // Any other descriptor failure (here a tampered one) still fails the lookup, pinning nothing.
+    const carol = await agent(relay, clock);
+    relay.descriptors.set(A, { ...relay.descriptors.get(A)!, descriptor: { ...relay.descriptors.get(A)!.descriptor, expiresAt: clock.t + 3600 } });
+    await expect(carol.client.lookupCard(A)).rejects.toThrow(code('invalid_authorization'));
+    expect(await carol.client.peers.get(A)).toBeNull();
+  });
+
+  it('kelLive is true with a live descriptor', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const bob = await agent(relay, clock);
+    expect((await bob.client.lookupCard(alice.id.getACEId())).kelLive).toBe(true);
+    const carol = await agent(relay, clock);
+    expect((await carol.client.lookupCard('@alice@relay.test')).kelLive).toBe(true);
+  });
+
+  it('unparseable pin is storage_failed', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const bob = await agent(relay, clock);
+    const A = alice.id.getACEId();
+    await bob.client.lookupCard('@alice@relay.test');
+    // A damaged pin is a storage failure, never "no pin" (which would accept a rollback or a rebinding).
+    const cardPin = `network/handles/${sha256Hex(A)}.json`;
+    const ownerPin = `network/handle-owners/${sha256Hex(`${RELAY} alice`)}.json`;
+    for (const key of [cardPin, ownerPin]) {
+      const good = await bob.store.read(key);
+      expect(good).not.toBeNull();
+      for (const bad of ['not json', '[]', 'null', '"x"']) {
+        await bob.store.write(key, new TextEncoder().encode(bad));
+        await expect(bob.client.lookupCard('@alice@relay.test')).rejects.toThrow(code('storage_failed'));
+      }
+      await bob.store.write(key, good!);
+    }
+    expect((await bob.client.lookupCard('@alice@relay.test')).record.aceId).toBe(A);
   });
 
   it('handle resolving to a new aceId is invalid_authorization', async () => {

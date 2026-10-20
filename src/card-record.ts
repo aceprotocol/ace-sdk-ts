@@ -31,7 +31,12 @@ export interface CardRecord {
 /** The publication unit: `{kel, card}`. */
 export interface CardBundle { kel: KelEvent[]; card: CardRecord }
 
-export interface VerifiedCard { aceId: string; kelState: KelState; record: CardRecord; bundle: CardBundle }
+/**
+ * A verified card record. `kelLive`: whether the KEL it verified under was confirmed by a live descriptor or an existing
+ * pin (`NetworkClient.lookupCard`); false when only the bundle's own KEL vouches for it, as from `verifyCardBundle` alone
+ * or a lookup of an identity with no live descriptor (04 § Card record).
+ */
+export interface VerifiedCard { aceId: string; kelState: KelState; record: CardRecord; bundle: CardBundle; kelLive: boolean }
 
 const R_REQUIRED = ['aceId', 'issuedAt', 'home', 'card', 'contact', 'listed', 'signature'];
 const R_OPTIONAL = ['handle', 'pay'];
@@ -88,5 +93,5 @@ export function verifyCardBundle(value: unknown, now: number = nowOf(), o: Verif
   const { signature, ...claims } = r;
   verifyOperationalSignature(state, 'card-record', issuedAt, canonicalStateBytes(claims), signature, now, 'invalid_authorization');
   const bundle = structuredClone(value) as unknown as CardBundle;
-  return { aceId: r.aceId, kelState: state, record: bundle.card, bundle };
+  return { aceId: r.aceId, kelState: state, record: bundle.card, bundle, kelLive: false };
 }
