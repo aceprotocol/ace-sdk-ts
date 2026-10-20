@@ -160,6 +160,51 @@ describe('card record over the relay', () => {
     expect(after.record.handle).toBe('alice');
   });
 
+  it('older card is rejected after a newer one', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const bob = await agent(relay, clock);
+    const A = alice.id.getACEId();
+    const seen = await bob.client.lookupCard(A);
+    // A relay rolling back to an older record (other pay accounts, contact closed) is refused on every path.
+    relay.cards.set(A, await createCardRecord(alice.id, { home: RELAY, handle: 'alice', pay: [SOL], contact: 'closed', listed: false, now: seen.record.issuedAt - 1 }));
+    await expect(bob.client.lookupCard(A)).rejects.toThrow(code('stale_descriptor'));
+    await expect(bob.client.lookupCard('@alice@relay.test')).rejects.toThrow(code('stale_descriptor'));
+    await expect(bob.client.lookup('@alice@relay.test')).rejects.toThrow(code('stale_descriptor'));
+  });
+
+  it('equal issuedAt with different claims is rejected', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const bob = await agent(relay, clock);
+    const A = alice.id.getACEId();
+    const seen = await bob.client.lookupCard(A);
+    expect((await bob.client.lookupCard(A)).record).toEqual(seen.record); // the identical record again is fine
+    relay.cards.set(A, await createCardRecord(alice.id, { home: RELAY, handle: 'alice', contact: 'open', listed: true, now: seen.record.issuedAt }));
+    await expect(bob.client.lookupCard(A)).rejects.toThrow(code('stale_descriptor'));
+  });
+
+  it('newer card updates the pin', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const bob = await agent(relay, clock);
+    const A = alice.id.getACEId();
+    const first = relay.cards.get(A)!;
+    await bob.client.lookupCard(A);
+    const newer = await createCardRecord(alice.id, { home: RELAY, handle: 'alice', pay: [SOL], contact: 'closed', listed: false, now: first.card.issuedAt + 5 });
+    relay.cards.set(A, newer);
+    expect((await bob.client.lookupCard(A)).record.contact).toBe('closed');
+    // the pin moved to the newer record and persists in the store: the first one is now a rollback
+    relay.cards.set(A, first);
+    await expect(bob.client.lookupCard(A)).rejects.toThrow(code('stale_descriptor'));
+    const again = await NetworkClient.open({ identity: bob.id, store: bob.store, relay: relay.client(), clock: clock.now, receive: false });
+    await expect(again.lookupCard(A)).rejects.toThrow(code('stale_descriptor'));
+    await again.close();
+  });
+
   it('no card means closed', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);

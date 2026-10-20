@@ -94,7 +94,11 @@ export interface NetworkClientOptions {
 interface SelfRecord { agent: PublishedAgent; params: string; card?: CardBundle; cardParams?: string }
 const SELF_KEY = 'network/self.json';
 const agentKey = (id: string) => `network/agents/${sha256Hex(id)}.json`;
-/** The handle first seen in a peer's card record at its home (set once, so a later record at that home must carry it). */
+/**
+ * A peer's card pin: the newest verified card record's `issuedAt` and claims digest (no rollback), and the handle it
+ * holds at its home (set once, so a later record at that home must carry it).
+ */
+interface CardPin { home: string; handle?: string; issuedAt?: number; digest?: string }
 const handlePinKey = (id: string) => `network/handles/${sha256Hex(id)}.json`;
 const HANDLE_RE = /^@([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/;
 
@@ -339,16 +343,33 @@ export class NetworkClient {
     return this.#checkCard(isACEId(target) ? await this.#fetchCard(target) : (await this.#cardByHandle(target)).bundle);
   }
 
-  /** Verify a fetched card record against the identity's pin and its handle pin (written on first sight). */
+  /**
+   * Verify a fetched card record against the identity's KEL pin and its card pin (written on first sight, persisted):
+   * no rollback first (an older `issuedAt`, or an equal one with other claims, is `stale_descriptor`), then the
+   * set-once handle per home (a record naming the pinned home must carry the pinned handle; a new home re-pins).
+   */
   async #checkCard(bundle: CardBundle): Promise<VerifiedCard> {
     const id = bundle.card.aceId;
     const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
     await withLock(this.store, 'network-handles', async () => {
-      // Set once per home relay: a record naming the pinned home must carry the pinned handle; a new home re-pins.
       const r = v.record;
-      const pin = await this.#read<{ home: string; handle: string }>(handlePinKey(id));
-      if (pin !== null && pin.home === r.home && pin.handle !== r.handle) throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
-      if (r.handle !== undefined && (pin === null || pin.home !== r.home)) await this.store.write(handlePinKey(id), canonicalStateBytes({ home: r.home, handle: r.handle }));
+      const digest = documentDigest(r);
+      const pin = await this.#read<CardPin>(handlePinKey(id));
+      if (pin !== null && pin.issuedAt !== undefined) {
+        if (r.issuedAt < pin.issuedAt) throw new ACEError('stale_descriptor', 'an older card record than one already verified');
+        if (r.issuedAt === pin.issuedAt) {
+          if (digest !== pin.digest) throw new ACEError('stale_descriptor', 'another card record with the same issuedAt');
+          return;
+        }
+      }
+      if (pin !== null && pin.handle !== undefined && pin.home === r.home && pin.handle !== r.handle) {
+        throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
+      }
+      // The handle pin is unchanged (same home: equal by the check above), set on first claim, or re-pinned by a
+      // handle at a new home; a record without a handle at another home keeps the earlier home's handle pin.
+      const keep = pin !== null && pin.handle !== undefined && (r.handle === undefined || pin.home === r.home);
+      const handle = keep ? { home: pin.home, handle: pin.handle } : { home: r.home, ...(r.handle !== undefined ? { handle: r.handle } : {}) };
+      await this.store.write(handlePinKey(id), canonicalStateBytes({ ...handle, issuedAt: r.issuedAt, digest }));
     });
     return v;
   }

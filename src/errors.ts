@@ -14,6 +14,8 @@ const CODES = {
     'not_registered', 'not_permitted', 'relay_rejected', 'blocked_address', 'delivery_rejected', 'expired',
     // relay-side verifiers (07)
     'invalid_registration', 'stale_seq', 'future_seq',
+    // relay-side and client-side no-rollback of descriptors and card records (04, 07)
+    'stale_descriptor',
     // commerce rule codes
     'wrong_party', 'transition_not_allowed', 'wrong_role', 'bad_reference', 'limit_exceeded',
   ],
