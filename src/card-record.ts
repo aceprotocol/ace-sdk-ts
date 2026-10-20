@@ -80,6 +80,7 @@ export function verifyCardBundle(value: unknown, now: number = nowOf(), o: Verif
   if (issuedAt === null || issuedAt > now + TIMESTAMP_WINDOW_SECONDS) throw bad('invalid card record issuedAt');
   validateNetworkRelay(r.home, o);
   if (r.handle !== undefined && !isHandle(r.handle)) throw bad('handle must match [a-z][a-z0-9_-]{2,31}');
+  if (r.handle !== undefined && new URL(r.home as string).pathname !== '/') throw bad('a handle needs a home without a path (it resolves at https://host)');
   validateCard(r.card);
   if (r.pay !== undefined && (!Array.isArray(r.pay) || r.pay.length < 1 || r.pay.length > MAX_PAY_ACCOUNTS
     || new Set(r.pay).size !== r.pay.length || !r.pay.every(isCaip10))) {
