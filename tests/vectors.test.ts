@@ -12,7 +12,7 @@ import {
   fromBase64, isACEId, isBlockedAddress, isCaip10, isCaip19, isHandle, isHex64, isHttpsUrl, isMessageId, isMessageType, isOutcomeCode,
   isStreamId, isThreadId, isUsable, messageDigest, normalizeRelayUrl, parseAuthHeaders, profileDigest, signingMessage, validateCommerceExt,
   toBase64, validateErc8004Binding, validateProfileManifest, verifyAuthHeaders, verifyDelegation, verifyErc8004Registration, verifyKel,
-  verifyOperationalSignature, verifyPacketSignature, verifyPermit, verifyPublishedAgent, verifyRegistrationRequest, verifySignature,
+  verifyCardBundle, verifyOperationalSignature, verifyPacketSignature, verifyPermit, verifyPublishedAgent, verifyRegistrationRequest, verifySignature,
   type KelState, type Packet, type PrekeyVault, type ReceiptBody, type ReceiveOutcome, type RelayAuthRequest,
 } from './sdk.js';
 import { authPayload } from '../src/auth.js';
@@ -29,12 +29,6 @@ const enc = new TextEncoder();
 const kelOf = (name: string) => V.agents[name].export.kel;
 const stateOf = (name: string, now = NOW): KelState => verifyKel(kelOf(name), now);
 const idOf = (name: string): string => V.agents[name].aceId;
-/**
- * Vectors before version 10 sign descriptors that still carry the retired `visibility`/`handle`/`card` members (they
- * moved to the card record, 04 § Card record), which this SDK rejects as unknown members. The sections built on those
- * signed descriptors are skipped until the generator is rerun (version 10); nothing is skipped after that.
- */
-const PRE_CARD_RECORD = V.version < 10;
 
 async function codeOf(fn: () => unknown): Promise<string | null> {
   try { await fn(); } catch (e) {
@@ -45,8 +39,9 @@ async function codeOf(fn: () => unknown): Promise<string | null> {
 }
 
 describe('vectors: format', () => {
-  it('only pre-card-record vectors carry descriptor visibility', () => {
-    expect(PRE_CARD_RECORD || !JSON.stringify(V).includes('"visibility"')).toBe(true);
+  it('are card-record vectors (version 10+): no descriptor carries the retired visibility member', () => {
+    expect(V.version).toBeGreaterThanOrEqual(10);
+    expect(JSON.stringify(V).includes('"visibility"')).toBe(false);
   });
 });
 
@@ -204,14 +199,13 @@ describe('vectors: packet', () => {
 
 describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
   const d = V.descriptor;
-  const signed = PRE_CARD_RECORD ? it.skip : it;
-  signed.each(d.valid.map((c: Any) => [c.name, c]))('valid: %s', (_n, c: Any) => {
+  it.each(d.valid.map((c: Any) => [c.name, c]))('valid: %s', (_n, c: Any) => {
     expect(verifyPublishedAgent(c.publishedAgent, c.now).delegations.map((x) => x.issuer)).toEqual(c.delegations);
   });
-  signed.each(d.invalid.map((c: Any) => [c.name, c]))('invalid: %s', async (_n, c: Any) => {
+  it.each(d.invalid.map((c: Any) => [c.name, c]))('invalid: %s', async (_n, c: Any) => {
     expect(await codeOf(() => verifyPublishedAgent(c.publishedAgent, c.now))).toBe(c.error);
   });
-  signed.each(d.pinned.map((c: Any) => [c.name, c]))('against the pin: %s', async (_n, c: Any) => {
+  it.each(d.pinned.map((c: Any) => [c.name, c]))('against the pin: %s', async (_n, c: Any) => {
     const pinned = stateOf(c.pinned, c.now);
     expect(await codeOf(() => verifyPublishedAgent(c.publishedAgent, c.now, { pinned }))).toBe(c.error);
     // importAgent of a client holding the pin behaves the same (no prekey substitution by a superseded key).
@@ -237,7 +231,7 @@ describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
       else expect(await codeOf(run), c.name).toBe(c.error);
     }
   });
-  signed('delegations in descriptors', async () => {
+  it('delegations in descriptors', async () => {
     for (const c of V.delegation.descriptors) {
       const pins = new Map<string, KelState>(c.delegationPins.map((x: string) => [idOf(x), stateOf(x, c.now)]));
       expect(await codeOf(() => verifyPublishedAgent(c.publishedAgent, c.now, { delegationPins: pins })), c.name).toBe(c.error);
@@ -259,6 +253,13 @@ describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
   });
   it('permits', async () => {
     for (const c of V.permit.cases) expect(await codeOf(() => verifyPermit(c.permit, stateOf(c.issuer, c.now), c.subject, c.now)), c.name).toBe(c.error);
+  });
+  it.each(V.cardRecords.valid.map((c: Any) => [c.name, c]))('card record valid: %s', (_n, c: Any) => {
+    const { aceId, record: r } = verifyCardBundle(c.bundle, c.now);
+    expect({ aceId, home: r.home, handle: r.handle ?? null, pay: r.pay ?? null, contact: r.contact, listed: r.listed }).toEqual(c.expect);
+  });
+  it.each(V.cardRecords.invalid.map((c: Any) => [c.name, c]))('card record invalid: %s', async (_n, c: Any) => {
+    expect(await codeOf(() => verifyCardBundle(c.bundle, c.now))).toBe(c.error);
   });
   it('ERC-8004', async () => {
     for (const c of V.erc8004.shapes) expect((await codeOf(() => validateErc8004Binding(c.entry))) === null).toBe(c.valid);
@@ -364,7 +365,7 @@ describe('vectors: commerce', () => {
   });
 });
 
-describe.skipIf(PRE_CARD_RECORD)('vectors: receive pipeline', () => {
+describe('vectors: receive pipeline', () => {
   const names: Record<ReceiveOutcome['kind'], string> = {
     delivered: 'delivered', contact: 'delivered', duplicate: 'duplicate', dropped: 'drop', rejected: 'reject', receipt: 'delivered', deferred: 'retry',
   };
@@ -382,7 +383,7 @@ describe.skipIf(PRE_CARD_RECORD)('vectors: receive pipeline', () => {
     const receipts: ReceiptBody[] = [];
     const inbox = await Inbox.open({
       identity: me, store, vault: await bobVault(), profiles: new ProfileSet(['text', 'commerce']), peers, admission, clock,
-      capacity: c.capacity, contact: () => (c.public ? 'open' : 'closed'), onMessage: () => {}, sendReceipt: async (_to, b) => { receipts.push(b); },
+      capacity: c.capacity, contact: () => c.contact, onMessage: () => {}, sendReceipt: async (_to, b) => { receipts.push(b); },
     });
     for (const step of c.steps) {
       t = step.now;
