@@ -26,7 +26,7 @@ describe('admission', () => {
   it('connect records pending; a request never admits by itself; a stranger may send nothing else', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId(), B = bob.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -40,7 +40,7 @@ describe('admission', () => {
   it('a stranger\'s contact is checked against an existing pin: a source older than the pin is dropped', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const carol = await agent(relay, clock);
     const stale = await contact(carol, alice, 'request', 'ace:text:1', clock); // signed under carol's first delegation
     await carol.id.delegate({ now: clock.t });
@@ -53,7 +53,7 @@ describe('admission', () => {
   it('an accepted reply from a peer we never contacted is dropped and admits nothing', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const bob = await agent(relay, clock, { visibility: 'public' });
+    const bob = await agent(relay, clock, { contact: 'open', listed: true });
     const carol = await agent(relay, clock);
     const out = await bob.client.inbox.receive(await contact(carol, bob, 'accepted', 'ace:text:1', clock));
     expect(out.kind).toBe('dropped');
@@ -65,7 +65,7 @@ describe('admission', () => {
     const relay = new FakeRelay(clock.now);
     const both = { profiles: ['text' as const, 'commerce' as const] };
     const bob = await agent(relay, clock, both);
-    const carol = await agent(relay, clock, { ...both, visibility: 'public' });
+    const carol = await agent(relay, clock, { ...both, contact: 'open', listed: true });
     const C = carol.id.getACEId();
     await bob.client.connect(C, { profile: 'ace:text:1' });
     await bob.client.inbox.receive(await contact(carol, bob, 'accepted', 'ace:commerce:1', clock));
@@ -78,7 +78,7 @@ describe('admission', () => {
   it('an accepted reply from an already admitted peer changes nothing', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -93,14 +93,14 @@ describe('admission', () => {
   it('a rejected reply removes our pending entry', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId(), B = bob.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
     await alice.client.pull();
     await alice.client.reject(B);
     expect(await alice.client.requests()).toEqual([]);
-    // 05 § Flow: the rejected reply reaches the (private) requester through the permit carried in its request
+    // 05 § Flow: the rejected reply reaches the (closed) requester through the permit carried in its request
     expect((await bob.client.pull()).map((o) => o.kind)).toEqual(['contact']);
     expect(await bob.client.admission.get(A)).toBeNull();
   });
@@ -108,7 +108,7 @@ describe('admission', () => {
   it('acceptProfiles never overrides a block', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     const B = bob.id.getACEId();
     await alice.client.block(B);
@@ -121,7 +121,7 @@ describe('admission', () => {
   it('a block survives a restart; unblock makes the peer a stranger again', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId(), B = bob.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -132,7 +132,7 @@ describe('admission', () => {
     const received: ParsedMessage[] = [];
     const reopened = await NetworkClient.open({
       identity: alice.id, store: alice.store, relay: relay.client(), clock: clock.now,
-      visibility: 'public', onMessage: (m) => { received.push(m); },
+      contact: 'open', listed: true, onMessage: (m) => { received.push(m); },
       foreignRelay: () => { throw new ACEError('blocked_address', 'no foreign relays in tests'); },
     });
     expect((await reopened.admission.get(B))!.status).toBe('blocked');
@@ -191,7 +191,7 @@ describe('admission', () => {
   it('accept never clears a block: a residual request from a blocked peer is not_permitted, the relay block unchanged', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId(), B = bob.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -209,7 +209,7 @@ describe('admission', () => {
     for (const blockFirst of [false, true]) {
       const clock = new Clock();
       const relay = new FakeRelay(clock.now);
-      const alice = await agent(relay, clock, { visibility: 'public' });
+      const alice = await agent(relay, clock, { contact: 'open', listed: true });
       const bob = await agent(relay, clock);
       const A = alice.id.getACEId(), B = bob.id.getACEId();
       await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -225,8 +225,8 @@ describe('admission', () => {
   it('M1: connect never clears a block; only the explicit unblock does', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
-    const bob = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
+    const bob = await agent(relay, clock, { contact: 'open', listed: true });
     const B = bob.id.getACEId();
     await alice.client.block(B);
     await expect(alice.client.connect(B, { profile: 'ace:text:1' })).rejects.toMatchObject({ code: 'not_permitted' });
@@ -239,7 +239,7 @@ describe('admission', () => {
   it('M3: held requests are one per sender, expire after 24 h, and the oldest is evicted when full', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const book = alice.client.admission;
     const src = await alice.client.publish();
     const req = (n: number, note = '') => ({
@@ -263,7 +263,7 @@ describe('admission', () => {
   it('after a signing-key change, maintain pushes fresh permits to admitted peers', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock); // private
     const A = alice.id.getACEId(), B = bob.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });

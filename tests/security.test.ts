@@ -11,7 +11,7 @@ describe('security fixes', () => {
   it('a permit sent to a relay must authorize that packet', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const carol = await identity(clock);
     const permit = await createPermit(carol, bob.id.getACEId(), { now: NOW });
@@ -27,15 +27,15 @@ describe('security fixes', () => {
     const bob = await agent(relay, clock);
     const alice = await agent(relay, clock);
     const B = bob.id.getACEId();
-    // alice holds a permit from bob but no descriptor of his: only the anonymous public lookup may be used
+    // alice holds a permit from bob but no descriptor of his: only the anonymous lookup is used, never the permit
     await alice.client.importAgent(await bob.client.publish());
     await alice.client.admission.holdPermit(await createPermit(bob.id, alice.id.getACEId(), { now: NOW }));
     await alice.store.delete(`network/agents/${(await import('./sdk.js')).sha256Hex(B)}.json`);
     const before = relay.sent.length;
     const seen: unknown[] = [];
     const orig = relay.route.bind(relay);
-    relay.route = async (m, url, h, body) => { if (url.pathname === '/v1/descriptor/resolve') seen.push(body); return orig(m, url, h, body); };
-    await expect(alice.client.agent(B)).rejects.toMatchObject({ code: 'unknown_peer' });
+    relay.route = async (m, url, h, body) => { if (body !== undefined) seen.push(body); return orig(m, url, h, body); };
+    expect((await alice.client.agent(B)).descriptor.aceId).toBe(B);
     expect(seen).toEqual([]);
     expect(relay.sent.length).toBe(before);
   });
@@ -61,7 +61,7 @@ describe('security fixes', () => {
   });
 
   it('a contact from an admitted but unpinned peer is authenticated by its source, not dropped', async () => {
-    const w = await inboxWorld({ admit: false, visibility: () => 'private' });
+    const w = await inboxWorld({ admit: false, contact: () => 'closed' });
     await w.admission.update(w.sender.getACEId(), () => ({ aceId: w.sender.getACEId(), status: 'pending', profile: 'ace:text:1', updatedAt: NOW }));
     const source = await createDescriptor(w.sender, { relays: [RELAY], prekey: w.prekey, profiles: text.descriptors(), now: NOW });
     const permit = await createPermit(w.sender, w.me.getACEId(), { now: NOW });
@@ -123,10 +123,10 @@ describe('security fixes', () => {
     await expect(outbox.list()).rejects.toMatchObject({ code: 'storage_failed' });
   });
 
-  it('directory entries that do not match the query are skipped; anonymous lookups must be public', async () => {
+  it('directory entries that do not match the query are skipped; a lookup must return the requested identity', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const orig = relay.route.bind(relay);
     relay.route = async (m, url, h, body) => {
@@ -136,6 +136,6 @@ describe('security fixes', () => {
     };
     expect(await bob.client.discover({ profile: 'ace:commerce:1' })).toEqual({ agents: [], cursor: null });
     expect((await bob.client.discover({ profile: 'ace:text:1' })).agents.map((x) => x.descriptor.aceId)).toEqual([alice.id.getACEId()]);
-    await expect(relay.client().getDescriptor(bob.id.getACEId())).rejects.toMatchObject({ code: 'relay_protocol_error' });
+    await expect(relay.client().getDescriptor(alice.id.getACEId())).rejects.toMatchObject({ code: 'relay_protocol_error' });
   });
 });

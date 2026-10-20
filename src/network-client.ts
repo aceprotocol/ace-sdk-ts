@@ -1,14 +1,16 @@
 /**
- * The networked agent: publish (with prekey rotation, registering on demand), discover, import, connect via contact
+ * The networked agent: publish (descriptor with prekey rotation, then card record; registering on demand), discover,
+ * look up card records, import, connect via contact
  * packets, accept, block, descriptor refresh, permit renewal through receipts, and delivery through the Outbox and
  * Inbox. Local configuration, never a remote message, controls admission.
  */
 import { AdmissionBook, type ContactRequest, type PeerRecord } from './admission.js';
+import { createCardRecord, verifyCardBundle, type CardBundle, type CardRecord, type Contact, type VerifiedCard } from './card-record.js';
 import { commerceRules, ThreadStore } from './commerce.js';
 import { contactContent, receiptContent, type ContactBody, type ReceiptBody } from './core-messages.js';
 import {
   createDescriptor, createPermit, delegationIssuers, documentDigest, isBoundTo, isCachedUsable, verifyDelegation, verifyPermit, verifyPublishedAgent,
-  type AgentCard, type DelegationCredential, type DeliveryPermit, type DescriptorDelegation, type Erc8004Binding, type PublishedAgent, type Visibility,
+  type AgentCard, type DelegationCredential, type DeliveryPermit, type DescriptorDelegation, type Erc8004Binding, type PublishedAgent,
 } from './descriptor.js';
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, isACEId, isHandle, isObj, nowOf, parseStateBytes, sha256Hex } from './encoding.js';
@@ -47,9 +49,16 @@ export interface NetworkClientOptions {
   foreignRelay?: (url: string) => RelayClient;
   /** `fetch` of the home RelayClient built from `relayUrl`. */
   fetch?: typeof fetch;
-  visibility?: Visibility;
+  /** The card record's handle at the home relay: set once, it can never change or be dropped (04 § Card record). */
   handle?: string;
+  /** The card record's presentation card. */
   card?: AgentCard;
+  /** The card record's payment accounts: 1..MAX_PAY_ACCOUNTS distinct CAIP-10 accounts. */
+  pay?: string[];
+  /** Whether strangers' contact requests are processed (default `closed`). */
+  contact?: Contact;
+  /** Whether the home relay's directory lists this identity (default false). */
+  listed?: boolean;
   ext?: Record<string, JSONObject>;
   /** Delegation entries naming this identity; only the live ones are published. */
   delegations?: DescriptorDelegation[];
@@ -82,9 +91,48 @@ export interface NetworkClientOptions {
   clock?: () => number;
 }
 
-interface SelfRecord { agent: PublishedAgent; params: string }
+interface SelfRecord { agent: PublishedAgent; params: string; card?: CardBundle; cardParams?: string }
 const SELF_KEY = 'network/self.json';
 const agentKey = (id: string) => `network/agents/${sha256Hex(id)}.json`;
+/**
+ * A peer's card pin: the newest verified card record's `issuedAt` and claims digest (no rollback), and the handle it
+ * holds at its home (set once, so a later record at that home must carry it).
+ */
+interface CardPin { home: string; handle?: string; issuedAt: number; digest: string }
+const handlePinKey = (id: string) => `network/handles/${sha256Hex(id)}.json`;
+/** The reverse handle pin: the ACE ID `@handle@home` first resolved to. A binding is permanent, so a later other one is misbehavior. */
+interface HandleOwnerPin { home: string; handle: string; aceId: string }
+const handleOwnerKey = (home: string, handle: string) => `network/handle-owners/${sha256Hex(`${home} ${handle}`)}.json`;
+/**
+ * How a peer's KEL pin was confirmed: `liveConfirmed: false` when a card lookup pinned the bundle's own KEL because the
+ * identity had no live descriptor, until a live descriptor confirms it. No record: pinned through a descriptor.
+ */
+interface KelProvenance { aceId: string; liveConfirmed: boolean }
+const kelProvenanceKey = (id: string) => `network/kel-provenance/${sha256Hex(id)}.json`;
+const isStr = (v: unknown): v is string => typeof v === 'string';
+const isCardPin = (v: Record<string, unknown>): boolean => Number.isSafeInteger(v.issuedAt) && isStr(v.digest) && isStr(v.home)
+  && (v.handle === undefined || isStr(v.handle));
+const isHandleOwnerPin = (v: Record<string, unknown>): boolean => isStr(v.aceId) && isStr(v.home) && isStr(v.handle);
+const isKelProvenance = (v: Record<string, unknown>): boolean => isStr(v.aceId) && typeof v.liveConfirmed === 'boolean';
+const isUnknownPeer = (e: unknown): boolean => e instanceof ACEError && e.code === 'unknown_peer';
+const HANDLE_RE = /^@([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/;
+
+/**
+ * The result of `get` at the first of `routes` that serves it. `unknown_peer` only when every route answered it;
+ * otherwise the first other failure (a transient one included), so an unreachable route never reads as "not there".
+ */
+async function firstServed<T>(routes: readonly string[], get: (route: string) => Promise<T>): Promise<T> {
+  let unknown: unknown = new ACEError('unknown_peer', 'no route to the peer');
+  let other: unknown;
+  for (const route of routes) {
+    try {
+      return await get(route);
+    } catch (e) {
+      if (isUnknownPeer(e)) unknown = e; else other ??= e;
+    }
+  }
+  throw other ?? unknown;
+}
 
 const blockedPeer = () => new ACEError('not_permitted', 'the peer is blocked; unblock it first');
 
@@ -147,7 +195,8 @@ export class NetworkClient {
       rules: c.#rules(), clock: o.clock, allowLoopbackRelays: o.allowLoopbackRelays,
       onMessage: async (m) => { if (messages) await messages.save(m); await o.onMessage?.(m); },
       checkCapacity: async (m) => { await messages?.checkCapacity(m); await o.checkCapacity?.(m); },
-      visibility: () => c.options.visibility ?? 'private',
+      // 05 § Flow: strangers only when the published card record is open (and still configured so); no record is closed.
+      contact: async () => (c.options.contact === 'open' && (await c.#read<SelfRecord>(SELF_KEY))?.card?.card.contact === 'open' ? 'open' : 'closed'),
       onReceipt: (from, body) => c.#onReceipt(from, body),
       onContact: (e) => c.#onContact(e),
       sendReceipt: (to, body) => c.#sendReceipt(to, body),
@@ -178,10 +227,13 @@ export class NetworkClient {
   // --- publication ---------------------------------------------------------------------------
 
   /**
-   * Publish this identity's descriptor: rotates the prekey when none exists or it is older than 24 h (pruning
-   * expired retained prekeys), and reuses an unchanged descriptor with more than an hour left unless `force` (which
-   * posts it again). When the home relay holds no registration or an older KEL (`not_registered` / `kel_conflict`),
-   * the current KEL is registered and the descriptor posted once more.
+   * Publish this identity's card record, then its descriptor. The card record goes first because it is the post a relay
+   * refuses (handle rules); a refused card leaves the published descriptor unchanged. The card record is re-signed when
+   * its settings change or after a new `dlg`, and otherwise reused (re-posted with `force`). The descriptor: rotates the
+   * prekey when none exists or it is older than 24 h (pruning expired retained prekeys), and reuses an unchanged
+   * descriptor with more than an hour left unless `force` (which posts it again). When the home relay holds no
+   * registration or an older KEL (`not_registered` / `kel_conflict`), the current KEL is registered and the post
+   * repeated once.
    */
   async publish(o: { force?: boolean } = {}): Promise<PublishedAgent> {
     return withLock(this.store, 'network-self', async () => {
@@ -192,19 +244,34 @@ export class NetworkClient {
       const opts = this.options;
       const params = {
         relays: [this.relay.baseUrl], prekey: { id: prekey.id, publicKey: prekey.publicKey }, profiles: this.profiles.descriptors(),
-        visibility: opts.visibility ?? 'private', card: opts.card ?? {}, ...(opts.handle ? { handle: opts.handle } : {}),
         ...(opts.ext ? { ext: opts.ext } : {}), ...(opts.erc8004 ? { erc8004: opts.erc8004 } : {}),
         ...await this.#liveDelegations(now),
       };
-      const digest = sha256Hex(canonicalStateBytes({ params, lastHash: checkUsable(this.identity, now).lastHash }));
+      const lastHash = checkUsable(this.identity, now).lastHash;
+      const digest = sha256Hex(canonicalStateBytes({ params, lastHash }));
       const old = await this.#read<SelfRecord>(SELF_KEY);
+      const cardParams = {
+        home: this.relay.baseUrl, card: opts.card ?? {}, contact: opts.contact ?? 'closed', listed: opts.listed ?? false,
+        ...(opts.handle !== undefined ? { handle: opts.handle } : {}), ...(opts.pay !== undefined ? { pay: opts.pay } : {}),
+      } as const;
+      const cardDigest = sha256Hex(canonicalStateBytes({ cardParams, lastHash }));
+      let { card, cardParams: cardState } = old ?? {};
+      if (card && cardState === cardDigest) {
+        if (o.force) await this.#postCard(card);
+      } else {
+        card = await createCardRecord(this.identity, { ...cardParams, now: Math.max(now, (card?.card.issuedAt ?? -1) + 1), ...this.#verifyOpts() });
+        await this.#postCard(card);
+        cardState = cardDigest;
+        // Without a self record yet, the card is saved with the first descriptor below.
+        if (old) await this.store.write(SELF_KEY, canonicalStateBytes({ ...old, card, cardParams: cardState }));
+      }
       if (old && old.params === digest && old.agent.descriptor.expiresAt > now + 3600) {
         if (o.force) await this.#postDescriptor(old.agent);
         return old.agent;
       }
       const agent = await createDescriptor(this.identity, { ...params, now: Math.max(now, (old?.agent.descriptor.issuedAt ?? -1) + 1), ...this.#verifyOpts() });
       await this.#postDescriptor(agent);
-      await this.store.write(SELF_KEY, canonicalStateBytes({ agent, params: digest }));
+      await this.store.write(SELF_KEY, canonicalStateBytes({ ...old, agent, params: digest, card, cardParams: cardState }));
       return agent;
     });
   }
@@ -235,19 +302,28 @@ export class NetworkClient {
   }
 
   /** Post `agent` to the home relay, registering the current KEL first when the relay lacks it. */
-  async #postDescriptor(agent: PublishedAgent): Promise<void> {
+  #postDescriptor(agent: PublishedAgent): Promise<void> {
+    return this.#registered(() => this.relay.publishDescriptor(agent));
+  }
+
+  /** Post this identity's card record to the home relay, registering on demand like the descriptor. */
+  #postCard(card: CardBundle): Promise<void> {
+    return this.#registered(() => this.relay.publishCard(card));
+  }
+
+  async #registered(post: () => Promise<void>): Promise<void> {
     try {
-      await this.relay.publishDescriptor(agent);
+      await post();
     } catch (e) {
       if (!(e instanceof ACEError && (e.code === 'not_registered' || e.relayCode === 'kel_conflict'))) throw e;
       await this.relay.register(this.identity);
-      await this.relay.publishDescriptor(agent);
+      await post();
     }
   }
 
   // --- discovery ----------------------------------------------------------------------------
 
-  /** The public directory of the home relay (every entry verified). */
+  /** The public directory of the home relay: identities whose card record is listed (every entry verified). */
   discover(o: { profile?: string; cursor?: string; limit?: number } = {}): Promise<{ agents: PublishedAgent[]; cursor: string | null }> {
     return this.relay.listDescriptors(o);
   }
@@ -283,43 +359,162 @@ export class NetworkClient {
     });
   }
 
-  /** Resolve `@name@relay-host` (or a bare ACE ID) to a verified, imported PublishedAgent. */
+  /** Resolve `@name@relay-host` (through its card record) or a bare ACE ID to a verified, imported PublishedAgent. */
   async lookup(target: string): Promise<PublishedAgent> {
     if (isACEId(target)) return this.agent(target);
-    const m = typeof target === 'string' ? /^@([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/.exec(target) : null;
-    if (!m || !isHandle(m[1])) throw new ACEError('invalid_argument', 'use an ACE ID or @name@relay-host');
-    const home = new URL(this.relay.baseUrl);
-    const relay = m[2] === home.host ? this.relay : this.#relayFor(`https://${m[2]}`);
-    return this.importAgent(await relay.resolveHandle(m[1]));
+    const { bundle, relay, handle } = await this.#cardByHandle(target);
+    const id = bundle.card.aceId;
+    const pinned = await this.#pinKel(id, () => this.#fetchAgent(id, [relay.baseUrl]));
+    await this.#checkCard(bundle, { home: relay.baseUrl, handle });
+    return pinned ?? this.#fetchAgent(id, [relay.baseUrl]);
   }
 
   /**
-   * The peer's descriptor: the cached one while usable, else refreshed from its routes (public: `GET`; with a permit
-   * it issued us: `resolve`). A failed refresh throws; a stale descriptor is never returned.
+   * The verified card record of `target` (an ACE ID or `@name@relay-host`). A handle resolves only to a record whose
+   * `home` is the queried relay and whose `handle` is the queried one (`unknown_peer`). A handle is set once per home:
+   * after a record with a handle was seen for an identity, a record of it naming the same home with another or no handle
+   * is `invalid_authorization`. A handle's first resolution pins its ACE ID; a later resolution to another one is
+   * `invalid_authorization`. Without a KEL pin for the identity, its descriptor is looked up first and its KEL pinned, so
+   * the card is verified under the current KEL, never one a relay chose. When every route answers `unknown_peer` (no
+   * live descriptor: offline past its lifetime), the card is verified under the bundle's own KEL instead, that KEL is
+   * pinned as a descriptor's would be, and the result says `kelLive: false` (04 § Card record). That pin is recorded as
+   * not confirmed live: later lookups look the descriptor up again and say `kelLive: false` until one confirms it.
+   */
+  async lookupCard(target: string): Promise<VerifiedCard> {
+    if (isACEId(target)) {
+      const kel = await this.#cardKel(target, () => this.agent(target), () => this.#fetchCard(target));
+      return this.#checkCard(kel.bundle ?? await this.#fetchCard(target), undefined, kel.kelLive);
+    }
+    const { bundle, relay, handle } = await this.#cardByHandle(target);
+    const id = bundle.card.aceId;
+    const kel = await this.#cardKel(id, () => this.#fetchAgent(id, [relay.baseUrl]), async () => bundle);
+    return this.#checkCard(bundle, { home: relay.baseUrl, handle }, kel.kelLive);
+  }
+
+  /** When `id` has no KEL pin, pin it through `fetch` (a descriptor lookup) and return what it fetched; else null. */
+  async #pinKel(id: string, fetch: () => Promise<PublishedAgent>): Promise<PublishedAgent | null> {
+    return (await this.peers.get(id)) === null ? fetch() : null;
+  }
+
+  /**
+   * The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A pin confirmed live is used as is.
+   * Otherwise the descriptor is looked up through `fetch` (pinning or reconciling the KEL): on success the pin is
+   * recorded as confirmed live. When every route answers `unknown_peer` (no live descriptor), an unconfirmed pin stays
+   * unconfirmed, and without a pin the card's own bundle (`card`) pins the KEL: the bundle is verified, its KEL adopted
+   * under the fork rules and recorded as not confirmed live, and the bundle returned. Every other failure propagates.
+   */
+  async #cardKel(id: string, fetch: () => Promise<PublishedAgent>, card: () => Promise<CardBundle>): Promise<{ kelLive: boolean; bundle?: CardBundle }> {
+    const pinned = await this.peers.get(id);
+    const provenance = await this.#readPin<KelProvenance>(kelProvenanceKey(id), isKelProvenance);
+    if (pinned !== null && provenance?.liveConfirmed !== false) return { kelLive: true };
+    try {
+      await fetch();
+    } catch (e) {
+      if (!isUnknownPeer(e)) throw e;
+      return pinned !== null ? { kelLive: false } : this.#pinBundleKel(id, await card());
+    }
+    if (provenance !== null && !provenance.liveConfirmed) {
+      await withLock(this.store, 'peers', () => this.store.write(kelProvenanceKey(id), canonicalStateBytes({ aceId: id, liveConfirmed: true })));
+    }
+    return { kelLive: true };
+  }
+
+  /** Pin the verified KEL of `bundle` (no live descriptor), recorded as not confirmed live with the pin, atomically. */
+  async #pinBundleKel(id: string, bundle: CardBundle): Promise<{ kelLive: false; bundle: CardBundle }> {
+    const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
+    if (v.aceId !== id) throw new ACEError('invalid_authorization', 'the card record names another identity');
+    await this.peers.adopt(structuredClone(v.kelState.events), async ({ state: pin }) => {
+      // As for a descriptor: another path advanced the pin past the state the card verified under.
+      if (pin.lastHash !== v.kelState.lastHash) throw new ACEError('stale_peer_binding', 'the pin advanced past the card record');
+      await this.store.write(kelProvenanceKey(id), canonicalStateBytes({ aceId: id, liveConfirmed: false }));
+    });
+    return { kelLive: false, bundle };
+  }
+
+  /**
+   * A stored pin, null when absent; one that is not an object or lacks a required member (`valid`) is `storage_failed`,
+   * never no pin.
+   */
+  async #readPin<T>(key: string, valid: (v: Record<string, unknown>) => boolean): Promise<T | null> {
+    const raw = await this.store.read(key);
+    if (raw === null) return null;
+    const v = parseStateBytes(raw, key);
+    if (!isObj(v) || !valid(v)) throw new ACEError('storage_failed', `${key} is invalid`);
+    return v as T;
+  }
+
+  /**
+   * Verify a fetched card record against the identity's KEL pin and its card pin (written on first sight, persisted):
+   * no rollback first (an older `issuedAt`, or an equal one with other claims, is `stale_descriptor`), then the
+   * set-once handle per home (a record naming the pinned home must carry the pinned handle; a new home re-pins). A
+   * record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
+   */
+  async #checkCard(bundle: CardBundle, resolved?: { home: string; handle: string }, kelLive = true): Promise<VerifiedCard> {
+    const id = bundle.card.aceId;
+    const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
+    await withLock(this.store, 'network-handles', async () => {
+      const owner = resolved ? await this.#readPin<HandleOwnerPin>(handleOwnerKey(resolved.home, resolved.handle), isHandleOwnerPin) : null;
+      if (owner !== null && owner.aceId !== id) throw new ACEError('invalid_authorization', 'the handle resolved to another identity than before');
+      await this.#advanceCardPin(v.record);
+      if (resolved && owner === null) {
+        await this.store.write(handleOwnerKey(resolved.home, resolved.handle), canonicalStateBytes({ ...resolved, aceId: id }));
+      }
+    });
+    return { ...v, kelLive };
+  }
+
+  /** The card pin checks and update of #checkCard, under the `network-handles` lock. */
+  async #advanceCardPin(r: CardRecord): Promise<void> {
+    const id = r.aceId;
+    const digest = documentDigest(r);
+    const pin = await this.#readPin<CardPin>(handlePinKey(id), isCardPin);
+    if (pin !== null) {
+      if (r.issuedAt < pin.issuedAt) throw new ACEError('stale_descriptor', 'an older card record than one already verified');
+      if (r.issuedAt === pin.issuedAt) {
+        if (digest !== pin.digest) throw new ACEError('stale_descriptor', 'another card record with the same issuedAt');
+        return;
+      }
+    }
+    if (pin !== null && pin.handle !== undefined && pin.home === r.home && pin.handle !== r.handle) {
+      throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
+    }
+    // The handle pin is unchanged (same home: equal by the check above), set on first claim, or re-pinned by a
+    // handle at a new home; a record without a handle at another home keeps the earlier home's handle pin.
+    const keep = pin !== null && pin.handle !== undefined && (r.handle === undefined || pin.home === r.home);
+    const handle = keep ? { home: pin.home, handle: pin.handle } : { home: r.home, ...(r.handle !== undefined ? { handle: r.handle } : {}) };
+    await this.store.write(handlePinKey(id), canonicalStateBytes({ ...handle, issuedAt: r.issuedAt, digest }));
+  }
+
+  async #cardByHandle(target: string): Promise<{ bundle: CardBundle; relay: RelayClient; handle: string }> {
+    const m = typeof target === 'string' ? HANDLE_RE.exec(target) : null;
+    if (!m || !isHandle(m[1])) throw new ACEError('invalid_argument', 'use an ACE ID or @name@relay-host');
+    const relay = m[2] === new URL(this.relay.baseUrl).host ? this.relay : this.#relayFor(`https://${m[2]}`);
+    return { bundle: await relay.handle(m[1]), relay, handle: m[1] };
+  }
+
+  /** The peer's card record from the first route that serves it: its cached descriptor's relays, then the home relay. */
+  async #fetchCard(aceId: string): Promise<CardBundle> {
+    const cached = await this.#read<PublishedAgent>(agentKey(aceId));
+    return firstServed([...new Set([...cached?.descriptor.relays ?? [], this.relay.baseUrl])], (route) => this.#relayFor(route).card(aceId));
+  }
+
+  /**
+   * The peer's descriptor: the cached one while usable, else refreshed from its routes (`GET /v1/descriptor`). A failed
+   * refresh throws; a stale descriptor is never returned.
    */
   async agent(aceId: string, o: { refresh?: boolean } = {}): Promise<PublishedAgent> {
     const cached = await this.#read<PublishedAgent>(agentKey(aceId));
     const [pinned, delegationPins] = await Promise.all([this.peers.get(aceId), cached ? this.peers.pins(delegationIssuers(cached)) : new Map<string, KelState>()]);
     if (cached && !o.refresh && isCachedUsable(cached, this.#now(), { pinned, delegationPins })) return cached;
-    // A permit is a bearer credential: present it only to routes from a descriptor signed under the issuer's current
-    // pin. A KEL-stale descriptor (signed under a superseded, possibly compromised key) may name attacker relays: its
-    // routes and the home relay get only the anonymous public lookup, as when nothing is cached.
-    if (cached !== null && isBoundTo(cached, pinned)) return this.#fetchAgent(aceId, cached.descriptor.relays, this.#live(await this.admission.heldPermit(aceId), pinned));
+    // A KEL-stale descriptor (signed under a superseded, possibly compromised key) may name attacker relays: the home
+    // relay is asked too, as when nothing is cached.
+    if (cached !== null && isBoundTo(cached, pinned)) return this.#fetchAgent(aceId, cached.descriptor.relays);
     return this.#fetchAgent(aceId, [...new Set([...cached?.descriptor.relays ?? [], this.relay.baseUrl])]);
   }
 
-  /** Fetch and import the peer's descriptor from the first of `routes` that serves it (`resolve` with `permit`). */
-  async #fetchAgent(aceId: string, routes: readonly string[], permit?: DeliveryPermit): Promise<PublishedAgent> {
-    let error: unknown = new ACEError('unknown_peer', 'no route to the peer');
-    for (const route of routes) {
-      try {
-        const relay = this.#relayFor(route);
-        return await this.importAgent(permit ? await relay.resolveDescriptor(aceId, permit) : await relay.getDescriptor(aceId));
-      } catch (e) {
-        error = e;
-      }
-    }
-    throw error;
+  /** Fetch and import the peer's descriptor from the first of `routes` that serves it. */
+  async #fetchAgent(aceId: string, routes: readonly string[]): Promise<PublishedAgent> {
+    return firstServed(routes, async (route) => this.importAgent(await this.#relayFor(route).getDescriptor(aceId)));
   }
 
   /** The permit `aceId` issued us, only while it verifies under its current pin: the one `send` presents. */
@@ -356,7 +551,8 @@ export class NetworkClient {
   /**
    * Invite one peer (ACE ID, `@handle@host`, or its PublishedAgent shared out of band) to contact this identity:
    * imports the peer, records it `admitted` (an explicit local decision; clears a block) and returns this identity's
-   * PublishedAgent with a delivery permit issued to the peer. Share it privately: the permit is a bearer credential.
+   * PublishedAgent with a delivery permit issued to the peer, which reaches this identity even while `closed`. Share it
+   * privately: the permit is a bearer credential.
    */
   async createInvitation(peer: string | PublishedAgent, o: { profile?: string } = {}): Promise<Invitation> {
     if (o.profile !== undefined && !this.profiles.has(o.profile)) throw new ACEError('invalid_argument', `${o.profile} is not installed`);
@@ -375,7 +571,7 @@ export class NetworkClient {
 
   /**
    * Import an invitation `{agent, permit}` addressed to this identity: verify and pin the agent, hold its permit (so
-   * `connect` can reach a private inviter). Never admits the inviter. Returns the imported PublishedAgent.
+   * `connect` can reach a `closed` inviter). Never admits the inviter. Returns the imported PublishedAgent.
    */
   async importInvitation(value: unknown): Promise<PublishedAgent> {
     const { agent, permit } = verifyInvitation(value, this.identity.getACEId(), this.#now(), this.#verifyOpts());
@@ -529,7 +725,8 @@ export class NetworkClient {
 
   /**
    * Send a contact request for `profile` to `target` (ACE ID, `@handle@host` or a PublishedAgent shared out of band).
-   * Records the target as `pending`. A non-public target needs a permit it issued us. A blocked peer is
+   * Records the target as `pending`. Without a permit it issued us, the target's card record must be `contact: open`
+   * (no record is `closed`; 05 § Flow); this identity's own `contact` does not matter. A blocked peer is
    * `not_permitted`: only `unblock` (or an invitation) lifts a block (05 § Blocks). Returns the request's messageId.
    */
   async connect(target: string | PublishedAgent, o: { profile: string; note?: string }): Promise<string> {
@@ -537,7 +734,7 @@ export class NetworkClient {
     const id = agent.descriptor.aceId;
     this.#sharedProfile(agent, o.profile);
     if ((await this.admission.get(id))?.status === 'blocked') throw blockedPeer();
-    if (agent.descriptor.visibility !== 'public' && !(await this.#theirPermit(id))) throw new ACEError('not_permitted', 'a private agent needs a permit it issued');
+    if (!(await this.#theirPermit(id)) && (await this.#contactOf(id)) !== 'open') throw new ACEError('not_permitted', 'the peer takes contact requests only from peers it issued a permit');
     const permit = await this.#createPermit(id);
     await this.admission.update(id, (old) => ({
       ...(old ?? { aceId: id }), status: old?.status === 'admitted' ? 'admitted' : 'pending', profile: o.profile, updatedAt: this.#now(),
@@ -546,6 +743,16 @@ export class NetworkClient {
     await this.#sendContact(id, { kind: 'request', profile: o.profile, note: o.note, permit }, { messageId });
     await this.#noteIssued(id, permit);
     return messageId;
+  }
+
+  /** The peer's card record `contact`; a peer without a card record is `closed`. */
+  async #contactOf(aceId: string): Promise<Contact> {
+    try {
+      return (await this.lookupCard(aceId)).record.contact;
+    } catch (e) {
+      if (e instanceof ACEError && e.code === 'unknown_peer') return 'closed';
+      throw e;
+    }
   }
 
   /** Pending incoming contact requests, oldest first. */
@@ -566,10 +773,10 @@ export class NetworkClient {
     if (req.source.descriptor.expiresAt > this.#now()) {
       await this.importAgent(req.source);
     } else {
-      // The held request (24 h) outlived its source descriptor: pin the source's KEL (05 § Flow step 3) and refresh the
-      // descriptor, from the source's routes with the requester's permit while the source is bound to the pin.
+      // The held request outlived its source descriptor: pin the source's KEL (05 § Flow step 3) and refresh the
+      // descriptor, from the source's routes while the source is bound to the pin.
       const { state } = await this.peers.adopt(structuredClone(req.source.kel));
-      if (isBoundTo(req.source, state)) await this.#fetchAgent(req.from, req.source.descriptor.relays, this.#live(req.permit, state));
+      if (isBoundTo(req.source, state)) await this.#fetchAgent(req.from, req.source.descriptor.relays);
       else await this.agent(req.from, { refresh: true });
     }
     const permit = await this.#createPermit(req.from);

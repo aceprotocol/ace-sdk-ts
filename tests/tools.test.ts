@@ -66,18 +66,20 @@ describe('AGENT_TOOLS', () => {
 
   it('runs the hosted flows end to end and marks remote content untrusted', async () => {
     const clock = new Clock(), relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', handle: 'alice', card: { name: 'Alice' }, profiles: ['text', 'commerce'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, handle: 'alice', card: { name: 'Alice' }, profiles: ['text', 'commerce'] });
     const bob = await agent(relay, clock, { profiles: ['text', 'commerce'] });
     const A = alice.id.getACEId(), B = bob.id.getACEId();
 
     const me = await run(alice, 'ace_identity');
-    expect(me).toMatchObject({ aceId: A, visibility: 'public', handle: 'alice', address: '@alice@relay.test', untrusted: [] });
+    expect(me).toMatchObject({ aceId: A, contact: 'open', listed: true, handle: 'alice', address: '@alice@relay.test', untrusted: [] });
     expect(me.profiles.map((p: { id: string }) => p.id)).toEqual(['ace:core:1', 'ace:text:1', 'ace:commerce:1']);
 
     const found = await run(bob, 'ace_network', { action: 'discover' });
     expect(found.agents.map((x: { aceId: string }) => x.aceId)).toEqual([A]);
-    expect(found.untrusted).toEqual(['agents[].handle', 'agents[].card', 'agents[].relays', 'agents[].ext', 'agents[].delegations[].issuer', 'agents[].erc8004']);
-    expect((await run(bob, 'ace_network', { action: 'lookup', peer: '@alice@relay.test' })).agent.card).toEqual({ name: 'Alice' });
+    expect(found.untrusted).toEqual(['agents[].relays', 'agents[].ext', 'agents[].delegations[].issuer', 'agents[].erc8004']);
+    const looked = await run(bob, 'ace_network', { action: 'lookup', peer: '@alice@relay.test' });
+    expect(looked.card).toMatchObject({ handle: 'alice', card: { name: 'Alice' }, contact: 'open' });
+    expect(looked.untrusted).toContain('card');
 
     expect(await run(bob, 'ace_network', { action: 'connect', peer: '@alice@relay.test', note: 'hi, bob here' })).toMatchObject({ status: 'pending', aceId: A, profile: 'ace:text:1' });
     await alice.client.pull();

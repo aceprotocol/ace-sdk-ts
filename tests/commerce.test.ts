@@ -47,7 +47,7 @@ describe('commerceRules', () => {
       const client = await NetworkClient.open({ identity: await identity(clock), store: new MemoryStore(), relayUrl: relay.baseUrl, profiles: ['commerce'], fetch: relay.fetch, clock: clock.now, ...o });
       return { client, threads: client.threads, messages: client.messages };
     };
-    const s = await make({ visibility: 'public', acceptProfiles: ['ace:commerce:1'] });
+    const s = await make({ contact: 'open', listed: true, acceptProfiles: ['ace:commerce:1'] });
     const b = await make({});
     for (const c of [s, b]) { await c.client.publish(); }
     const S = s.client.identity.getACEId();
@@ -76,7 +76,7 @@ describe('commerce sender state', () => {
       const client = await NetworkClient.open({ identity: await identity(clock), store: new MemoryStore(), relayUrl: relay.baseUrl, profiles: ['commerce'], fetch: relay.fetch, clock: clock.now, ...o });
       return { client, threads: client.threads, messages: client.messages };
     };
-    const s = await make({ visibility: 'public', acceptProfiles: ['ace:commerce:1'] });
+    const s = await make({ contact: 'open', listed: true, acceptProfiles: ['ace:commerce:1'] });
     const b = await make({});
     for (const c of [s, b]) { await c.client.publish(); }
     const S = s.client.identity.getACEId(), B = b.client.identity.getACEId();

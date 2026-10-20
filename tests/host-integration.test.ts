@@ -19,8 +19,8 @@ describe('host integration', () => {
   it('an expired configured delegation drops out of the next descriptor', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const issuer = await agent(relay, clock, { visibility: 'public' });
-    const subject = await agent(relay, clock, { visibility: 'public' });
+    const issuer = await agent(relay, clock, { contact: 'open', listed: true });
+    const subject = await agent(relay, clock, { contact: 'open', listed: true });
     const credential = await createDelegationCredential(issuer.id, subject.id.getACEId(), { now: clock.t, ttl: 60 });
     subject.client.options.delegations = [{ kel: issuer.id.getKel(), credential }];
     expect((await subject.client.publish()).descriptor.delegations).toHaveLength(1);

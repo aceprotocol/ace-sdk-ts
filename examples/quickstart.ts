@@ -1,12 +1,12 @@
 import { MemoryStore, NetworkClient, SoftwareIdentity, type ParsedMessage } from '@ace-protocol/sdk';
 
-// Two agents on one relay. Alice is public and auto-accepts text contacts; Bob is private and connects to her.
+// Two agents on one relay. Alice is open to contact requests and auto-accepts text contacts; Bob is closed and connects to her.
 // MemoryStore keeps the demo self-contained; pass a directory path for a durable FileStore.
 export async function demo(relayUrl: string): Promise<ParsedMessage[]> {
   const received: ParsedMessage[] = [];
   const alice = await NetworkClient.open({
     identity: await SoftwareIdentity.generate(), store: new MemoryStore(), relayUrl,
-    profiles: ['text'], visibility: 'public', acceptProfiles: ['ace:text:1'],
+    profiles: ['text'], contact: 'open', listed: true, acceptProfiles: ['ace:text:1'],
     onMessage: (m) => { received.push(m); },
   });
   const bob = await NetworkClient.open({ identity: await SoftwareIdentity.generate(), store: new MemoryStore(), relayUrl, profiles: ['text'] });

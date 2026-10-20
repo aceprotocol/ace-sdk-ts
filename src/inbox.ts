@@ -3,7 +3,7 @@
  *   1 packet shape → 2 admission → 3 sender KEL pin (refreshed at most once) → 4 operational signature (delegation
  *   seq, signed while live, usable now) → 5 time window → 6 decrypt with the referenced prekey → 7 `(type,
  *   schemaDigest)` installed → 8 body schema → 9 dedupe → 10 profile rules and persist → 11 receipt, then relay ack.
- * A sender outside the admission table is processed only when this identity is public and the packet is an
+ * A sender outside the admission table is processed only when this identity's card record is `open` and the packet is an
  * `ace:contact:1` request; that path never queries the network and never writes a pin (admission before lookup).
  *
  * Outcomes: signature, decryption and admission failures are silently dropped (and acknowledged); schema and rule
@@ -14,7 +14,8 @@
  */
 import { AdmissionBook } from './admission.js';
 import { checkContactBody, checkReceiptBody, type ContactBody, type ReceiptBody } from './core-messages.js';
-import { checkStrangerSource, delegationIssuers, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent, type Visibility } from './descriptor.js';
+import { checkStrangerSource, delegationIssuers, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent } from './descriptor.js';
+import type { Contact } from './card-record.js';
 import { ACEError, asACEError } from './errors.js';
 import { canonicalStateBytes, conversationKey, isACEId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
 import type { ACEIdentity } from './identity.js';
@@ -39,7 +40,7 @@ export interface ContactEvent {
   source: VerifiedAgent;
   /** The verified reply permit (absent for `rejected`). */
   permit?: DeliveryPermit;
-  /** True when the sender was not in the admission table (a stranger's request to a public identity). */
+  /** True when the sender was not in the admission table (a stranger's request to an `open` identity). */
   stranger: boolean;
 }
 
@@ -60,8 +61,11 @@ export interface InboxOptions {
   peers?: PeerStore;
   admission?: AdmissionBook;
   rules?: ProfileRules[];
-  /** This identity's visibility; strangers' contact requests are processed only when `public`. Default `private`. */
-  visibility?: () => Visibility | Promise<Visibility>;
+  /**
+   * This identity's published card record `contact`; strangers' contact requests are processed only when `open`.
+   * Default `closed` (no card record is `closed`).
+   */
+  contact?: () => Contact | Promise<Contact>;
   /** Persist the message durably and idempotently keyed by (from, messageId). Throwing defers the packet. */
   onMessage: (m: ParsedMessage) => void | Promise<void>;
   /** Effect-free capacity check; throw `receiver_capacity` to leave the packet on the relay. */
@@ -286,8 +290,8 @@ export class Inbox {
     } catch (e) {
       const err = asACEError(e, 'relay_unavailable');
       if (err.isTransient) return defer(err);
-      // 06 step 3: a permanent refresh failure (e.g. a private peer after a signing-key change, whose earlier permits
-      // no longer resolve its descriptor) continues as a contact candidate.
+      // 06 step 3: a permanent refresh failure (e.g. a peer after a signing-key change that has not republished its
+      // descriptor yet) continues as a contact candidate.
       return this.#candidate(packet, false);
     }
     // 4. operational signature against the pin (step 3 already made the one permitted refresh)
@@ -336,10 +340,10 @@ export class Inbox {
     }
   }
 
-  /** A sender outside the admission table: only a public identity's contact request; no lookup, no pin. */
+  /** A sender outside the admission table: only an `open` identity's contact request; no lookup, no pin. */
   async #stranger(packet: Packet): Promise<ReceiveOutcome> {
-    const visibility = (await this.#o.visibility?.()) ?? 'private';
-    if (visibility !== 'public') return drop(new ACEError('not_permitted', 'sender is not admitted'));
+    const contact = (await this.#o.contact?.()) ?? 'closed';
+    if (contact !== 'open') return drop(new ACEError('not_permitted', 'sender is not admitted'));
     return this.#candidate(packet, true);
   }
 

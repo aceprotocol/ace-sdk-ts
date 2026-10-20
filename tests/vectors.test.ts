@@ -12,7 +12,7 @@ import {
   fromBase64, isACEId, isBlockedAddress, isCaip10, isCaip19, isHandle, isHex64, isHttpsUrl, isMessageId, isMessageType, isOutcomeCode,
   isStreamId, isThreadId, isUsable, messageDigest, normalizeRelayUrl, parseAuthHeaders, profileDigest, signingMessage, validateCommerceExt,
   toBase64, validateErc8004Binding, validateProfileManifest, verifyAuthHeaders, verifyDelegation, verifyErc8004Registration, verifyKel,
-  verifyOperationalSignature, verifyPacketSignature, verifyPermit, verifyPublishedAgent, verifyRegistrationRequest, verifySignature,
+  verifyCardBundle, verifyOperationalSignature, verifyPacketSignature, verifyPermit, verifyPublishedAgent, verifyRegistrationRequest, verifySignature,
   type KelState, type Packet, type PrekeyVault, type ReceiptBody, type ReceiveOutcome, type RelayAuthRequest,
 } from './sdk.js';
 import { authPayload } from '../src/auth.js';
@@ -37,6 +37,13 @@ async function codeOf(fn: () => unknown): Promise<string | null> {
   }
   return null;
 }
+
+describe('vectors: format', () => {
+  it('are card-record vectors (version 10+): no descriptor carries the retired visibility member', () => {
+    expect(V.version).toBeGreaterThanOrEqual(10);
+    expect(JSON.stringify(V).includes('"visibility"')).toBe(false);
+  });
+});
 
 describe('vectors: agents', () => {
   it('load from their exports', () => {
@@ -223,6 +230,8 @@ describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
       if (c.result) expect(run(), c.name).toBe(c.result);
       else expect(await codeOf(run), c.name).toBe(c.error);
     }
+  });
+  it('delegations in descriptors', async () => {
     for (const c of V.delegation.descriptors) {
       const pins = new Map<string, KelState>(c.delegationPins.map((x: string) => [idOf(x), stateOf(x, c.now)]));
       expect(await codeOf(() => verifyPublishedAgent(c.publishedAgent, c.now, { delegationPins: pins })), c.name).toBe(c.error);
@@ -244,6 +253,13 @@ describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
   });
   it('permits', async () => {
     for (const c of V.permit.cases) expect(await codeOf(() => verifyPermit(c.permit, stateOf(c.issuer, c.now), c.subject, c.now)), c.name).toBe(c.error);
+  });
+  it.each(V.cardRecords.valid.map((c: Any) => [c.name, c]))('card record valid: %s', (_n, c: Any) => {
+    const { aceId, record: r } = verifyCardBundle(c.bundle, c.now);
+    expect({ aceId, home: r.home, handle: r.handle ?? null, pay: r.pay ?? null, contact: r.contact, listed: r.listed }).toEqual(c.expect);
+  });
+  it.each(V.cardRecords.invalid.map((c: Any) => [c.name, c]))('card record invalid: %s', async (_n, c: Any) => {
+    expect(await codeOf(() => verifyCardBundle(c.bundle, c.now))).toBe(c.error);
   });
   it('ERC-8004', async () => {
     for (const c of V.erc8004.shapes) expect((await codeOf(() => validateErc8004Binding(c.entry))) === null).toBe(c.valid);
@@ -367,7 +383,7 @@ describe('vectors: receive pipeline', () => {
     const receipts: ReceiptBody[] = [];
     const inbox = await Inbox.open({
       identity: me, store, vault: await bobVault(), profiles: new ProfileSet(['text', 'commerce']), peers, admission, clock,
-      capacity: c.capacity, visibility: () => (c.public ? 'public' : 'private'), onMessage: () => {}, sendReceipt: async (_to, b) => { receipts.push(b); },
+      capacity: c.capacity, contact: () => c.contact, onMessage: () => {}, sendReceipt: async (_to, b) => { receipts.push(b); },
     });
     for (const step of c.steps) {
       t = step.now;

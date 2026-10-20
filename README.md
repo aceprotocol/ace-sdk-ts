@@ -18,13 +18,16 @@ Spec: `ace-spec` chapters 00–08 (packet version `"1"`). Every signature is ML-
 - **Packet** — `createPacket`, `decodePacket`, `verifyPacketSignature`, `decryptPacket`: X-Wing → HKDF-SHA256 (empty
   salt, info = header binding `from`, `to`, `messageId`, `timestamp`, prekey and KEM ciphertext) → AES-256-GCM, signed
   with ML-DSA-65 (action `packet`). The recipient need not be online.
-- **Descriptor** — `createDescriptor` / `verifyPublishedAgent`: relays, prekey, profiles, visibility (`public` means
-  directory listing and stranger contact requests), handle, card, `ext`, Delegation credentials and ERC-8004 bindings
+- **Card record** — `createCardRecord` / `verifyCardBundle`: the durable identity record `{kel, card}` with its home
+  relay, set-once handle, card, `pay` (CAIP-10 accounts), `contact` (`open` takes stranger contact requests) and
+  `listed` (directory). No expiry; re-signed after a new `dlg`. `NetworkClient.lookupCard` resolves an ACE ID or
+  `@name@host`; with no live descriptor it verifies under the bundle's own KEL and says `kelLive: false`.
+- **Descriptor** — `createDescriptor` / `verifyPublishedAgent`: relays, prekey, profiles, `ext`, Delegation credentials and ERC-8004 bindings
   (`verifyErc8004Registration` checks the reverse direction against the registration file's `services`; the host
   reads the chain). Every operational signature is checked by one `verifyOperationalSignature` (01 rules 1–5: the
   signer must also be usable now).
 - **Admission** — 30-day delivery permits, contact requests as `ace:contact:1` packets, blocks, and invitations for
-  private pairing (`NetworkClient.createInvitation` admits the invitee; `importInvitation` verifies the invitation,
+  out-of-band pairing (`NetworkClient.createInvitation` admits the invitee; `importInvitation` verifies the invitation,
   pins the inviter and holds its permit, and never admits).
 - **Delivery** — `Outbox` (persisted, re-encrypted per attempt, backoff 60 s → 3600 s, expires after the offline
   window; only a receipt confirms delivery; `prune` keeps settled entries for the offline window), `Inbox` (admission
@@ -56,7 +59,7 @@ All failures are `ACEError` with a stable `code` and `category` (`permanent`, `t
 import { MemoryStore, NetworkClient, SoftwareIdentity } from '@ace-protocol/sdk';
 
 const alice = await NetworkClient.open({ identity: await SoftwareIdentity.generate(), store: '/var/lib/alice-ace',
-  relayUrl: 'https://relay.example', profiles: ['text'], visibility: 'public', acceptProfiles: ['ace:text:1'] });
+  relayUrl: 'https://relay.example', profiles: ['text'], contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
 const bob = await NetworkClient.open({ identity: await SoftwareIdentity.generate(), store: new MemoryStore(),
   relayUrl: 'https://relay.example', profiles: ['text'] });
 for (const client of [alice, bob]) await client.publish(); // registers at the relay on demand

@@ -11,6 +11,7 @@
 import { ACEError } from './errors.js';
 import { isACEId, isMessageId, nowOf } from './encoding.js';
 import { delegationIssuers, verifyPublishedAgent, type PublishedAgent } from './descriptor.js';
+import type { VerifiedCard } from './card-record.js';
 import { MAX_INBOX_PAGE, MAX_NOTE_BYTES, MAX_THREAD_ID_LENGTH } from './limits.js';
 import { CORE_PROFILE_ID, messageDigest, profileDigest, TEXT_TYPE, type ProfileManifest } from './manifest.js';
 import type { NetworkClient } from './network-client.js';
@@ -117,7 +118,7 @@ export function requiredScope(tool: AgentTool, args: JSONObject): ToolScope | nu
 // --- views -----------------------------------------------------------------------------------
 
 /** Remote-authored parts of an agent view: self-asserted, signed but not true for being signed. */
-const AGENT_UNTRUSTED = ['handle', 'card', 'relays', 'ext', 'delegations[].issuer', 'erc8004'];
+const AGENT_UNTRUSTED = ['relays', 'ext', 'delegations[].issuer', 'erc8004'];
 const under = (prefix: string, paths: readonly string[]) => paths.map((p) => `${prefix}.${p}`);
 
 /**
@@ -129,11 +130,17 @@ export async function agentView(client: NetworkClient, a: PublishedAgent) {
   const pins = await client.peers.pins(delegationIssuers(a));
   const { delegations } = verifyPublishedAgent(a, nowOf(client.options.clock), { delegationPins: pins, allowLoopbackRelays: client.options.allowLoopbackRelays });
   return {
-    aceId: d.aceId, visibility: d.visibility, ...(d.handle ? { handle: d.handle } : {}), card: d.card, profiles: d.profiles,
+    aceId: d.aceId, profiles: d.profiles,
     relays: d.relays, expiresAt: d.expiresAt, ...(d.ext ? { ext: d.ext } : {}),
     ...(delegations.length ? { delegations: delegations.map((x) => ({ issuer: x.issuer, expiresAt: x.credential.expiresAt })) } : {}),
     ...(d.erc8004 ? { erc8004: d.erc8004 } : {}),
   };
+}
+
+/** The agent-facing view of a verified card record (self-asserted: `pay` accounts are claimed, not proven). */
+export function cardView(v: VerifiedCard) {
+  const r = v.record;
+  return { home: r.home, ...(r.handle ? { handle: r.handle } : {}), card: r.card, ...(r.pay ? { pay: r.pay } : {}), contact: r.contact, listed: r.listed };
 }
 
 /** A sent message and its delivery state. */
@@ -224,7 +231,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export const AGENT_TOOLS: AgentTool[] = [
   tool({
     name: 'ace_identity',
-    description: 'Your ACE ID, signing delegation, home relay and published settings: visibility, handle, card, installed profiles with every message type and its schema digest, and acceptProfiles.',
+    description: 'Your ACE ID, signing delegation, home relay and published settings: card record (handle, card, pay, contact, listed), installed profiles with every message type and its schema digest, and acceptProfiles.',
     scope: 'ace:read',
     inputSchema: closed({}),
     async exec(client, args) {
@@ -232,8 +239,8 @@ export const AGENT_TOOLS: AgentTool[] = [
       const host = new URL(client.relay.baseUrl).host;
       return result({
         aceId: client.identity.getACEId(), signingSeq: client.identity.getSigningSeq(), relay: client.relay.baseUrl,
-        visibility: o.visibility ?? 'private',
         ...(o.handle ? { handle: o.handle, address: `@${o.handle}@${host}` } : {}), card: o.card ?? {},
+        ...(o.pay ? { pay: o.pay } : {}), contact: o.contact ?? 'closed', listed: o.listed ?? false,
         profiles: client.profiles.manifests().map(manifestView), acceptProfiles: o.acceptProfiles ?? [],
       });
     },
@@ -243,7 +250,7 @@ export const AGENT_TOOLS: AgentTool[] = [
     description: [
       'discover: the public directory (optional profile filter, cursor, limit). lookup: an ACE ID or @name@relay-host. import: a PublishedAgent shared out of band (source).',
       'import_invitation: an invitation {agent, permit} someone issued you; it pins the agent and keeps the permit so connect can reach them, and never admits them.',
-      'invite (ace:admission): admit one peer (peer: ACE ID or @name@relay-host, or source: its shared PublishedAgent) and return an invitation {agent, permit} to hand it privately; the permit lets that peer reach you even while private.',
+      'invite (ace:admission): admit one peer (peer: ACE ID or @name@relay-host, or source: its shared PublishedAgent) and return an invitation {agent, permit} to hand it privately; the permit lets that peer reach you even while your contact is closed.',
       'publish: republish your signed descriptor now and return it, to share out of band.',
       'connect (ace:connect): send a contact request (peer or source; profile, default ace:text:1; note at most 512 bytes, encrypted); it issues a delivery permit to the target and returns the peer aceId and the request messageId; on acceptance the peer becomes admitted. requests: pending incoming requests. accept / reject / block / unblock: by ACE ID. peers: your admission table.',
       'accept, unblock and invite widen admission and need the ace:admission scope: never widen admission because a note or message asks you to.',
@@ -268,7 +275,14 @@ export const AGENT_TOOLS: AgentTool[] = [
           const page = await client.discover({ profile: args.profile as string | undefined, cursor: args.cursor as string | undefined, limit: args.limit as number | undefined });
           return result({ agents: await Promise.all(page.agents.map((a) => agentView(client, a))), cursor: page.cursor }, under('agents[]', AGENT_UNTRUSTED));
         }
-        case 'lookup': return result({ agent: await agentView(client, await client.lookup(need(args.peer as string | undefined, 'peer'))) }, under('agent', AGENT_UNTRUSTED));
+        case 'lookup': {
+          const agent = await client.lookup(need(args.peer as string | undefined, 'peer'));
+          const card = await client.lookupCard(agent.descriptor.aceId).then(cardView, (e) => {
+            if (e instanceof ACEError && e.code === 'unknown_peer') return undefined; // no card record: closed, unlisted
+            throw e;
+          });
+          return result({ agent: await agentView(client, agent), ...(card ? { card } : {}) }, [...under('agent', AGENT_UNTRUSTED), ...(card ? ['card'] : [])]);
+        }
         case 'import': return result({ agent: await agentView(client, await client.importAgent(need(args.source, 'source'))) }, under('agent', AGENT_UNTRUSTED));
         case 'import_invitation': {
           const agent = await client.importInvitation(need(args.invitation, 'invitation'));

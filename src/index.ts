@@ -28,8 +28,11 @@ export {
   createDescriptor, verifyPublishedAgent, validateCard, validateExt, createDelegationCredential, verifyDelegation,
   validateErc8004Binding, verifyErc8004Registration, createPermit, verifyPermit, documentDigest, delegationIssuers,
   type AgentDescriptor, type PublishedAgent, type VerifiedAgent, type DescriptorOptions, type VerifyOptions, type AgentCard,
-  type Visibility, type DelegationCredential, type DescriptorDelegation, type Erc8004Binding, type DeliveryPermit,
+  type DelegationCredential, type DescriptorDelegation, type Erc8004Binding, type DeliveryPermit,
 } from './descriptor.js';
+export {
+  createCardRecord, verifyCardBundle, isCaip10Account, type CardRecord, type CardBundle, type VerifiedCard, type Contact,
+} from './card-record.js';
 export {
   ProfileSet, validateProfileManifest, profileDigest, messageDigest, BUNDLED_MANIFESTS,
   CORE_PROFILE_ID, RECEIPT_TYPE, CONTACT_TYPE, TEXT_TYPE, type ProfileManifest, type NetworkProfile,
