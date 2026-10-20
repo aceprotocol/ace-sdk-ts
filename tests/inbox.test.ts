@@ -51,8 +51,8 @@ describe('Inbox', () => {
     expect(t.receipts).toEqual([]);
   });
 
-  it('a stranger to a public identity may only send a contact request', async () => {
-    const t = await setup({ admit: false, visibility: () => 'public' });
+  it('a stranger to an open identity may only send a contact request', async () => {
+    const t = await setup({ admit: false, contact: () => 'open' });
     const out = await t.inbox.receive(await t.pack(t.sender, msg('hello')));
     expect(out).toMatchObject({ kind: 'dropped', error: { code: 'not_permitted' } });
     expect(t.refreshPeer).not.toHaveBeenCalled();

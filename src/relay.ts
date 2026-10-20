@@ -1,9 +1,10 @@
-/** Relay HTTP client for the minimal relay binding (opaque packets, descriptors, blocks, inbox), with an SSE parser over `fetch`. */
+/** Relay HTTP client for the minimal relay binding (opaque packets, descriptors, card records, blocks, inbox), with an SSE parser over `fetch`. */
 
 import { ACEError, categoryOf, type ACEErrorCode } from './errors.js';
 import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isHandle, isObj, isStreamId, nowOf, pairKey, parseJSONBytes, parseStateBytes, utf8, wireInt } from './encoding.js';
 import { withLock, type ACEStore } from './store.js';
 import { createAuthHeaders, type AuthHeaders, type RelayAuthRequest } from './auth.js';
+import { verifyCardBundle, type CardBundle } from './card-record.js';
 import { verifyPublishedAgent, type DeliveryPermit, type PublishedAgent } from './descriptor.js';
 import type { ACEIdentity } from './identity.js';
 import { DEFAULT_PAGE_LIMIT, MAX_INBOX_PAGE, MAX_JSON_DEPTH, MAX_PACKET_BYTES, MAX_PAGE_BYTES } from './limits.js';
@@ -133,7 +134,7 @@ function protocolError(msg: string): ACEError {
   return new ACEError('relay_protocol_error', msg);
 }
 
-/** A packet or PublishedAgent inside a response is within MAX_JSON_DEPTH on its own (02 § JSON values). */
+/** A packet, PublishedAgent or CardBundle inside a response is within MAX_JSON_DEPTH on its own (02 § JSON values). */
 function contained(value: unknown): void {
   checkJsonValue(value, 'relay_protocol_error');
 }
@@ -284,32 +285,51 @@ export class RelayClient {
     return agent;
   }
 
-  /** `GET /v1/descriptor/{aceId}`: anonymous; public descriptors only. */
+  /** `GET /v1/descriptor/{aceId}`: anonymous; the unexpired descriptor of any registered identity. */
   async getDescriptor(aceId: string): Promise<PublishedAgent> {
     if (!isACEId(aceId)) throw new ACEError('invalid_argument', 'invalid ACE ID');
-    const agent = this.#agent(await this.#request('GET', this.#url(`/v1/descriptor/${encodeURIComponent(aceId)}`)), aceId);
-    if (agent.descriptor.visibility !== 'public') throw protocolError('anonymous lookup returned a private descriptor');
-    return agent;
+    return this.#agent(await this.#request('GET', this.#url(`/v1/descriptor/${encodeURIComponent(aceId)}`)), aceId);
   }
 
-  /** `POST /v1/descriptor/resolve {aceId, permit}`: any descriptor (private included) for the holder of a permit issued by `aceId`. */
-  async resolveDescriptor(aceId: string, permit: DeliveryPermit): Promise<PublishedAgent> {
-    if (!isACEId(aceId) || !isObj(permit) || permit.issuer !== aceId) throw new ACEError('invalid_argument', 'the permit must be issued by aceId');
-    return this.#agent(await this.#request('POST', this.#url('/v1/descriptor/resolve'), { body: { aceId, permit } }), aceId);
+  /** `POST /v1/card`: publish this identity's CardBundle (its KEL must equal the registered KEL; the handle is set once). */
+  async publishCard(bundle: CardBundle): Promise<void> {
+    verifyCardBundle(bundle, nowOf(this.#clock), this.#verify);
+    await this.#request('POST', this.#url('/v1/card'), { body: bundle });
   }
 
-  /** `GET /v1/handles/{handle}`: a public handle owned by this relay. */
-  async resolveHandle(handle: string): Promise<PublishedAgent> {
-    if (!isHandle(handle)) throw new ACEError('invalid_argument', 'invalid handle');
-    const agent = this.#agent(await this.#request('GET', this.#url(`/v1/handles/${handle}`)));
-    const d = agent.descriptor;
-    if (d.visibility !== 'public' || d.handle !== handle || d.relays[0] !== this.baseUrl) throw protocolError('handle authority mismatch');
-    return agent;
+  #card(res: unknown, aceId?: string): CardBundle {
+    contained(res);
+    let bundle: CardBundle;
+    try {
+      ({ bundle } = verifyCardBundle(res, nowOf(this.#clock), this.#verify));
+    } catch (e) {
+      if (e instanceof ACEError) throw e;
+      throw new ACEError('relay_protocol_error', 'unverifiable card record', { cause: e });
+    }
+    if (aceId !== undefined && bundle.card.aceId !== aceId) throw protocolError('card record identity mismatch');
+    return bundle;
+  }
+
+  /** `GET /v1/card/{aceId}`: anonymous; the stored card record of a registered identity. */
+  async card(aceId: string): Promise<CardBundle> {
+    if (!isACEId(aceId)) throw new ACEError('invalid_argument', 'invalid ACE ID');
+    return this.#card(await this.#request('GET', this.#url(`/v1/card/${encodeURIComponent(aceId)}`)), aceId);
   }
 
   /**
-   * `GET /v1/descriptors?profile=&cursor=&limit=`: the public directory. Every entry is verified; one that fails
-   * permanently, is not public or does not list the requested profile is skipped.
+   * `GET /v1/handles/{handle}`: the card record of the identity the handle is bound to at this relay. A record whose
+   * `home` is not this relay or whose `handle` differs is `unknown_peer` (04 § Card record).
+   */
+  async handle(handle: string): Promise<CardBundle> {
+    if (!isHandle(handle)) throw new ACEError('invalid_argument', 'invalid handle');
+    const bundle = this.#card(await this.#request('GET', this.#url(`/v1/handles/${handle}`)));
+    if (bundle.card.home !== this.baseUrl || bundle.card.handle !== handle) throw new ACEError('unknown_peer', 'the record does not hold this handle at this relay');
+    return bundle;
+  }
+
+  /**
+   * `GET /v1/descriptors?profile=&cursor=&limit=`: the public directory (identities whose card record is listed). Every
+   * entry is verified; one that fails permanently or does not list the requested profile is skipped.
    */
   async listDescriptors(o: { profile?: string; cursor?: string; limit?: number } = {}): Promise<{ agents: PublishedAgent[]; cursor: string | null }> {
     const limit = o.limit ?? DEFAULT_PAGE_LIMIT;
@@ -320,8 +340,8 @@ export class RelayClient {
     for (const a of res.agents) {
       let agent: PublishedAgent;
       try { agent = this.#agent(a); } catch (e) { if (!(e instanceof ACEError) || e.isTransient) throw e; continue; }
-      // The directory lists public descriptors only, filtered by the exact profile ID when one was requested.
-      if (agent.descriptor.visibility !== 'public' || (o.profile !== undefined && !agent.descriptor.profiles.some((p) => p.id === o.profile))) continue;
+      // Filtered by the exact profile ID when one was requested.
+      if (o.profile !== undefined && !agent.descriptor.profiles.some((p) => p.id === o.profile)) continue;
       agents.push(agent);
     }
     return { agents, cursor: res.cursor };
@@ -353,7 +373,7 @@ export class RelayClient {
 
   /**
    * `POST /v1/send {packet, permit?}`. `{ok: true}` means the relay stored it, not that it was delivered (only a
-   * receipt says that). Without a permit the recipient must be public (stranger quota).
+   * receipt says that). Without a permit the recipient's card record must be `open` (stranger quota).
    */
   async send(packet: Packet, permit?: DeliveryPermit): Promise<void> {
     // A permit is a bearer credential: attach it only to a packet it authorizes.

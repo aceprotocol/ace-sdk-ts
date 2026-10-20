@@ -19,11 +19,11 @@ describe('A: cached descriptors are bound to the current pins', () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock);
-    const bob = await agent(relay, clock, { visibility: 'public' });
+    const bob = await agent(relay, clock, { contact: 'open', listed: true });
     const B = bob.id.getACEId();
     const evil = await new StorePrekeyVault(new MemoryStore(), { clock: clock.now }).rotate(clock.t);
     const forged = await createDescriptor(bob.id, {
-      relays: [RELAY], prekey: { id: evil.id, publicKey: evil.publicKey }, profiles: bob.client.profiles.descriptors(), visibility: 'public',
+      relays: [RELAY], prekey: { id: evil.id, publicKey: evil.publicKey }, profiles: bob.client.profiles.descriptors(),
       now: clock.t + TIMESTAMP_WINDOW_SECONDS,
     });
     await alice.client.importAgent(forged);
@@ -41,7 +41,7 @@ describe('A: cached descriptors are bound to the current pins', () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock);
-    const bob = await agent(relay, clock, { visibility: 'public' });
+    const bob = await agent(relay, clock, { contact: 'open', listed: true });
     const B = bob.id.getACEId();
     const old = (await alice.client.agent(B)).descriptor.prekey.id;
     const rotate = async () => {
@@ -86,7 +86,8 @@ describe('A: cached descriptors are bound to the current pins', () => {
     clock.advance(10);
     await bob.id.delegate({ now: clock.t }); // bob recovers by rotating
     await alice.client.peers.adopt(bob.id.getKel());
-    await expect(alice.client.agent(B)).rejects.toMatchObject({ code: 'unknown_peer' });
+    await bob.client.publish();
+    expect((await alice.client.agent(B)).descriptor.relays).toEqual([RELAY]); // refreshed from the home relay
     expect(seen.length).toBeGreaterThan(0);
     expect(seen.filter((r) => r.includes('permit'))).toEqual([]);
   });
@@ -119,7 +120,7 @@ describe('A: cached descriptors are bound to the current pins', () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock);
-    const bob = await agent(relay, clock, { visibility: 'public' });
+    const bob = await agent(relay, clock, { contact: 'open', listed: true });
     const old = await bob.client.publish();
     clock.advance(10);
     await bob.id.delegate({ now: clock.t });
@@ -138,8 +139,8 @@ describe('A: cached descriptors are bound to the current pins', () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock);
-    const issuer = await agent(relay, clock, { visibility: 'public' });
-    const subject = await agent(relay, clock, { visibility: 'public' });
+    const issuer = await agent(relay, clock, { contact: 'open', listed: true });
+    const subject = await agent(relay, clock, { contact: 'open', listed: true });
     const I = issuer.id.getACEId(), S = subject.id.getACEId();
     const credential = await createDelegationCredential(issuer.id, S, { now: clock.t });
     subject.client.options.delegations = [{ kel: issuer.id.getKel(), credential }];
@@ -160,8 +161,8 @@ describe('A: cached descriptors are bound to the current pins', () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock);
-    const issuer = await agent(relay, clock, { visibility: 'public' });
-    const subject = await agent(relay, clock, { visibility: 'public' });
+    const issuer = await agent(relay, clock, { contact: 'open', listed: true });
+    const subject = await agent(relay, clock, { contact: 'open', listed: true });
     const I = issuer.id.getACEId(), S = subject.id.getACEId();
     const credential = await createDelegationCredential(issuer.id, S, { now: clock.t, ttl: 60 });
     subject.client.options.delegations = [{ kel: issuer.id.getKel(), credential }];
@@ -179,10 +180,10 @@ describe('A: cached descriptors are bound to the current pins', () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock);
-    const bob = await agent(relay, clock, { visibility: 'public' });
+    const bob = await agent(relay, clock, { contact: 'open', listed: true });
     const make = async (now: number, ttl: number) => {
       const pk = await new StorePrekeyVault(new MemoryStore(), { clock: clock.now }).rotate(clock.t);
-      return createDescriptor(bob.id, { relays: [RELAY], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: bob.client.profiles.descriptors(), visibility: 'public', now, ttl });
+      return createDescriptor(bob.id, { relays: [RELAY], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: bob.client.profiles.descriptors(), now, ttl });
     };
     const older = await make(clock.t, 86400);
     const newer = await make(clock.t + 1, 60);
@@ -277,7 +278,7 @@ describe('C: expired means outcome unknown; receipts settle it', () => {
       const client = await NetworkClient.open({ identity: await identity(clock), store: new MemoryStore(), relayUrl: relay.baseUrl, profiles: ['commerce'], fetch: relay.fetch, clock: clock.now, ...o });
       return { client, threads: client.threads, messages: client.messages };
     };
-    const s = await make({ visibility: 'public', acceptProfiles: ['ace:commerce:1'] });
+    const s = await make({ contact: 'open', listed: true, acceptProfiles: ['ace:commerce:1'] });
     const b = await make({});
     for (const c of [s, b]) { await c.client.publish(); }
     const S = s.client.identity.getACEId(), B = b.client.identity.getACEId();

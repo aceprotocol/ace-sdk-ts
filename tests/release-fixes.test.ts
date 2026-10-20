@@ -64,7 +64,7 @@ describe('response depth: MAX_JSON_DEPTH per contained object, + 3 for the wrapp
     const pk = await new StorePrekeyVault(new MemoryStore(), { clock: () => NOW }).rotate(NOW);
     const a = await createDescriptor(id, {
       relays: [RELAY], prekey: { id: pk.id, publicKey: pk.publicKey }, profiles: [{ id: 'x:deep:1', digest: 'a'.repeat(64) }],
-      visibility: 'public', ext: { 'x:deep:1': nest(29) as Record<string, never> }, now: NOW,
+      ext: { 'x:deep:1': nest(29) as Record<string, never> }, now: NOW,
     });
     return over ? { ...a, descriptor: { ...a.descriptor, ext: { 'x:deep:1': nest(30) as Record<string, never> } } } : a;
   };
@@ -191,7 +191,7 @@ describe('06 § Outbox step 3: every attempt carries a live permit', () => {
   it('a retry without a permit valid under the pin fails not_permitted and is never posted on the stranger path', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -213,7 +213,7 @@ describe('05 § Flow step 4: an outgoing pending entry lives OFFLINE_WINDOW_SECO
   it('a pending entry outlives CONTACT_REQUEST_TTL_SECONDS and lapses at OFFLINE_WINDOW_SECONDS', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });

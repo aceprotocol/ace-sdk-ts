@@ -6,15 +6,17 @@ describe('NetworkClient', () => {
   it('contact flow, delivery with receipts, permit renewal through receipts', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', handle: 'alice', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, handle: 'alice', acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId(), B = bob.id.getACEId();
 
     // discovery and handle
     expect((await bob.client.discover()).agents.map((a) => a.descriptor.aceId)).toEqual([A]);
     expect((await bob.client.lookup('@alice@relay.test')).descriptor.aceId).toBe(A);
-    // bob (private) cannot be looked up anonymously
-    await expect(alice.client.agent(B)).rejects.toMatchObject({ code: 'unknown_peer' });
+    // bob (closed, unlisted) is absent from the directory but resolvable by ACE ID
+    expect((await alice.client.agent(B)).descriptor.aceId).toBe(B);
+    expect((await alice.client.lookupCard(B)).record).toMatchObject({ contact: 'closed', listed: false });
+    expect((await bob.client.lookupCard('@alice@relay.test')).record).toMatchObject({ aceId: A, handle: 'alice', contact: 'open', listed: true });
 
     await bob.client.connect(A, { profile: 'ace:text:1', note: 'hello from bob' });
     expect((await bob.client.admission.get(A))!.status).toBe('pending');
@@ -47,10 +49,10 @@ describe('NetworkClient', () => {
     expect(renewed.expiresAt).toBe(clock.t + MAX_PERMIT_LIFETIME);
   });
 
-  it('a stranger request to a public identity without a rule waits for an explicit accept; blocks drop', async () => {
+  it('a stranger request to an open identity without a rule waits for an explicit accept; blocks drop', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId(), B = bob.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -72,7 +74,7 @@ describe('NetworkClient', () => {
   it('rejected:unknown_prekey refreshes the descriptor and retries; outbox backs off and expires', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -106,7 +108,7 @@ describe('NetworkClient', () => {
     expect(await bob.client.outbox.attempt(lost.messageId)).toMatchObject({ status: 'expired', code: 'expired' });
   });
 
-  it('invitations: two private agents pair; importing never admits, creating admits the invitee', async () => {
+  it('invitations: two closed agents pair; importing never admits, creating admits the invitee', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock), bob = await agent(relay, clock);
@@ -153,8 +155,8 @@ describe('NetworkClient', () => {
   it('enqueue to a peer without any resolvable descriptor fails unknown_peer at once and queues nothing', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock), bob = await agent(relay, clock);
-    await expect(alice.client.outbox.enqueue({ to: bob.id.getACEId(), type: 'ace:text:1', body: { message: 'x' } })).rejects.toMatchObject({ code: 'unknown_peer' });
+    const alice = await agent(relay, clock), bob = await identity(clock); // never published
+    await expect(alice.client.outbox.enqueue({ to: bob.getACEId(), type: 'ace:text:1', body: { message: 'x' } })).rejects.toMatchObject({ code: 'unknown_peer' });
     expect(await alice.client.outbox.list()).toEqual([]);
   });
 
@@ -207,7 +209,7 @@ describe('NetworkClient', () => {
   it('verifyDelegation names this identity as subject; an expired credential is null', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const issuer = await agent(relay, clock, { visibility: 'public' });
+    const issuer = await agent(relay, clock, { contact: 'open', listed: true });
     const subject = await agent(relay, clock);
     const S = subject.id.getACEId();
     await subject.client.lookup(issuer.id.getACEId()); // pins the issuer
@@ -221,7 +223,7 @@ describe('NetworkClient', () => {
   it('the test relay streams catch-up and new packets over /v1/listen', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     await bob.client.connect(alice.id.getACEId(), { profile: 'ace:text:1' });
     const ctrl = new AbortController();

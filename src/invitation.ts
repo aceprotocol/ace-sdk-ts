@@ -1,5 +1,5 @@
 /**
- * Invitations (05 § Invitations): the private-pairing path. The inviter hands one peer, out of band, its own
+ * Invitations (05 § Invitations): the out-of-band pairing path (e.g. for a `closed` agent). The inviter hands one peer, out of band, its own
  * PublishedAgent and a delivery permit issued to that peer. Creating one is an explicit local admission of the peer;
  * importing one verifies the agent and holds the permit, and never admits the inviter.
  */

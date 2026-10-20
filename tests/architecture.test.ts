@@ -10,7 +10,7 @@ describe('04 § Caching: one usability predicate', () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock);
-    const bob = await agent(relay, clock, { visibility: 'public' });
+    const bob = await agent(relay, clock, { contact: 'open', listed: true });
     const B = bob.id.getACEId();
     clock.advance(10);
     await bob.id.delegate({ now: clock.t, notAfter: clock.t + 3600 });
@@ -28,7 +28,7 @@ describe('05 § Flow step 3: accept a held request', () => {
   it('after its source descriptor expired, accept pins the source and refreshes it with the requester permit', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock); // private
     const A = alice.id.getACEId(), B = bob.id.getACEId();
     const first = await bob.client.publish();

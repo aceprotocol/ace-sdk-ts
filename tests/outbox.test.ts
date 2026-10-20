@@ -193,7 +193,7 @@ describe('Outbox', () => {
   it('each attempt re-encrypts to the current prekey with the same messageId and a fresh timestamp', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     const A = alice.id.getACEId();
     await bob.client.connect(A, { profile: 'ace:text:1' });
@@ -225,7 +225,7 @@ describe('Outbox', () => {
   it('contact packets and receipts are never stored in the Outbox', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: ['ace:text:1'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: ['ace:text:1'] });
     const bob = await agent(relay, clock);
     await bob.client.connect(alice.id.getACEId(), { profile: 'ace:text:1' });
     await alice.client.pull(); // auto-accept: an accepted contact back

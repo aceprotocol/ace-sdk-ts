@@ -6,13 +6,13 @@
 import { OFFICIAL_EXT } from './commerce.js';
 import { ACEError } from './errors.js';
 import {
-  canonicalStateBytes, checkJsonValue, closedKeys, codePointLength, CONTROL_CHAR_RE, isACEId, isCaip10, isHandle, isHex64,
+  canonicalStateBytes, checkJsonValue, closedKeys, codePointLength, CONTROL_CHAR_RE, isACEId, isCaip10, isHex64,
   isHttpsUrl, isObj, nowOf, parseJSONBytes, sha256Hex, utf8, wireInt,
 } from './encoding.js';
 import { signClaims, type ACEIdentity } from './identity.js';
 import { isUsable, lastEventHash, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature } from './kel.js';
 import {
-  MAX_DELEGATION_LIFETIME, MAX_DESCRIPTOR_DELEGATIONS, MAX_DESCRIPTOR_ERC8004, MAX_DESCRIPTOR_LIFETIME, MAX_DESCRIPTOR_PROFILES,
+  DEFAULT_DESCRIPTOR_LIFETIME, MAX_DELEGATION_LIFETIME, MAX_DESCRIPTOR_DELEGATIONS, MAX_DESCRIPTOR_ERC8004, MAX_DESCRIPTOR_LIFETIME, MAX_DESCRIPTOR_PROFILES,
   MAX_DESCRIPTOR_RELAYS, MAX_EXT_BYTES, MAX_PERMIT_LIFETIME, MAX_PUBLISHED_AGENT_BYTES, MAX_STRANGER_DELEGATIONS, MAX_STRANGER_KEL_EVENTS,
   TIMESTAMP_WINDOW_SECONDS,
 } from './limits.js';
@@ -36,10 +36,10 @@ function lifetime(d: Record<string, unknown>, now: number, max: number, what: st
   }
 }
 
-/** `issuedAt` (`o.now` or the clock) and `expiresAt = issuedAt + ttl` (`o.ttl` or `max`), ttl in 1..max. */
-function docWindow(o: { now?: number; ttl?: number }, max: number): { issuedAt: number; expiresAt: number } {
+/** `issuedAt` (`o.now` or the clock) and `expiresAt = issuedAt + ttl` (`o.ttl` or `fallback`, default `max`), ttl in 1..max. */
+function docWindow(o: { now?: number; ttl?: number }, max: number, fallback = max): { issuedAt: number; expiresAt: number } {
   const issuedAt = o.now ?? nowOf();
-  const ttl = o.ttl ?? max;
+  const ttl = o.ttl ?? fallback;
   if (wireInt(ttl) === null || ttl < 1 || ttl > max) throw new ACEError('invalid_argument', `ttl must be 1..${max}`);
   return { issuedAt, expiresAt: issuedAt + ttl };
 }
@@ -81,7 +81,7 @@ export function validateNetworkRelay(value: unknown, o: VerifyOptions = {}): str
   return value;
 }
 
-/** Self-asserted presentation metadata. The tag `hosted` means a hosting provider holds the keys. */
+/** Self-asserted presentation metadata (a card record's `card`). The tag `hosted` means a hosting provider holds the keys. */
 export interface AgentCard { name?: string; description?: string; image?: string; tags?: string[] }
 
 const TAG_RE = /^[a-z0-9-]{1,32}$/;
@@ -181,7 +181,7 @@ export function verifyDelegation(entry: unknown, subject: string, now: number = 
 
 // --- permits -----------------------------------------------------------------------------------
 
-/** The receiver (`issuer`) lets `subject` deliver to it and resolve its private descriptor. Communication only. */
+/** The receiver (`issuer`) lets `subject` deliver to it. Communication only. */
 export interface DeliveryPermit { issuer: string; subject: string; issuedAt: number; expiresAt: number; signature: OperationalSignature }
 
 export async function createPermit(issuer: ACEIdentity, subject: string, o: { now?: number; ttl?: number } = {}): Promise<DeliveryPermit> {
@@ -206,8 +206,6 @@ export function verifyPermit(value: unknown, issuer: KelState, subject?: string,
 
 // --- descriptor --------------------------------------------------------------------------------
 
-export type Visibility = 'private' | 'public';
-
 export interface AgentDescriptor {
   aceId: string;
   issuedAt: number;
@@ -215,10 +213,6 @@ export interface AgentDescriptor {
   relays: string[];
   prekey: Prekey;
   profiles: NetworkProfile[];
-  visibility: Visibility;
-  /** Public only; owned by `relays[0]`. */
-  handle?: string;
-  card: AgentCard;
   /** Keyed by profile id (each key listed in `profiles`); values are defined by that profile. */
   ext?: Record<string, JSONObject>;
   delegations?: DescriptorDelegation[];
@@ -242,25 +236,20 @@ export interface DescriptorOptions extends VerifyOptions {
   relays: string[];
   prekey: Prekey;
   profiles: NetworkProfile[];
-  visibility?: Visibility;
-  handle?: string;
-  card?: AgentCard;
   ext?: Record<string, JSONObject>;
   delegations?: DescriptorDelegation[];
   erc8004?: Erc8004Binding[];
   now?: number;
-  /** Lifetime in seconds, at most 86400 (the default). */
+  /** Lifetime in seconds: 86400 by default, at most MAX_DESCRIPTOR_LIFETIME. */
   ttl?: number;
 }
 
 /** Create and sign this identity's PublishedAgent (verified before it is returned). */
 export async function createDescriptor(identity: ACEIdentity, o: DescriptorOptions): Promise<PublishedAgent> {
-  const { issuedAt, expiresAt } = docWindow(o, MAX_DESCRIPTOR_LIFETIME);
+  const { issuedAt, expiresAt } = docWindow(o, MAX_DESCRIPTOR_LIFETIME, DEFAULT_DESCRIPTOR_LIFETIME);
   const claims = {
     aceId: identity.getACEId(), issuedAt, expiresAt, relays: [...o.relays],
     prekey: { id: o.prekey.id, publicKey: o.prekey.publicKey }, profiles: o.profiles.map((p) => ({ id: p.id, digest: p.digest })),
-    visibility: o.visibility ?? 'private', card: structuredClone(o.card ?? {}),
-    ...(o.handle !== undefined ? { handle: o.handle } : {}),
     ...(o.ext !== undefined && Object.keys(o.ext).length > 0 ? { ext: structuredClone(o.ext) } : {}),
     ...(o.delegations !== undefined && o.delegations.length > 0 ? { delegations: structuredClone(o.delegations) } : {}),
     ...(o.erc8004 !== undefined && o.erc8004.length > 0 ? { erc8004: structuredClone(o.erc8004) } : {}),
@@ -270,8 +259,8 @@ export async function createDescriptor(identity: ACEIdentity, o: DescriptorOptio
   return agent;
 }
 
-const D_REQUIRED = ['aceId', 'issuedAt', 'expiresAt', 'relays', 'prekey', 'profiles', 'visibility', 'card', 'signature'];
-const D_OPTIONAL = ['handle', 'ext', 'delegations', 'erc8004'];
+const D_REQUIRED = ['aceId', 'issuedAt', 'expiresAt', 'relays', 'prekey', 'profiles', 'signature'];
+const D_OPTIONAL = ['ext', 'delegations', 'erc8004'];
 
 /**
  * Verify a PublishedAgent at `now`, in order: shape including `ext`, `delegations` and `erc8004`
@@ -294,9 +283,6 @@ export function verifyPublishedAgent(value: unknown, now: number = nowOf(), o: V
   if (!Array.isArray(d.profiles) || d.profiles.length > MAX_DESCRIPTOR_PROFILES
     || !d.profiles.every((p) => closedKeys(p, ['id', 'digest']) && isMessageType(p.id) && p.id !== CORE_PROFILE_ID && isHex64(p.digest))
     || new Set(d.profiles.map((p) => (p as NetworkProfile).id)).size !== d.profiles.length) throw bad('profiles must be at most 32 distinct {id, digest}, core excluded');
-  if (d.visibility !== 'private' && d.visibility !== 'public') throw bad('visibility must be private or public');
-  if (d.handle !== undefined && (!isHandle(d.handle) || d.visibility !== 'public')) throw bad('handle requires public visibility and [a-z][a-z0-9_-]{2,31}');
-  validateCard(d.card);
   if (d.ext !== undefined) validateExt(d.ext, d.profiles as NetworkProfile[]);
   if (d.erc8004 !== undefined) {
     if (!Array.isArray(d.erc8004) || d.erc8004.length < 1 || d.erc8004.length > MAX_DESCRIPTOR_ERC8004) throw bad('erc8004 must hold 1-4 entries');

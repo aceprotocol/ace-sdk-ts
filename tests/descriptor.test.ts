@@ -14,16 +14,21 @@ const code = (c: string) => expect.objectContaining({ code: c });
 describe('descriptor', () => {
   it('signs and verifies; any tampering invalidates', async () => {
     const a = await identity();
-    const agent = await createDescriptor(a, await opts({ visibility: 'public', handle: 'alice', card: { name: 'Alice', tags: ['hosted'] } }));
+    const agent = await createDescriptor(a, await opts());
     expect(verifyPublishedAgent(agent, NOW).state.aceId).toBe(a.getACEId());
-    expect(() => verifyPublishedAgent({ ...agent, descriptor: { ...agent.descriptor, card: { name: 'Mallory' } } }, NOW)).toThrow(code('invalid_authorization'));
-    expect(() => verifyPublishedAgent({ ...agent, descriptor: { ...agent.descriptor, contact: 'requests' } }, NOW)).toThrow(code('invalid_authorization'));
-    expect(() => verifyPublishedAgent(agent, NOW + 86_400)).toThrow(code('invalid_authorization'));
+    expect(() => verifyPublishedAgent({ ...agent, descriptor: { ...agent.descriptor, relays: ['https://other.test'] } }, NOW)).toThrow(code('invalid_authorization'));
+    // visibility, handle and card left the descriptor for the card record (04 § Card record): unknown members now
+    for (const extra of [{ visibility: 'public' }, { handle: 'alice' }, { card: {} }]) {
+      expect(() => verifyPublishedAgent({ ...agent, descriptor: { ...agent.descriptor, ...extra } }, NOW)).toThrow(code('invalid_authorization'));
+    }
+    expect(() => verifyPublishedAgent(agent, NOW + 86_400)).toThrow(code('invalid_authorization')); // default lifetime 86400
   });
 
-  it('field rules: handle needs public, prekey id, loopback relays, ext', async () => {
+  it('field rules: lifetime, prekey id, loopback relays, ext', async () => {
     const a = await identity();
-    await expect(createDescriptor(a, await opts({ handle: 'alice' }))).rejects.toThrow(code('invalid_authorization'));
+    const week = await createDescriptor(a, await opts({ ttl: 604_800 }));
+    expect(verifyPublishedAgent(week, NOW + 604_799).state.aceId).toBe(a.getACEId());
+    await expect(createDescriptor(a, await opts({ ttl: 604_801 }))).rejects.toThrow(code('invalid_argument'));
     const o = await opts();
     await expect(createDescriptor(a, { ...o, prekey: { ...o.prekey, id: 'f'.repeat(64) } })).rejects.toThrow(code('invalid_authorization'));
     await expect(createDescriptor(a, await opts({ relays: ['http://localhost:8080'] }))).rejects.toThrow(code('invalid_authorization'));

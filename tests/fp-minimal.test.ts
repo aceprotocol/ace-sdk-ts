@@ -15,7 +15,7 @@ const TEXT = 'ace:text:1';
 /** An admitted pair over one FakeRelay: alice public and auto-accepting text, bob connected to her. */
 async function pair(o: { bob?: object } = {}) {
   const clock = new Clock(), relay = new FakeRelay(clock.now);
-  const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: [TEXT] });
+  const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: [TEXT] });
   const bob = await agent(relay, clock, o.bob ?? {});
   await bob.client.connect(alice.id.getACEId(), { profile: TEXT });
   await alice.client.pull();
@@ -45,7 +45,7 @@ describe('A4: beyond the replay horizon is dropped and never receipted', () => {
 describe('A5: contact requests', () => {
   it('a public agent offline for hours still receives and accepts the request', async () => {
     const clock = new Clock(), relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const a = alice.id.getACEId(), b = bob.id.getACEId();
     await bob.client.connect(a, { profile: TEXT });
@@ -61,7 +61,7 @@ describe('A5: contact requests', () => {
 
   it('an outgoing pending entry expires, and a late accepted is ignored', async () => {
     const clock = new Clock(), relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { visibility: 'public' });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true });
     const bob = await agent(relay, clock);
     const a = alice.id.getACEId(), b = bob.id.getACEId();
     await bob.client.connect(a, { profile: TEXT });
@@ -165,7 +165,7 @@ describe('A12: the NetworkClient surface', () => {
   it('open builds the store, message log and commerce threads; onReceipt sees the settled entry', async () => {
     const clock = new Clock(), relay = new FakeRelay(clock.now);
     const seen: Array<[string, ReceiptBody, OutboxEntry | null]> = [];
-    const alice = await agent(relay, clock, { visibility: 'public', acceptProfiles: [TEXT], profiles: ['text', 'commerce'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, acceptProfiles: [TEXT], profiles: ['text', 'commerce'] });
     const bob = await agent(relay, clock, { onReceipt: (from: string, body: ReceiptBody, entry: OutboxEntry | null) => { seen.push([from, body, entry]); } });
     expect(alice.client.threads).not.toBeNull();
     expect(bob.client.threads).toBeNull();
@@ -197,7 +197,7 @@ describe('A12: the NetworkClient surface', () => {
   it('the default foreign relay inherits the clock and the loopback policy', async () => {
     const clock = new Clock();
     const home = new FakeRelay(clock.now, 'http://127.0.0.1:1'), other = new FakeRelay(clock.now, 'http://127.0.0.1:2');
-    const bob = await agent(other, clock, { allowLoopbackRelays: true, visibility: 'public' });
+    const bob = await agent(other, clock, { allowLoopbackRelays: true, contact: 'open', listed: true });
     const alice = await NetworkClient.open({
       identity: await identity(clock), store: new MemoryStore(), relay: home.client(), allowLoopbackRelays: true, clock: clock.now, receive: false,
     });
