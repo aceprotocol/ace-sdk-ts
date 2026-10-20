@@ -32,9 +32,10 @@ export interface CardRecord {
 export interface CardBundle { kel: KelEvent[]; card: CardRecord }
 
 /**
- * A verified card record. `kelLive`: whether the KEL it verified under was confirmed by a live descriptor or an existing
- * pin (`NetworkClient.lookupCard`); false when only the bundle's own KEL vouches for it, as from `verifyCardBundle` alone
- * or a lookup of an identity with no live descriptor (04 § Card record).
+ * A verified card record. `kelLive` (required): whether a live descriptor confirmed the KEL it verified under, in this
+ * lookup or an earlier one recorded with the pin (`NetworkClient.lookupCard`); false when only a bundle's own KEL vouches
+ * for it: from `verifyCardBundle` alone, or a lookup of an identity that has had no live descriptor since it was pinned
+ * that way (04 § Card record).
  */
 export interface VerifiedCard { aceId: string; kelState: KelState; record: CardRecord; bundle: CardBundle; kelLive: boolean }
 

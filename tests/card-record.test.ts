@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MemoryStore, NetworkClient, contactContent, createCardRecord, createPacket, verifyCardBundle, isCaip10Account, MAX_CARD_RECORD_BYTES,
-  sha256Hex, type CardBundle,
+  createDescriptor, sha256Hex, type CardBundle,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, identity, stateOf } from './helpers.js';
 
@@ -221,6 +221,97 @@ describe('card record over the relay', () => {
       await bob.store.write(key, good!);
     }
     expect((await bob.client.lookupCard('@alice@relay.test')).record.aceId).toBe(A);
+  });
+
+  it('fallback-pinned KEL stays kelLive false on later lookups', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const A = alice.id.getACEId();
+    clock.advance(8 * 86400);
+    const bob = await agent(relay, clock);
+    expect((await bob.client.lookupCard(A)).kelLive).toBe(false);
+    // The pin exists now, but no live descriptor ever confirmed it: every later lookup says so, durably.
+    expect((await bob.client.lookupCard(A)).kelLive).toBe(false);
+    expect((await bob.client.lookupCard('@alice@relay.test')).kelLive).toBe(false);
+    const again = await NetworkClient.open({ identity: bob.id, store: bob.store, relay: relay.client(), clock: clock.now, receive: false });
+    expect((await again.lookupCard(A)).kelLive).toBe(false);
+    await again.close();
+  });
+
+  it('a later live descriptor confirms a fallback-pinned KEL', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const A = alice.id.getACEId();
+    clock.advance(8 * 86400);
+    const bob = await agent(relay, clock);
+    expect((await bob.client.lookupCard('@alice@relay.test')).kelLive).toBe(false);
+    // Alice comes back online: her new descriptor reconciles with the pin and confirms it.
+    await alice.client.publish();
+    expect((await bob.client.lookupCard('@alice@relay.test')).kelLive).toBe(true);
+    // Confirmed for good, durably: even after she goes offline again.
+    clock.advance(8 * 86400);
+    expect((await bob.client.lookupCard(A)).kelLive).toBe(true);
+    const again = await NetworkClient.open({ identity: bob.id, store: bob.store, relay: relay.client(), clock: clock.now, receive: false });
+    expect((await again.lookupCard(A)).kelLive).toBe(true);
+    await again.close();
+  });
+
+  it('transient on one route plus unknown_peer on another does not fall back', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const relayB = new FakeRelay(clock.now, 'https://relay-b.test');
+    const alice = await agent(relay, clock, { contact: 'open' });
+    const A = alice.id.getACEId();
+    const descriptorPath = `/v1/descriptor/${encodeURIComponent(A)}`;
+    // Without a pin, an unreachable home relay is a failure, never "no live descriptor".
+    const carol = await agent(relay, clock);
+    relay.inject.push({ path: descriptorPath, status: 503, code: 'internal_error' });
+    await expect(carol.client.lookupCard(A)).rejects.toThrow(expect.objectContaining({ isTransient: true }));
+    expect(await carol.client.peers.get(A)).toBeNull();
+    // Alice's descriptor names relay B first; her home relay has lost it, so bob pins her card's KEL.
+    const own = relay.descriptors.get(A)!.descriptor.prekey;
+    const twoRoutes = await createDescriptor(alice.id, { relays: [relayB.baseUrl, RELAY], prekey: { id: own.id, publicKey: own.publicKey }, profiles: alice.client.profiles.descriptors(), now: clock.t });
+    relay.descriptors.delete(A);
+    const bob = await agent(relay, clock, { foreignRelay: () => relayB.client() });
+    expect((await bob.client.lookupCard(A)).kelLive).toBe(false);
+    await bob.client.importAgent(twoRoutes); // shared out of band; it expires before bob looks again
+    clock.advance(8 * 86400);
+    // Relay B is unreachable and the home relay answers unknown_peer: the lookup fails instead of reporting not live.
+    relayB.inject.push({ path: descriptorPath, status: 503, code: 'internal_error' });
+    await expect(bob.client.lookupCard(A)).rejects.toThrow(expect.objectContaining({ isTransient: true }));
+    // Both routes answering unknown_peer: no live descriptor, still not confirmed.
+    expect((await bob.client.lookupCard(A)).kelLive).toBe(false);
+  });
+
+  it('pin missing required fields is storage_failed', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const A = alice.id.getACEId();
+    const bob = await agent(relay, clock);
+    const seen = await bob.client.lookupCard('@alice@relay.test');
+    const cardPin = `network/handles/${sha256Hex(A)}.json`;
+    const ownerPin = `network/handle-owners/${sha256Hex(`${RELAY} alice`)}.json`;
+    const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
+    const full = { home: RELAY, handle: 'alice', issuedAt: seen.record.issuedAt, digest: 'x' };
+    const { issuedAt: _i, ...noIssuedAt } = full;
+    const { digest: _d, ...noDigest } = full;
+    const { home: _h, ...noHome } = full;
+    for (const [key, bad] of [[cardPin, {}], [cardPin, noIssuedAt], [cardPin, noDigest], [cardPin, noHome],
+      [ownerPin, { home: RELAY, handle: 'alice' }]] as const) {
+      const good = (await bob.store.read(key))!;
+      await bob.store.write(key, enc(bad));
+      await expect(bob.client.lookupCard('@alice@relay.test')).rejects.toThrow(code('storage_failed'));
+      await bob.store.write(key, good);
+    }
+    // The record of how a KEL pin was confirmed, without its flag.
+    clock.advance(8 * 86400);
+    const carol = await agent(relay, clock);
+    expect((await carol.client.lookupCard(A)).kelLive).toBe(false);
+    await carol.store.write(`network/kel-provenance/${sha256Hex(A)}.json`, enc({ aceId: A }));
+    await expect(carol.client.lookupCard(A)).rejects.toThrow(code('storage_failed'));
   });
 
   it('handle resolving to a new aceId is invalid_authorization', async () => {
