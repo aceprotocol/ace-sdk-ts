@@ -145,6 +145,56 @@ describe('card record over the relay', () => {
     await bob.client.lookupCard(A);
   });
 
+  it('lookupCard pins the KEL before trusting the card', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', pay: [SOL] });
+    const A = alice.id.getACEId();
+    const old = relay.cards.get(A)!;
+    // A new dlg replaces the signing key (say, stolen); the owner re-signs the card.
+    clock.advance(10);
+    await alice.id.delegate({ now: clock.t });
+    await alice.client.maintain();
+    // A relay replays the record signed under the superseded delegation, with the KEL prefix it verifies under.
+    relay.cards.set(A, old);
+    const bob = await agent(relay, clock);
+    expect(await bob.client.peers.get(A)).toBeNull();
+    await expect(bob.client.lookupCard(A)).rejects.toThrow(code('stale_peer_binding'));
+    // The KEL was pinned from the descriptor lookup, before the card was checked.
+    expect((await bob.client.peers.get(A))?.events.length).toBe(alice.id.getKel().length);
+  });
+
+  it('handle resolving to a new aceId is invalid_authorization', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const mallory = await agent(relay, clock, { contact: 'open' });
+    const bob = await agent(relay, clock);
+    const M = mallory.id.getACEId();
+    expect((await bob.client.lookupCard('@alice@relay.test')).record.aceId).toBe(alice.id.getACEId());
+    // The relay rebinds the handle to another identity (bindings are permanent: detectable misbehavior).
+    relay.cards.set(M, await createCardRecord(mallory.id, { home: RELAY, handle: 'alice', contact: 'open', listed: false, now: clock.t + 1 }));
+    relay.handles.set('alice', M);
+    await expect(bob.client.lookupCard('@alice@relay.test')).rejects.toThrow(code('invalid_authorization'));
+    await expect(bob.client.lookup('@alice@relay.test')).rejects.toThrow(code('invalid_authorization'));
+    // The reverse pin is durable.
+    const again = await NetworkClient.open({ identity: bob.id, store: bob.store, relay: relay.client(), clock: clock.now, receive: false });
+    await expect(again.lookupCard('@alice@relay.test')).rejects.toThrow(code('invalid_authorization'));
+    await again.close();
+  });
+
+  it('refused card leaves descriptor unpublished', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    await agent(relay, clock, { handle: 'alice' });
+    const id = await identity(clock);
+    const late = await NetworkClient.open({ identity: id, store: new MemoryStore(), relay: relay.client(), clock: clock.now, receive: false, handle: 'alice' });
+    await expect(late.publish()).rejects.toMatchObject({ relayCode: 'handle_taken' });
+    expect(relay.cards.has(id.getACEId())).toBe(false);
+    expect(relay.descriptors.has(id.getACEId())).toBe(false);
+    await late.close();
+  });
+
   it('a new dlg re-signs the card at upkeep', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);

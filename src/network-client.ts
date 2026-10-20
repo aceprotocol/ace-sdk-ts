@@ -5,7 +5,7 @@
  * Inbox. Local configuration, never a remote message, controls admission.
  */
 import { AdmissionBook, type ContactRequest, type PeerRecord } from './admission.js';
-import { createCardRecord, verifyCardBundle, type CardBundle, type Contact, type VerifiedCard } from './card-record.js';
+import { createCardRecord, verifyCardBundle, type CardBundle, type CardRecord, type Contact, type VerifiedCard } from './card-record.js';
 import { commerceRules, ThreadStore } from './commerce.js';
 import { contactContent, receiptContent, type ContactBody, type ReceiptBody } from './core-messages.js';
 import {
@@ -100,6 +100,9 @@ const agentKey = (id: string) => `network/agents/${sha256Hex(id)}.json`;
  */
 interface CardPin { home: string; handle?: string; issuedAt?: number; digest?: string }
 const handlePinKey = (id: string) => `network/handles/${sha256Hex(id)}.json`;
+/** The reverse handle pin: the ACE ID `@handle@home` first resolved to. A binding is permanent, so a later other one is misbehavior. */
+interface HandleOwnerPin { home: string; handle: string; aceId: string }
+const handleOwnerKey = (home: string, handle: string) => `network/handle-owners/${sha256Hex(`${home} ${handle}`)}.json`;
 const HANDLE_RE = /^@([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/;
 
 const blockedPeer = () => new ACEError('not_permitted', 'the peer is blocked; unblock it first');
@@ -195,11 +198,13 @@ export class NetworkClient {
   // --- publication ---------------------------------------------------------------------------
 
   /**
-   * Publish this identity's descriptor, then its card record. The descriptor: rotates the prekey when none exists or it
-   * is older than 24 h (pruning expired retained prekeys), and reuses an unchanged descriptor with more than an hour left
-   * unless `force` (which posts it again). The card record is re-signed when its settings change or after a new `dlg`,
-   * and otherwise reused (re-posted with `force`). When the home relay holds no registration or an older KEL
-   * (`not_registered` / `kel_conflict`), the current KEL is registered and the post repeated once.
+   * Publish this identity's card record, then its descriptor. The card record goes first because it is the post a relay
+   * refuses (handle rules); a refused card leaves the published descriptor unchanged. The card record is re-signed when
+   * its settings change or after a new `dlg`, and otherwise reused (re-posted with `force`). The descriptor: rotates the
+   * prekey when none exists or it is older than 24 h (pruning expired retained prekeys), and reuses an unchanged
+   * descriptor with more than an hour left unless `force` (which posts it again). When the home relay holds no
+   * registration or an older KEL (`not_registered` / `kel_conflict`), the current KEL is registered and the post
+   * repeated once.
    */
   async publish(o: { force?: boolean } = {}): Promise<PublishedAgent> {
     return withLock(this.store, 'network-self', async () => {
@@ -216,29 +221,29 @@ export class NetworkClient {
       const lastHash = checkUsable(this.identity, now).lastHash;
       const digest = sha256Hex(canonicalStateBytes({ params, lastHash }));
       const old = await this.#read<SelfRecord>(SELF_KEY);
-      let self: SelfRecord;
-      if (old && old.params === digest && old.agent.descriptor.expiresAt > now + 3600) {
-        if (o.force) await this.#postDescriptor(old.agent);
-        self = old;
-      } else {
-        const agent = await createDescriptor(this.identity, { ...params, now: Math.max(now, (old?.agent.descriptor.issuedAt ?? -1) + 1), ...this.#verifyOpts() });
-        await this.#postDescriptor(agent);
-        self = { ...old, agent, params: digest };
-        await this.store.write(SELF_KEY, canonicalStateBytes(self));
-      }
       const cardParams = {
         home: this.relay.baseUrl, card: opts.card ?? {}, contact: opts.contact ?? 'closed', listed: opts.listed ?? false,
         ...(opts.handle !== undefined ? { handle: opts.handle } : {}), ...(opts.pay !== undefined ? { pay: opts.pay } : {}),
       } as const;
       const cardDigest = sha256Hex(canonicalStateBytes({ cardParams, lastHash }));
-      if (self.card && self.cardParams === cardDigest) {
-        if (o.force) await this.#postCard(self.card);
+      let { card, cardParams: cardState } = old ?? {};
+      if (card && cardState === cardDigest) {
+        if (o.force) await this.#postCard(card);
       } else {
-        const card = await createCardRecord(this.identity, { ...cardParams, now: Math.max(now, (self.card?.card.issuedAt ?? -1) + 1), ...this.#verifyOpts() });
+        card = await createCardRecord(this.identity, { ...cardParams, now: Math.max(now, (card?.card.issuedAt ?? -1) + 1), ...this.#verifyOpts() });
         await this.#postCard(card);
-        await this.store.write(SELF_KEY, canonicalStateBytes({ ...self, card, cardParams: cardDigest }));
+        cardState = cardDigest;
+        // Without a self record yet, the card is saved with the first descriptor below.
+        if (old) await this.store.write(SELF_KEY, canonicalStateBytes({ ...old, card, cardParams: cardState }));
       }
-      return self.agent;
+      if (old && old.params === digest && old.agent.descriptor.expiresAt > now + 3600) {
+        if (o.force) await this.#postDescriptor(old.agent);
+        return old.agent;
+      }
+      const agent = await createDescriptor(this.identity, { ...params, now: Math.max(now, (old?.agent.descriptor.issuedAt ?? -1) + 1), ...this.#verifyOpts() });
+      await this.#postDescriptor(agent);
+      await this.store.write(SELF_KEY, canonicalStateBytes({ ...old, agent, params: digest, card, cardParams: cardState }));
+      return agent;
     });
   }
 
@@ -328,57 +333,84 @@ export class NetworkClient {
   /** Resolve `@name@relay-host` (through its card record) or a bare ACE ID to a verified, imported PublishedAgent. */
   async lookup(target: string): Promise<PublishedAgent> {
     if (isACEId(target)) return this.agent(target);
-    const { bundle, relay } = await this.#cardByHandle(target);
-    await this.#checkCard(bundle);
-    return this.#fetchAgent(bundle.card.aceId, [relay.baseUrl]);
+    const { bundle, relay, handle } = await this.#cardByHandle(target);
+    const id = bundle.card.aceId;
+    const pinned = await this.#pinKel(id, () => this.#fetchAgent(id, [relay.baseUrl]));
+    await this.#checkCard(bundle, { home: relay.baseUrl, handle });
+    return pinned ?? this.#fetchAgent(id, [relay.baseUrl]);
   }
 
   /**
    * The verified card record of `target` (an ACE ID or `@name@relay-host`). A handle resolves only to a record whose
    * `home` is the queried relay and whose `handle` is the queried one (`unknown_peer`). A handle is set once per home:
    * after a record with a handle was seen for an identity, a record of it naming the same home with another or no handle
-   * is `invalid_authorization`.
+   * is `invalid_authorization`. A handle's first resolution pins its ACE ID; a later resolution to another one is
+   * `invalid_authorization`. Without a KEL pin for the identity, its descriptor is looked up first and its KEL pinned, so
+   * the card is verified under the current KEL, never one a relay chose.
    */
   async lookupCard(target: string): Promise<VerifiedCard> {
-    return this.#checkCard(isACEId(target) ? await this.#fetchCard(target) : (await this.#cardByHandle(target)).bundle);
+    if (isACEId(target)) {
+      await this.#pinKel(target, () => this.agent(target));
+      return this.#checkCard(await this.#fetchCard(target));
+    }
+    const { bundle, relay, handle } = await this.#cardByHandle(target);
+    const id = bundle.card.aceId;
+    await this.#pinKel(id, () => this.#fetchAgent(id, [relay.baseUrl]));
+    return this.#checkCard(bundle, { home: relay.baseUrl, handle });
+  }
+
+  /** When `id` has no KEL pin, pin it through `fetch` (a descriptor lookup) and return what it fetched; else null. */
+  async #pinKel(id: string, fetch: () => Promise<PublishedAgent>): Promise<PublishedAgent | null> {
+    return (await this.peers.get(id)) === null ? fetch() : null;
   }
 
   /**
    * Verify a fetched card record against the identity's KEL pin and its card pin (written on first sight, persisted):
    * no rollback first (an older `issuedAt`, or an equal one with other claims, is `stale_descriptor`), then the
-   * set-once handle per home (a record naming the pinned home must carry the pinned handle; a new home re-pins).
+   * set-once handle per home (a record naming the pinned home must carry the pinned handle; a new home re-pins). A
+   * record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
    */
-  async #checkCard(bundle: CardBundle): Promise<VerifiedCard> {
+  async #checkCard(bundle: CardBundle, resolved?: { home: string; handle: string }): Promise<VerifiedCard> {
     const id = bundle.card.aceId;
     const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
     await withLock(this.store, 'network-handles', async () => {
-      const r = v.record;
-      const digest = documentDigest(r);
-      const pin = await this.#read<CardPin>(handlePinKey(id));
-      if (pin !== null && pin.issuedAt !== undefined) {
-        if (r.issuedAt < pin.issuedAt) throw new ACEError('stale_descriptor', 'an older card record than one already verified');
-        if (r.issuedAt === pin.issuedAt) {
-          if (digest !== pin.digest) throw new ACEError('stale_descriptor', 'another card record with the same issuedAt');
-          return;
-        }
+      const owner = resolved ? await this.#read<HandleOwnerPin>(handleOwnerKey(resolved.home, resolved.handle)) : null;
+      if (owner !== null && owner.aceId !== id) throw new ACEError('invalid_authorization', 'the handle resolved to another identity than before');
+      await this.#advanceCardPin(v.record);
+      if (resolved && owner === null) {
+        await this.store.write(handleOwnerKey(resolved.home, resolved.handle), canonicalStateBytes({ ...resolved, aceId: id }));
       }
-      if (pin !== null && pin.handle !== undefined && pin.home === r.home && pin.handle !== r.handle) {
-        throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
-      }
-      // The handle pin is unchanged (same home: equal by the check above), set on first claim, or re-pinned by a
-      // handle at a new home; a record without a handle at another home keeps the earlier home's handle pin.
-      const keep = pin !== null && pin.handle !== undefined && (r.handle === undefined || pin.home === r.home);
-      const handle = keep ? { home: pin.home, handle: pin.handle } : { home: r.home, ...(r.handle !== undefined ? { handle: r.handle } : {}) };
-      await this.store.write(handlePinKey(id), canonicalStateBytes({ ...handle, issuedAt: r.issuedAt, digest }));
     });
     return v;
   }
 
-  async #cardByHandle(target: string): Promise<{ bundle: CardBundle; relay: RelayClient }> {
+  /** The card pin checks and update of #checkCard, under the `network-handles` lock. */
+  async #advanceCardPin(r: CardRecord): Promise<void> {
+    const id = r.aceId;
+    const digest = documentDigest(r);
+    const pin = await this.#read<CardPin>(handlePinKey(id));
+    if (pin !== null && pin.issuedAt !== undefined) {
+      if (r.issuedAt < pin.issuedAt) throw new ACEError('stale_descriptor', 'an older card record than one already verified');
+      if (r.issuedAt === pin.issuedAt) {
+        if (digest !== pin.digest) throw new ACEError('stale_descriptor', 'another card record with the same issuedAt');
+        return;
+      }
+    }
+    if (pin !== null && pin.handle !== undefined && pin.home === r.home && pin.handle !== r.handle) {
+      throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
+    }
+    // The handle pin is unchanged (same home: equal by the check above), set on first claim, or re-pinned by a
+    // handle at a new home; a record without a handle at another home keeps the earlier home's handle pin.
+    const keep = pin !== null && pin.handle !== undefined && (r.handle === undefined || pin.home === r.home);
+    const handle = keep ? { home: pin.home, handle: pin.handle } : { home: r.home, ...(r.handle !== undefined ? { handle: r.handle } : {}) };
+    await this.store.write(handlePinKey(id), canonicalStateBytes({ ...handle, issuedAt: r.issuedAt, digest }));
+  }
+
+  async #cardByHandle(target: string): Promise<{ bundle: CardBundle; relay: RelayClient; handle: string }> {
     const m = typeof target === 'string' ? HANDLE_RE.exec(target) : null;
     if (!m || !isHandle(m[1])) throw new ACEError('invalid_argument', 'use an ACE ID or @name@relay-host');
     const relay = m[2] === new URL(this.relay.baseUrl).host ? this.relay : this.#relayFor(`https://${m[2]}`);
-    return { bundle: await relay.handle(m[1]), relay };
+    return { bundle: await relay.handle(m[1]), relay, handle: m[1] };
   }
 
   /** The peer's card record from the first route that serves it: its cached descriptor's relays, then the home relay. */
