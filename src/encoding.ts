@@ -83,6 +83,11 @@ export function isHandle(value: unknown): value is string {
   return typeof value === 'string' && HANDLE_RE.test(value);
 }
 
+/** How a handle is written (04 § Handles): `@name@host`, `host` being the host (with its port, if any) of `home`. */
+export function handleAddress(handle: string, home: string): string {
+  return `@${handle}@${new URL(home).host}`;
+}
+
 /** Lowercase UUIDv4. */
 export function isMessageId(value: unknown): value is string {
   return typeof value === 'string' && MESSAGE_ID_RE.test(value);

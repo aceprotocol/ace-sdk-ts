@@ -9,7 +9,7 @@
  * communication only, never payment, shell or execution authority.
  */
 import { ACEError } from './errors.js';
-import { isACEId, isMessageId, nowOf } from './encoding.js';
+import { canonicalStateBytes, handleAddress, isACEId, isMessageId, nowOf, toBase64 } from './encoding.js';
 import { delegationIssuers, verifyPublishedAgent, type PublishedAgent } from './descriptor.js';
 import type { VerifiedCard } from './card-record.js';
 import { MAX_INBOX_PAGE, MAX_NOTE_BYTES, MAX_THREAD_ID_LENGTH } from './limits.js';
@@ -37,6 +37,7 @@ export interface JSONSchema {
   items?: JSONSchema;
   minItems?: number;
   maxItems?: number;
+  uniqueItems?: boolean;
   minLength?: number;
   maxLength?: number;
   pattern?: string;
@@ -92,6 +93,7 @@ export function checkArgs(schema: JSONSchema, value: unknown, path = 'arguments'
   }
   if (Array.isArray(value)) {
     if ((schema.minItems !== undefined && value.length < schema.minItems) || (schema.maxItems !== undefined && value.length > schema.maxItems)) throw bad(`${path} has an invalid length`);
+    if (schema.uniqueItems && new Set(value.map((v) => toBase64(canonicalStateBytes(v)))).size !== value.length) throw bad(`${path} has duplicate items`);
     if (schema.items) value.forEach((v, i) => checkArgs(schema.items!, v, `${path}[${i}]`));
   }
   if (t === 'object' && schema.properties) {
@@ -236,10 +238,9 @@ export const AGENT_TOOLS: AgentTool[] = [
     inputSchema: closed({}),
     async exec(client, args) {
       const o = client.options;
-      const host = new URL(client.relay.baseUrl).host;
       return result({
         aceId: client.identity.getACEId(), signingSeq: client.identity.getSigningSeq(), relay: client.relay.baseUrl,
-        ...(o.handle ? { handle: o.handle, address: `@${o.handle}@${host}` } : {}), card: o.card ?? {},
+        ...(o.handle ? { handle: o.handle, address: handleAddress(o.handle, client.relay.baseUrl) } : {}), card: o.card ?? {},
         ...(o.pay ? { pay: o.pay } : {}), contact: o.contact ?? 'closed', listed: o.listed ?? false,
         profiles: client.profiles.manifests().map(manifestView), acceptProfiles: o.acceptProfiles ?? [],
       });

@@ -62,6 +62,9 @@ describe('AGENT_TOOLS', () => {
     await expect(T.ace_inbox.run(a.client, { action: 'ack', messages: [{ from: 'x', messageId: 'y' }] })).rejects.toMatchObject({ code: 'invalid_argument' });
     expect(() => checkArgs(T.ace_outbox.inputSchema, { action: 'list', status: 'gone' })).toThrow(/one of/);
     expect(() => checkArgs(T.ace_outbox.inputSchema, { status: 'pending' })).toThrow(/action is required/);
+    const unique = { type: 'array', items: { type: 'object' }, uniqueItems: true } as const;
+    expect(() => checkArgs(unique, [{ a: 1, b: 2 }, { b: 2, a: 1 }])).toThrow(/duplicate items/);
+    expect(() => checkArgs(unique, [{ a: 1 }, { a: 2 }])).not.toThrow();
   });
 
   it('runs the hosted flows end to end and marks remote content untrusted', async () => {

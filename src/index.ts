@@ -3,8 +3,8 @@
 export { ACEError, isOutcomeCode, type ACEErrorCode, type ACEErrorCategory, type ACEErrorOptions } from './errors.js';
 export * from './limits.js';
 export {
-  canonicalStateBytes, conversationKey, sha256Hex, toBase64, fromBase64, ACE_ID_RE, isACEId, isMessageId, isThreadId, isHandle, isHex64,
-  isHttpsUrl,
+  canonicalStateBytes, conversationKey, sha256Hex, toBase64, fromBase64, ACE_ID_RE, CAIP10_RE, HANDLE_RE, isACEId, isMessageId, isThreadId, isHandle, handleAddress,
+  isHex64, isHttpsUrl,
 } from './encoding.js';
 export { encodePayload, signingMessage, verifySignature } from './signing.js';
 export type { SigningScheme, JSONValue, JSONObject, PrivateContent, ParsedMessage } from './types.js';
