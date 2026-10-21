@@ -316,6 +316,25 @@ export function isBoundTo(agent: PublishedAgent, pinned: KelState | null): pinne
 }
 
 /**
+ * Bound to the verifier's current pins: the subject's (`isBoundTo`), and every delegation entry whose issuer is pinned
+ * still verifies under that pin, as of the descriptor's `issuedAt` (expiry aside). A bound descriptor's relays are the
+ * subject's current choice; an unbound one's may be a superseded key's.
+ */
+export function isBoundToPins(agent: PublishedAgent, pins: { pinned: KelState | null; delegationPins: ReadonlyMap<string, KelState> }): boolean {
+  if (!isBoundTo(agent, pins.pinned)) return false;
+  const d = agent.descriptor;
+  try {
+    for (const e of d.delegations ?? []) {
+      const pin = pins.delegationPins.get(e.credential.issuer);
+      if (pin) verifyDelegation(e, d.aceId, d.issuedAt, { pinned: pin });
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
  * 04 § Caching: a verified, cached PublishedAgent is usable at `now` (to encrypt to, or to report) only while it is
  * unexpired, bound to the subject's current pin (`isBoundTo`), that pin is usable (01 § Verifier rules 5: never send
  * to an unusable identity), and every delegation entry is unexpired and, when its issuer is pinned, still verifies

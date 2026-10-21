@@ -9,7 +9,7 @@ import { createCardRecord, verifyCardBundle, type CardBundle, type CardRecord, t
 import { commerceRules, ThreadStore } from './commerce.js';
 import { contactContent, receiptContent, type ContactBody, type ReceiptBody } from './core-messages.js';
 import {
-  createDescriptor, createPermit, delegationIssuers, documentDigest, isBoundTo, isCachedUsable, verifyDelegation, verifyPermit, verifyPublishedAgent,
+  createDescriptor, createPermit, delegationIssuers, documentDigest, isBoundTo, isBoundToPins, isCachedUsable, verifyDelegation, verifyPermit, verifyPublishedAgent,
   type AgentCard, type DelegationCredential, type DeliveryPermit, type DescriptorDelegation, type Erc8004Binding, type PublishedAgent,
 } from './descriptor.js';
 import { ACEError, isUnknownPeer } from './errors.js';
@@ -526,9 +526,9 @@ export class NetworkClient {
     const cached = await this.#read<PublishedAgent>(agentKey(aceId));
     const [pinned, delegationPins] = await Promise.all([this.peers.get(aceId), cached ? this.peers.pins(delegationIssuers(cached)) : new Map<string, KelState>()]);
     if (cached && !o.refresh && isCachedUsable(cached, this.#now(), { pinned, delegationPins })) return cached;
-    // A KEL-stale descriptor (signed under a superseded, possibly compromised key) may name attacker relays: the home
-    // relay is asked too, as when nothing is cached.
-    if (cached !== null && isBoundTo(cached, pinned)) return this.#fetchAgent(aceId, cached.descriptor.relays);
+    // A descriptor no longer bound to the pins (signed under a superseded, possibly compromised key, its own or a
+    // delegation issuer's) may name attacker relays: the home relay is asked too, as when nothing is cached.
+    if (cached !== null && isBoundToPins(cached, { pinned, delegationPins })) return this.#fetchAgent(aceId, cached.descriptor.relays);
     return this.#fetchAgent(aceId, this.#routesOf(cached));
   }
 

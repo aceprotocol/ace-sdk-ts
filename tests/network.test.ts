@@ -299,5 +299,25 @@ describe('NetworkClient', () => {
       expect(await bob.client.agent(A)).toEqual(current);
       expect(asked()).toHaveLength(1);
     });
+
+    it('a cached descriptor whose delegation issuer\'s pin advanced is refreshed from its relays and the home relay', async () => {
+      const { clock, relay, alice, A, descriptor, paths, bob } = await setup();
+      const dave = await identity(clock);
+      const { prekey, profiles } = relay.descriptors.get(A)!.descriptor;
+      clock.advance(1);
+      const credential = await createDelegationCredential(dave, A, { now: clock.t, ttl: 86_400 });
+      const delegated = await createDescriptor(alice.id, { relays: [B], prekey, profiles, now: clock.t, delegations: [{ kel: dave.getKel(), credential }] });
+      await bob.client.peers.adopt(dave.getKel());
+      await bob.client.importAgent(delegated);
+      // Dave's key moves on: the entry no longer verifies under his pin, so the descriptor is no longer bound.
+      clock.advance(1);
+      await dave.delegate({ now: clock.t });
+      await bob.client.peers.adopt(dave.getKel());
+      const current = await descriptor([RELAY]);
+      await relay.client().publishDescriptor(current);
+      paths.length = 0;
+      expect(await bob.client.agent(A)).toEqual(current);
+      expect(paths.filter((p) => p.startsWith('/v1/descriptor/'))).toHaveLength(1);
+    });
   });
 });
