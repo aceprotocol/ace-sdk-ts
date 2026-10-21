@@ -350,6 +350,8 @@ describe('card record over the relay', () => {
     await bob.client.importAgent(twoRoutes); // shared out of band; it expires before bob looks again
     // Self-signed, not served by a relay: it does not confirm the pin.
     expect(await bob.client.peers.kelLive(A)).toBe(false);
+    // Nor does a card lookup take that cached, still usable descriptor for a live one: it asks the relays.
+    expect((await bob.client.lookupCard(A)).kelLive).toBe(false);
     clock.advance(8 * 86400);
     // Relay B is unreachable and the home relay answers unknown_peer: the lookup fails instead of reporting not live.
     relayB.inject.push({ path: descriptorPath, status: 503, code: 'internal_error' });

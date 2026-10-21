@@ -395,7 +395,7 @@ export class NetworkClient {
    */
   async lookupCard(target: string): Promise<VerifiedCard> {
     if (isACEId(target)) {
-      const kel = await this.#cardKel(target, () => this.agent(target), () => this.#fetchCard(target));
+      const kel = await this.#cardKel(target, () => this.agent(target, { refresh: true }), () => this.#fetchCard(target));
       return this.#checkCard(kel.bundle ?? await this.#fetchCard(target), undefined, kel.kelLive);
     }
     const { bundle, relay, handle } = await this.#cardByHandle(target);
@@ -406,8 +406,9 @@ export class NetworkClient {
 
   /**
    * The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A pin confirmed live is used as is.
-   * Otherwise the descriptor is looked up through `fetch` (importing it records the pin as confirmed live, `importAgent`). When every route answers `unknown_peer` (no live descriptor), an unconfirmed pin stays
-   * unconfirmed, and without a pin the card's own bundle (`card`) pins the KEL: the bundle is verified, its KEL adopted
+   * Otherwise the descriptor is looked up at a relay through `fetch` (never a cached one) and the result is the pin's
+   * `kelLive` after it: a relay's descriptor bound to the pin confirms it, a replayed or older one does not. When every
+   * route answers `unknown_peer` (no live descriptor), an unconfirmed pin stays unconfirmed, and without a pin the card's own bundle (`card`) pins the KEL: the bundle is verified, its KEL adopted
    * under the fork rules and recorded as not confirmed live, and the bundle returned. Every other failure propagates.
    */
   async #cardKel(id: string, fetch: () => Promise<PublishedAgent>, card: () => Promise<CardBundle>): Promise<{ kelLive: boolean; bundle?: CardBundle }> {
@@ -419,7 +420,7 @@ export class NetworkClient {
       if (!isUnknownPeer(e)) throw e;
       return pinned !== null ? { kelLive: false } : this.#pinBundleKel(id, await card());
     }
-    return { kelLive: true };
+    return { kelLive: await this.peers.kelLive(id) };
   }
 
   /** Pin the verified KEL of `bundle` (no live descriptor: not live). */
