@@ -4,9 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  ACEError, AdmissionBook, FileStore, MemoryStore, OFFLINE_WINDOW_SECONDS, ReplayDetector, SoftwareIdentity, SoftwareKey, StorePrekeyVault,
-  canonicalStateBytes, createCardRecord, createDelegation, createDescriptor, createPermit, createRotation, generateSoftwareKey, keyDigest,
+  ACEError, AdmissionBook, FileStore, Inbox, MemoryStore, OFFLINE_WINDOW_SECONDS, ReplayDetector, SoftwareIdentity, SoftwareKey, StorePrekeyVault,
+  canonicalStateBytes, contactContent, createCardRecord, createDelegation, createDelegationCredential, createDescriptor, createPermit, createRotation, generateSoftwareKey, keyDigest,
   receiptContent, relayErrorFor, validateNetworkRelay, verifiedCacheUsage, verifyCardBundle, verifyKel, verifyPublishedAgent,
+  type ACEStore,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, stateOf } from './helpers.js';
 import { inboxWorld, msg } from './helpers2.js';
@@ -34,6 +35,36 @@ describe('C2: receipts pass step 9 and commit the seen entry', () => {
     expect(await w.inbox.receive(packet)).toMatchObject({ kind: 'duplicate', from: w.sender.getACEId() });
     expect(onReceipt).toHaveBeenCalledTimes(1);
     expect(w.receipts).toEqual([]);
+  });
+
+  /** The process died after the hand-over, before any snapshot: a restart is a new view of the same data, unlocked. */
+  const restart = (data: MemoryStore): ACEStore => {
+    const locks = new MemoryStore();
+    return { read: (k) => data.read(k), write: (k, v) => data.write(k, v), delete: (k) => data.delete(k), list: (p) => data.list(p), lock: (n, o) => locks.lock(n, o) };
+  };
+
+  it('a receipt\'s seen entry survives a crash before the snapshot (journal, as for messages)', async () => {
+    const onReceipt = vi.fn();
+    const w = await inboxWorld({ onReceipt });
+    const packet = await w.pack(w.sender, receiptContent({ messageId: crypto.randomUUID(), outcome: 'delivered' }));
+    expect((await w.inbox.receive(packet)).kind).toBe('receipt');
+    const reopened = await Inbox.open({ ...w.options, store: restart(w.store) });
+    expect(await reopened.receive(packet)).toMatchObject({ kind: 'duplicate', from: w.sender.getACEId() });
+    expect(onReceipt).toHaveBeenCalledTimes(1);
+  });
+
+  it('a contact\'s seen entry survives a crash before the snapshot', async () => {
+    const onContact = vi.fn();
+    const w = await inboxWorld({ refreshPeer: undefined, onContact });
+    w.clock.advance(10);
+    await w.sender.delegate({ now: w.clock.t });
+    const source = await createDescriptor(w.sender, { relays: ['https://relay.test'], prekey: w.prekey, profiles: [], now: w.clock.t });
+    const permit = await createPermit(w.sender, w.me.getACEId(), { now: w.clock.t });
+    const packet = await w.pack(w.sender, contactContent({ kind: 'request', profile: 'ace:text:1', note: '', source, permit }));
+    expect((await w.inbox.receive(packet)).kind).toBe('contact');
+    const reopened = await Inbox.open({ ...w.options, store: restart(w.store) });
+    expect(await reopened.receive(packet)).toMatchObject({ kind: 'dropped', error: { code: 'invalid_packet' } });
+    expect(onContact).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -108,6 +139,20 @@ describe('C7: shape before KEL work (04 § Verification, § Card record)', () =>
     const card = relay.cards.get(alice.id.getACEId())!;
     expect(() => verifyCardBundle({ kel: [], card: { ...card.card, signature: { ...card.card.signature, value: 'AAAA' } } }, clock.t))
       .toThrow(code('invalid_authorization'));
+  });
+
+  it('a delegation credential of the wrong shape is step 1 (invalid_authorization) even with kel = [] (py/swift parity)', async () => {
+    const clock = new Clock(), relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { handle: 'alice' }), dave = await agent(relay, clock, { handle: 'dave' });
+    const credential = await createDelegationCredential(dave.id, alice.id.getACEId(), { now: clock.t });
+    const d = (await alice.client.publish()).descriptor;
+    const withEntry = (c: object) => ({ kel: [], descriptor: { ...d, delegations: [{ kel: [], credential: c }] } });
+    const badIssuer = withEntry({ ...credential, issuer: 'x' });
+    const shortSig = withEntry({ ...credential, signature: { ...credential.signature, value: 'AAAA' } });
+    expect(() => verifyPublishedAgent(badIssuer, clock.t)).toThrow(code('invalid_authorization'));
+    expect(() => verifyPublishedAgent(shortSig, clock.t)).toThrow(code('invalid_authorization'));
+    // A well-formed entry with kel = [] still reaches step 2: the descriptor's own kel = [] is invalid_kel.
+    expect(() => verifyPublishedAgent(withEntry(credential), clock.t)).toThrow(code('invalid_kel'));
   });
 });
 

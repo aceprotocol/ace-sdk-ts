@@ -92,7 +92,8 @@ export interface InboxOptions {
 
 /**
  * A delivery record (06 § Crash recovery). `pending` carries the message: it is the only copy recovery can hand over.
- * `done` keeps just the seen entry until the next snapshot, never the delivered plaintext.
+ * `done` keeps just the seen entry until the next snapshot, never the delivered plaintext; receipts and contacts write
+ * only `done`, after their hand-over.
  */
 type Journal = { from: string; messageId: string; timestamp: number } & ({ status: 'pending'; message: ParsedMessage } | { status: 'done' });
 
@@ -386,8 +387,7 @@ export class Inbox {
       if (!stranger) await this.#peers.adopt(structuredClone(source.state.events));
       const event: ContactEvent = { from: packet.from, messageId: packet.messageId, timestamp: packet.timestamp, body, source, stranger, ...(permit ? { permit } : {}) };
       await this.#o.onContact?.(event);
-      this.#replay.commit(packet.messageId, packet.from, packet.timestamp, this.#floor());
-      await this.#bump();
+      await this.#commitSeen(packet);
       return { kind: 'contact', event };
     } catch (e) {
       return settle(asACEError(e, 'invalid_body'));
@@ -407,11 +407,10 @@ export class Inbox {
     }
     try {
       await this.#o.onReceipt?.(packet.from, body);
+      await this.#commitSeen(packet);
     } catch (e) {
       return defer(asACEError(e, 'storage_failed'));
     }
-    this.#replay.commit(packet.messageId, packet.from, packet.timestamp, this.#floor());
-    await this.#bump();
     return { kind: 'receipt', from: packet.from, body };
   }
 
@@ -463,6 +462,17 @@ export class Inbox {
     // 11. receipt (a transient failure is retried: the re-fetched packet is a duplicate and is answered again)
     const delivered: ReceiveOutcome = { kind: 'delivered', message };
     return this.#delivered(await this.#sendReceipt(from, { messageId, outcome: 'delivered' }), delivered);
+  }
+
+  /**
+   * The seen entry of a handed-over receipt or contact, as durable as an application message's: a `done` journal entry
+   * first (restored by `#recover` after a crash before the next snapshot), then the in-memory seen store.
+   */
+  async #commitSeen(packet: Packet): Promise<void> {
+    const { from, messageId, timestamp } = packet;
+    await this.#o.store.write(journalKey(from, messageId), canonicalStateBytes({ from, messageId, timestamp, status: 'done' }));
+    this.#replay.commit(messageId, from, timestamp, this.#floor());
+    await this.#bump();
   }
 
   async #bump(): Promise<void> {

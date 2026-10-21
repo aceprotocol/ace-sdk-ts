@@ -269,7 +269,21 @@ const D_REQUIRED = ['aceId', 'issuedAt', 'expiresAt', 'relays', 'prekey', 'profi
 const D_OPTIONAL = ['ext', 'delegations', 'erc8004'];
 
 /**
- * Verify a PublishedAgent at `now`, in order: shape including `ext`, `delegations` (`{kel, credential}` entries) and
+ * A delegation entry's closed shape, part of the descriptor's (04 § Verification step 1): `{kel, credential: {issuer:
+ * ACE ID, subject: string, issuedAt, expiresAt: wire integers, signature: operational signature shape}}`. `kel` is
+ * step 2's (`invalid_kel`); the entry's rules (04 § Delegations) are step 4's.
+ */
+function isDelegationShape(e: unknown): boolean {
+  if (!closedKeys(e, ['kel', 'credential'])) return false;
+  const c = e.credential;
+  if (!closedKeys(c, ['issuer', 'subject', 'issuedAt', 'expiresAt', 'signature']) || !isACEId(c.issuer) || typeof c.subject !== 'string'
+    || wireInt(c.issuedAt) === null || wireInt(c.expiresAt) === null) return false;
+  try { checkSignatureShape(c.signature, 'invalid_authorization'); } catch { return false; }
+  return true;
+}
+
+/**
+ * Verify a PublishedAgent at `now`, in order: shape including `ext`, `delegations` (`{kel, credential}` entries, the credential's shape and its signature's) and
  * `erc8004` and the signature's (its value of the scheme's length) (`invalid_authorization`); KEL usable at `now` (`invalid_kel` / `invalid_signature`) naming `aceId`
  * (`invalid_authorization`); the signature as an operational signature of the KEL reconciled with `o.pinned`, signed
  * no earlier than its delegation's `dlg` (`stale_peer_binding` / `invalid_authorization`); each delegation (an entry that only expired is dropped from
@@ -298,7 +312,7 @@ export function verifyPublishedAgent(value: unknown, now: number = nowOf(), o: V
   }
   if (d.delegations !== undefined) {
     if (!Array.isArray(d.delegations) || d.delegations.length < 1 || d.delegations.length > MAX_DESCRIPTOR_DELEGATIONS) throw bad('delegations must hold 1-4 entries');
-    if (!d.delegations.every((e) => closedKeys(e, ['kel', 'credential']))) throw bad('delegations must be {kel, credential}');
+    if (!d.delegations.every(isDelegationShape)) throw bad('delegations must be {kel, credential} with a well-formed credential');
     const issuers = d.delegations.map(issuerOf);
     if (new Set(issuers).size !== issuers.length) throw bad('delegation issuers must be distinct');
   }
