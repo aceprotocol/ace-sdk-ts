@@ -15,7 +15,7 @@ import { isBlockedAddress, pinnedRequest } from './pinned-https.js';
 import { MAX_PAGE_BYTES } from './limits.js';
 import { DEFAULT_TIMEOUT_MS, RelayClient } from './relay.js';
 import { isCanonicalRelayUrl } from './relay-url.js';
-import { acquireMutex, checkKey, checkLockName, checkTimeout, checkValue, KEY_RE, lockTimeoutError, MAX_VALUE_BYTES, Mutex, withLock, type ACEStore, type StoreData } from './store.js';
+import { acquireMutex, checkKey, checkLockName, checkPrefix, checkTimeout, checkValue, lockTimeoutError, MAX_VALUE_BYTES, Mutex, withLock, type ACEStore, type StoreData } from './store.js';
 
 const LOCK_POLL_MS = 50;
 const processMutexes = new Map<string, Mutex>();
@@ -175,11 +175,10 @@ export class FileStore implements ACEStore {
   }
 
   async list(prefix: string): Promise<string[]> {
-    if (typeof prefix !== 'string') throw new ACEError('invalid_argument', 'prefix must be a string');
+    checkPrefix(prefix);
     const base = await this.#base();
     const slash = prefix.lastIndexOf('/');
     const startRel = slash >= 0 ? prefix.slice(0, slash) : '';
-    if (startRel !== '' && !KEY_RE.test(startRel)) return [];
     const out: string[] = [];
     const walk = async (rel: string): Promise<void> => {
       let entries;

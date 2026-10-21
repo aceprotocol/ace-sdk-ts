@@ -1,3 +1,4 @@
+import { isHttpsUrl } from './encoding.js';
 import { ACEError } from './errors.js';
 
 /** 02 § Relay URL: the length bound of a canonical relay URL. */
@@ -6,8 +7,9 @@ const MAX_RELAY_URL_LENGTH = 2048;
 const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
 
 /**
- * A canonical relay URL (02 § Relay URL): `https`, at most 2048 characters, equal to its own normalization.
- * `allowLoopback` (local development) also admits `http` to a loopback host; production verifiers reject it.
+ * A canonical relay URL (02 § Relay URL): `https`, at most 2048 characters, equal to its own normalization, its host in
+ * the ACE HTTPS URL grammar (labels of `[A-Za-z0-9-]` not starting or ending with `-`, no empty label or trailing `.`,
+ * no IP literal). `allowLoopback` (local development) also admits `http` to a loopback host; production verifiers reject it.
  */
 export function isCanonicalRelayUrl(value: unknown, o: { allowLoopback: boolean }): value is string {
   if (typeof value !== 'string' || value.length > MAX_RELAY_URL_LENGTH) return false;
@@ -17,7 +19,8 @@ export function isCanonicalRelayUrl(value: unknown, o: { allowLoopback: boolean 
     return false;
   }
   const u = new URL(value);
-  return u.protocol === 'https:' || (o.allowLoopback && LOOPBACK_HOSTS.includes(u.hostname));
+  if (u.protocol === 'https:') return isHttpsUrl(value);
+  return o.allowLoopback && LOOPBACK_HOSTS.includes(u.hostname);
 }
 
 /**

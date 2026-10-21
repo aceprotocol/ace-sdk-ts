@@ -83,9 +83,13 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** A relay-supplied string without control characters (C0, DEL, C1), so it cannot forge lines in a host's logs. */
+const printable = (s: string) => s.replace(/\p{Cc}/gu, '');
+
 /**
  * Internal: map a relay response other than the call's expected success to an ACEError. `retryAfter` is
- * the raw `Retry-After` header, attached only when the mapped code is transient.
+ * the raw `Retry-After` header, attached only when the mapped code is transient. The body's `error` and `message`
+ * lose their control characters before they enter the error.
  */
 export function relayErrorFor(status: number, retryAfter: string | null, body: string): ACEError {
   let relayCode: string | undefined;
@@ -93,8 +97,8 @@ export function relayErrorFor(status: number, retryAfter: string | null, body: s
   try {
     const parsed: unknown = JSON.parse(body);
     if (isObj(parsed)) {
-      if (typeof parsed.error === 'string') relayCode = parsed.error;
-      if (typeof parsed.message === 'string') message = parsed.message.slice(0, 200);
+      if (typeof parsed.error === 'string') relayCode = printable(parsed.error);
+      if (typeof parsed.message === 'string') message = printable(parsed.message).slice(0, 200);
     }
   } catch {
     // no relay error code

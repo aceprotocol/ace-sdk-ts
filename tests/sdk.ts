@@ -9,6 +9,6 @@ export { decodePrivateContent, encodePrivateContent } from '../src/packet.js';
 export { checkStrangerSource, validateNetworkRelay } from '../src/descriptor.js';
 export { checkContactBody } from '../src/core-messages.js';
 export { ReplayDetector } from '../src/replay.js';
-export { parseSSE } from '../src/relay.js';
+export { parseSSE, relayErrorFor } from '../src/relay.js';
 export { verifyInvitation } from '../src/invitation.js';
 export { checkCommerceBody, decideCommerce, isCaip19, validateCommerceExt } from '../src/commerce.js';

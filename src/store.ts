@@ -14,7 +14,7 @@ export interface StoreData {
   write(key: string, value: Uint8Array): Promise<void>;
   /** A missing key is not an error. */
   delete(key: string): Promise<void>;
-  /** Keys starting with `prefix`, sorted ascending. */
+  /** Keys starting with `prefix` (empty, or a key optionally followed by `/`), sorted ascending. */
   list(prefix: string): Promise<string[]>;
 }
 
@@ -41,6 +41,12 @@ export function checkKey(key: unknown): string {
     throw new ACEError('invalid_argument', `invalid store key ${JSON.stringify(String(key).slice(0, 60))}`);
   }
   return key;
+}
+
+/** A list prefix: empty, or a key optionally followed by `/` (`invalid_argument` otherwise, like a key). */
+export function checkPrefix(prefix: unknown): string {
+  if (prefix !== '') checkKey(typeof prefix === 'string' && prefix.endsWith('/') ? prefix.slice(0, -1) : prefix);
+  return prefix as string;
 }
 
 export function checkLockName(name: unknown): string {
@@ -142,7 +148,7 @@ export class MemoryStore implements ACEStore {
   }
 
   async list(prefix: string): Promise<string[]> {
-    if (typeof prefix !== 'string') throw new ACEError('invalid_argument', 'prefix must be a string');
+    checkPrefix(prefix);
     return [...this.#data.keys()].filter((k) => k.startsWith(prefix)).sort();
   }
 
