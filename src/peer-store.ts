@@ -9,8 +9,9 @@ const CACHE_SIZE = 256;
 export interface Adopted { state: KelState; outcome: ExtendOutcome }
 
 /**
- * `live`: a live descriptor vouches for the KEL (it verified unexpired under it). A pin moved by a KEL alone (a card
- * bundle's, a held request's source) is not live until a live descriptor is adopted under it (04 § Card record).
+ * `live`: a live descriptor served by a relay vouches for the KEL. A pin moved by anything else (a card bundle's KEL, an
+ * imported or contact source, which a holder of a superseded key can sign) is not live until a relay's descriptor
+ * confirms it (04 § Card record).
  */
 export interface AdoptOptions<T> { live?: boolean; then?: (r: Adopted) => Promise<T> }
 
@@ -92,7 +93,7 @@ export class PeerStore {
       const candidate = verifyKel(kel, now);
       const pinned = await this.#pin(candidate.aceId);
       const result = reconcileKel(pinned === null ? null : structuredClone(pinned.state), candidate);
-      // A live descriptor vouches only for its own KEL: not for a pin that has moved past it. A moved pin is live only
+      // A relay's descriptor vouches only for its own KEL: not for a pin that has moved past it. A moved pin is live only
       // when a live descriptor moved it; an unchanged one becomes live, never unlive.
       const live = o.live === true && result.state.lastHash === candidate.lastHash;
       if (result.outcome !== 'unchanged' || (live && pinned?.kelLive === false)) {

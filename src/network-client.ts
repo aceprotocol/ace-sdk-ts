@@ -325,6 +325,11 @@ export class NetworkClient {
    * never replaces a newer one (even an expired one: no rollback); an entry signed under a superseded KEL is replaced.
    */
   async importAgent(value: unknown): Promise<PublishedAgent> {
+    return this.#importAgent(value, false);
+  }
+
+  /** `importAgent`; `live`: a relay served it, so it confirms the KEL it was signed under (`AdoptOptions.live`). */
+  async #importAgent(value: unknown, live: boolean): Promise<PublishedAgent> {
     const d = isObj(value) ? value.descriptor : undefined;
     if (!isObj(d) || !isACEId(d.aceId)) throw new ACEError('invalid_authorization', 'published agent must be {kel, descriptor}');
     const id = d.aceId;
@@ -332,9 +337,8 @@ export class NetworkClient {
     const now = this.#now();
     const [pinned, delegationPins] = await Promise.all([this.peers.get(id), this.peers.pins(delegationIssuers(value))]);
     const { agent, state } = verifyPublishedAgent(value, now, { ...this.#verifyOpts(), pinned, delegationPins });
-    // The pin and the cached descriptor change together, under the `peers` lock. The descriptor is live: it confirms the
-    // KEL it was signed under.
-    return this.peers.adopt(structuredClone(state.events), { live: isBoundTo(agent, state), then: async ({ state: pin }: Adopted) => {
+    // The pin and the cached descriptor change together, under the `peers` lock.
+    return this.peers.adopt(structuredClone(state.events), { live: live && isBoundTo(agent, state), then: async ({ state: pin }: Adopted) => {
       // Another path advanced the pin past the state the descriptor verified under (it was read before the lock).
       if (pin.lastHash !== state.lastHash) throw new ACEError('stale_peer_binding', 'the pin advanced past the descriptor');
       const old = await this.#read<PublishedAgent>(agentKey(id));
@@ -516,7 +520,7 @@ export class NetworkClient {
 
   /** Fetch and import the peer's descriptor from the first of `routes` that serves it. */
   async #fetchAgent(aceId: string, routes: readonly string[]): Promise<PublishedAgent> {
-    return firstServed(routes, async (route) => this.importAgent(await this.#relayFor(route).getDescriptor(aceId)));
+    return firstServed(routes, async (route) => this.#importAgent(await this.#relayFor(route).getDescriptor(aceId), true));
   }
 
   /** The permit `aceId` issued us, only while it verifies under its current pin: the one `send` presents. */

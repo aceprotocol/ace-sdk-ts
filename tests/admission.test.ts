@@ -50,6 +50,24 @@ describe('admission', () => {
     expect(await alice.client.inbox.receive(await contact(carol, alice, 'request', 'ace:text:1', clock))).toMatchObject({ kind: 'contact' });
   });
 
+  it('a known peer\'s contact source extends the pin but does not confirm it live', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const bob = await agent(relay, clock);
+    const carol = await agent(relay, clock, { contact: 'open', listed: true });
+    const C = carol.id.getACEId();
+    await bob.client.connect(C, { profile: 'ace:text:1' });
+    expect(await bob.client.peers.kelLive(C)).toBe(true); // fetched from carol's relay
+    const served = relay.descriptors.get(C)!;
+    await carol.id.delegate({ now: clock.t });
+    const accepted = await contact(carol, bob, 'accepted', 'ace:text:1', clock);
+    relay.descriptors.set(C, served); // the relay still serves the old descriptor: the refresh does not reach the packet
+    await bob.client.inbox.receive(accepted);
+    expect((await bob.client.peers.get(C))!.events).toEqual(carol.id.getKel());
+    // Self-signed by the sender: a holder of a superseded key could sign one too.
+    expect(await bob.client.peers.kelLive(C)).toBe(false);
+  });
+
   it('an accepted reply from a peer we never contacted is dropped and admits nothing', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
