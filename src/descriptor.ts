@@ -11,7 +11,7 @@ import {
 } from './encoding.js';
 import { signClaims, type ACEIdentity } from './identity.js';
 import {
-  checkSignatureShape, isUsable, lastEventHash, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature,
+  atLogTail, checkSignedAfterDelegation, checkSignatureShape, isUsable, lastEventHash, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature,
 } from './kel.js';
 import {
   DEFAULT_DESCRIPTOR_LIFETIME, MAX_DELEGATION_LIFETIME, MAX_DESCRIPTOR_DELEGATIONS, MAX_DESCRIPTOR_ERC8004, MAX_DESCRIPTOR_LIFETIME, MAX_DESCRIPTOR_PROFILES,
@@ -247,9 +247,12 @@ export interface DescriptorOptions extends VerifyOptions {
   ttl?: number;
 }
 
-/** Create and sign this identity's PublishedAgent (verified before it is returned). */
+/**
+ * Create and sign this identity's PublishedAgent (verified before it is returned). `issuedAt` is never before the log's
+ * last event, so a clock behind it still signs a valid descriptor.
+ */
 export async function createDescriptor(identity: ACEIdentity, o: DescriptorOptions): Promise<PublishedAgent> {
-  const { issuedAt, expiresAt } = docWindow(o, MAX_DESCRIPTOR_LIFETIME, DEFAULT_DESCRIPTOR_LIFETIME);
+  const { issuedAt, expiresAt } = docWindow({ ...o, now: atLogTail(identity.getKel(), o.now ?? nowOf()) }, MAX_DESCRIPTOR_LIFETIME, DEFAULT_DESCRIPTOR_LIFETIME);
   const claims = {
     aceId: identity.getACEId(), issuedAt, expiresAt, relays: [...o.relays],
     prekey: { id: o.prekey.id, publicKey: o.prekey.publicKey }, profiles: o.profiles.map((p) => ({ id: p.id, digest: p.digest })),
@@ -268,8 +271,8 @@ const D_OPTIONAL = ['ext', 'delegations', 'erc8004'];
 /**
  * Verify a PublishedAgent at `now`, in order: shape including `ext`, `delegations` (`{kel, credential}` entries) and
  * `erc8004` and the signature's (its value of the scheme's length) (`invalid_authorization`); KEL usable at `now` (`invalid_kel` / `invalid_signature`) naming `aceId`
- * (`invalid_authorization`); the signature as an operational signature of the KEL reconciled with `o.pinned`
- * (`stale_peer_binding` / `invalid_authorization`); each delegation (an entry that only expired is dropped from
+ * (`invalid_authorization`); the signature as an operational signature of the KEL reconciled with `o.pinned`, signed
+ * no earlier than its delegation's `dlg` (`stale_peer_binding` / `invalid_authorization`); each delegation (an entry that only expired is dropped from
  * `delegations`).
  */
 export function verifyPublishedAgent(value: unknown, now: number = nowOf(), o: VerifyOptions = {}): VerifiedAgent {
@@ -303,6 +306,7 @@ export function verifyPublishedAgent(value: unknown, now: number = nowOf(), o: V
   if (!isUsable(state, now)) throw new ACEError('invalid_kel', 'identity has no live signing delegation');
   if (state.aceId !== d.aceId) throw bad('kel does not derive aceId');
   if (o.pinned) state = reconcileKel(o.pinned, state).state;
+  checkSignedAfterDelegation(state, d.issuedAt as number);
   verifyOperationalSignature(state, 'agent-descriptor', d.issuedAt as number, canonicalStateBytes(claimsOf(d)), d.signature, now, 'invalid_authorization');
   const delegations: VerifiedAgent['delegations'] = [];
   for (const entry of (d.delegations as unknown[] | undefined) ?? []) {

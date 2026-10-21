@@ -5,7 +5,7 @@ import { ACEError } from './errors.js';
 import { verifyCardBundle, type CardBundle } from './card-record.js';
 import { documentDigest, verifyPermit, verifyPublishedAgent, type PublishedAgent } from './descriptor.js';
 import { parseAuthHeaders, verifyAuthHeaders, type RelayAuthRequest } from './auth.js';
-import type { KelState } from './kel.js';
+import { lastEventHash, type KelState } from './kel.js';
 import { decodePacket } from './packet.js';
 import { verifyRegistrationRequest } from './registration.js';
 import { compareStreamIds, RelayClient } from './relay.js';
@@ -149,8 +149,9 @@ export class FakeRelay {
       const reg = this.kels.get(record.aceId);
       if (!reg) throw new HTTPError(403, 'not_registered');
       if (reg.lastHash !== kelState.lastHash) throw new HTTPError(409, 'kel_conflict');
+      // 07: a stored record under another KEL is absent, also here: it does not bound the new issuedAt.
       const old = this.cards.get(record.aceId);
-      if (old && (old.card.issuedAt > record.issuedAt || (old.card.issuedAt === record.issuedAt && documentDigest(old.card) !== documentDigest(record)))) {
+      if (old && lastEventHash(old.kel) === reg.lastHash && (old.card.issuedAt > record.issuedAt || (old.card.issuedAt === record.issuedAt && documentDigest(old.card) !== documentDigest(record)))) {
         throw new HTTPError(409, 'stale_descriptor');
       }
       // 07 § Descriptors and cards: a handle is set once per identity and never reassigned.

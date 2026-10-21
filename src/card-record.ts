@@ -8,7 +8,7 @@ import { ACEError } from './errors.js';
 import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isCaip10, isHandle, nowOf, wireInt } from './encoding.js';
 import { signClaims, type ACEIdentity } from './identity.js';
 import {
-  checkSignatureShape, isUsable, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature,
+  atLogTail, checkSignedAfterDelegation, checkSignatureShape, isUsable, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature,
 } from './kel.js';
 import { MAX_CARD_RECORD_BYTES, MAX_PAY_ACCOUNTS, MAX_PUBLISHED_AGENT_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 
@@ -47,11 +47,11 @@ const R_OPTIONAL = ['handle', 'pay'];
 /** A CAIP-10 account id (`namespace:reference:address`). */
 export const isCaip10Account: (s: unknown) => s is string = isCaip10;
 
-/** Create and sign this identity's CardBundle (verified before it is returned). */
+/** Create and sign this identity's CardBundle (verified before it is returned); `issuedAt` is never before the log's last event. */
 export async function createCardRecord(identity: ACEIdentity, o: {
   home: string; handle?: string; card?: AgentCard; pay?: string[]; contact: Contact; listed: boolean; now?: number;
 } & Pick<VerifyOptions, 'allowLoopbackRelays'>): Promise<CardBundle> {
-  const issuedAt = o.now ?? nowOf();
+  const issuedAt = atLogTail(identity.getKel(), o.now ?? nowOf());
   const claims = {
     aceId: identity.getACEId(), issuedAt, home: o.home, card: structuredClone(o.card ?? {}), contact: o.contact, listed: o.listed,
     ...(o.handle !== undefined ? { handle: o.handle } : {}),
@@ -65,8 +65,8 @@ export async function createCardRecord(identity: ACEIdentity, o: {
 /**
  * Verify a CardBundle at `now`, in order (04 § Card record): shape (the signature's included), both size bounds and
  * field rules (`invalid_authorization`); KEL usable at `now` (`invalid_kel` / `invalid_signature`) naming `aceId`
- * (`invalid_authorization`); the signature as an operational signature of the KEL reconciled with `o.pinned`
- * (`stale_peer_binding` / `invalid_authorization`). No expiry check.
+ * (`invalid_authorization`); the signature as an operational signature of the KEL reconciled with `o.pinned`, signed
+ * no earlier than its delegation's `dlg` (`stale_peer_binding` / `invalid_authorization`). No expiry check.
  */
 export function verifyCardBundle(value: unknown, now: number = nowOf(), o: VerifyOptions = {}): VerifiedCard {
   const bad = (m: string) => new ACEError('invalid_authorization', m);
@@ -95,6 +95,7 @@ export function verifyCardBundle(value: unknown, now: number = nowOf(), o: Verif
   if (!isUsable(state, now)) throw new ACEError('invalid_kel', 'identity has no live signing delegation');
   if (state.aceId !== r.aceId) throw bad('kel does not derive aceId');
   if (o.pinned) state = reconcileKel(o.pinned, state).state;
+  checkSignedAfterDelegation(state, issuedAt);
   verifyOperationalSignature(state, 'card-record', issuedAt, canonicalStateBytes(claimsOf(r)), r.signature, now, 'invalid_authorization');
   const bundle = structuredClone(value) as unknown as CardBundle;
   return { aceId: r.aceId, kelState: state, record: bundle.card, bundle, kelLive: false };

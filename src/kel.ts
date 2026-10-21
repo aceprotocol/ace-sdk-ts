@@ -271,6 +271,17 @@ export function verifyOperationalSignature(
 }
 
 /**
+ * 04 § Verification step 3: a descriptor or card record is signed no earlier than the `dlg` of the current signing
+ * delegation, part of "signed while live" (`stale_peer_binding`): after a fork recovery that re-delegates the same key at the same `seq`, a document
+ * signed on the abandoned branch never verifies under the new log.
+ */
+export function checkSignedAfterDelegation(state: KelState, signedAt: number): void {
+  const k = state.signing;
+  const dlgTs = k === null ? null : wireInt(state.events[k.seq]?.ts);
+  if (dlgTs === null || signedAt < dlgTs) throw new ACEError('stale_peer_binding', 'signed before its signing delegation');
+}
+
+/**
  * Max(`now`, ts of the log's last event): a stored log is verified at its own last timestamp, so it never fails the
  * future-ts bound against a clock that is behind it.
  */

@@ -4,11 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  ACEError, AdmissionBook, FileStore, MemoryStore, OFFLINE_WINDOW_SECONDS, ReplayDetector, SoftwareIdentity, SoftwareKey, canonicalStateBytes,
-  createDelegation, createPermit, generateSoftwareKey, keyDigest, receiptContent, relayErrorFor, validateNetworkRelay, verifiedCacheUsage,
-  verifyCardBundle, verifyKel, verifyPublishedAgent,
+  ACEError, AdmissionBook, FileStore, MemoryStore, OFFLINE_WINDOW_SECONDS, ReplayDetector, SoftwareIdentity, SoftwareKey, StorePrekeyVault,
+  canonicalStateBytes, createCardRecord, createDelegation, createDescriptor, createPermit, createRotation, generateSoftwareKey, keyDigest,
+  receiptContent, relayErrorFor, validateNetworkRelay, verifiedCacheUsage, verifyCardBundle, verifyKel, verifyPublishedAgent,
 } from './sdk.js';
-import { Clock, FakeRelay, NOW, agent, stateOf } from './helpers.js';
+import { Clock, FakeRelay, NOW, RELAY, agent, stateOf } from './helpers.js';
 import { inboxWorld, msg } from './helpers2.js';
 
 const code = (c: string) => expect.objectContaining({ code: c });
@@ -188,5 +188,40 @@ describe('sdk-ts: admission request lock', () => {
       expect(lock.mock.calls.map(([name]) => name)).toEqual(['admission']);
       expect(await book.requests()).toHaveLength(1);
     } finally { await a.client.close(); }
+  });
+});
+
+describe('SP12: a document is signed no earlier than its dlg (04)', () => {
+  async function prekey() {
+    const pk = await new StorePrekeyVault(new MemoryStore(), { clock: () => NOW }).rotate(NOW);
+    return { id: pk.id, publicKey: pk.publicKey };
+  }
+
+  it('a fork recovery re-delegating the same key at the same seq does not revive the old branch\'s documents', async () => {
+    const next = generateSoftwareKey(), key = generateSoftwareKey();
+    const id = await SoftwareIdentity.generate({ now: NOW, nextRootDigest: keyDigest(next.scheme, next.publicKey()) });
+    const [icp, dlg1] = id.getKel(), root = rootOf(id);
+    // The abandoned branch: icp, dlg(1), dlg(2, key); a descriptor and a card record signed under seq 2.
+    const old = [icp, dlg1, await createDelegation(verifyKel([icp, dlg1], NOW), root, key.publicKey(), NOW + 10)];
+    const oldId = SoftwareIdentity.fromExport({ rootSeed: id.exportPrivateKey().rootSeed, signingSeed: Buffer.from(key.seed).toString('base64'), kel: old }, NOW + 10);
+    const descriptor = (await createDescriptor(oldId, { relays: [RELAY], prekey: await prekey(), profiles: [], now: NOW + 20 })).descriptor;
+    const card = (await createCardRecord(oldId, { home: RELAY, contact: 'closed', listed: false, now: NOW + 20 })).card;
+    // The recovery: icp, rot(1) by the next root, dlg(2) of the same key, later than both documents.
+    const rot = await createRotation(verifyKel([icp], NOW), next, keyDigest(generateSoftwareKey().scheme, generateSoftwareKey().publicKey()), NOW + 100);
+    const recovered = [icp, rot, await createDelegation(verifyKel([icp, rot], NOW + 100), next, key.publicKey(), NOW + 100)];
+    expect(verifyKel(recovered, NOW + 100).signing?.seq).toBe(descriptor.signature.seq);
+    expect(() => verifyPublishedAgent({ kel: recovered, descriptor }, NOW + 200)).toThrow(code('stale_peer_binding'));
+    expect(() => verifyCardBundle({ kel: recovered, card }, NOW + 200)).toThrow(code('stale_peer_binding'));
+  });
+
+  it('a clock behind the last KEL event still signs valid documents, dated at that event', async () => {
+    const id = await SoftwareIdentity.generate({ now: NOW });
+    await id.delegate({ now: NOW + 100 });
+    const agent = await createDescriptor(id, { relays: [RELAY], prekey: await prekey(), profiles: [], now: NOW });
+    expect(agent.descriptor.issuedAt).toBe(NOW + 100);
+    expect(verifyPublishedAgent(agent, NOW + 100).state.aceId).toBe(id.getACEId());
+    const bundle = await createCardRecord(id, { home: RELAY, contact: 'closed', listed: false, now: NOW });
+    expect(bundle.card.issuedAt).toBe(NOW + 100);
+    expect(verifyCardBundle(bundle, NOW + 100).aceId).toBe(id.getACEId());
   });
 });
