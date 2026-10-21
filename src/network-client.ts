@@ -13,7 +13,7 @@ import {
   type AgentCard, type DelegationCredential, type DeliveryPermit, type DescriptorDelegation, type Erc8004Binding, type PublishedAgent,
 } from './descriptor.js';
 import { ACEError, isUnknownPeer } from './errors.js';
-import { canonicalStateBytes, isACEId, isHandle, isObj, nowOf, parseStateBytes, sha256Hex } from './encoding.js';
+import { canonicalStateBytes, isACEId, isHandle, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
 import type { KelEvent, KelState } from './kel.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
 import { Inbox, type ContactEvent, type ReceiveOutcome } from './inbox.js';
@@ -27,6 +27,7 @@ import { createPacket } from './packet.js';
 import { PeerStore, type Adopted } from './peer-store.js';
 import { StorePrekeyVault, type PrekeyVault } from './prekey.js';
 import { RelayClient } from './relay.js';
+import { isCanonicalRelayUrl } from './relay-url.js';
 import type { ProfileRules } from './rules.js';
 import { withLock, type ACEStore } from './store.js';
 import type { JSONObject, ParsedMessage, PrivateContent } from './types.js';
@@ -95,17 +96,21 @@ interface SelfRecord { agent: PublishedAgent; params: string; card?: CardBundle;
 const SELF_KEY = 'network/self.json';
 const agentKey = (id: string) => `network/agents/${sha256Hex(id)}.json`;
 /**
- * A peer's card pin: the newest verified card record's `issuedAt` and claims digest (no rollback), and the handle it
- * holds at its home (set once, so a later record at that home must carry it).
+ * A peer's card pin: its newest `issuedAt` and claims digest, plus its permanent handles by home. The legacy
+ * `home`/`handle` pair is retained for migration from records that remembered only one home.
  */
-interface CardPin { home: string; handle?: string; issuedAt: number; digest: string }
+interface CardPin { home: string; handle?: string; issuedAt: number; digest: string; handles?: Record<string, string> }
 const handlePinKey = (id: string) => `network/handles/${sha256Hex(id)}.json`;
 /** The reverse handle pin: the ACE ID `@handle@home` first resolved to. A binding is permanent, so a later other one is misbehavior. */
 interface HandleOwnerPin { home: string; handle: string; aceId: string }
 const handleOwnerKey = (home: string, handle: string) => `network/handle-owners/${sha256Hex(`${home} ${handle}`)}.json`;
 const isStr = (v: unknown): v is string => typeof v === 'string';
-const isCardPin = (v: Record<string, unknown>): boolean => Number.isSafeInteger(v.issuedAt) && isStr(v.digest) && isStr(v.home)
-  && (v.handle === undefined || isStr(v.handle));
+const isHandleHome = (home: unknown): home is string => isCanonicalRelayUrl(home, { allowLoopback: true }) && new URL(home).pathname === '/';
+const isCardPin = (v: Record<string, unknown>): boolean => wireInt(v.issuedAt) !== null && isHex64(v.digest) && isCanonicalRelayUrl(v.home, { allowLoopback: true })
+  && (v.handle === undefined || (isHandle(v.handle) && isHandleHome(v.home)))
+  && (v.handles === undefined || (isObj(v.handles)
+    && Object.entries(v.handles).every(([home, handle]) => isHandleHome(home) && isHandle(handle))
+    && v.handles[v.home as string] === v.handle));
 const isHandleOwnerPin = (v: Record<string, unknown>): boolean => isStr(v.aceId) && isStr(v.home) && isStr(v.handle);
 const HANDLE_RE = /^@([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/;
 
@@ -477,15 +482,18 @@ export class NetworkClient {
         if (digest !== pin.digest) throw new ACEError('stale_descriptor', 'another card record with the same issuedAt');
         return;
       }
-      if (pinnedHandle && pin.home === r.home && pin.handle !== r.handle) {
-        throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
-      }
     }
+    // Old records held one home only. Import that binding while preserving every home learned since migration.
+    const handles = { ...(pin?.handles ?? {}), ...(pinnedHandle ? { [pin!.home]: pin!.handle! } : {}) };
+    if (Object.hasOwn(handles, r.home) && handles[r.home] !== r.handle) {
+      throw new ACEError('invalid_authorization', 'the card record does not carry the handle this identity set');
+    }
+    if (r.handle !== undefined) handles[r.home] = r.handle;
     // The handle pin is unchanged (same home: equal by the check above), set on first claim, or re-pinned by a
     // handle at a new home; a record without a handle at another home keeps the earlier home's handle pin.
     const keep = pin !== null && pinnedHandle && (r.handle === undefined || pin.home === r.home);
     const handle = keep ? { home: pin.home, handle: pin.handle } : { home: r.home, ...(r.handle !== undefined ? { handle: r.handle } : {}) };
-    await this.store.write(handlePinKey(id), canonicalStateBytes({ ...handle, issuedAt: r.issuedAt, digest }));
+    await this.store.write(handlePinKey(id), canonicalStateBytes({ ...handle, issuedAt: r.issuedAt, digest, handles }));
   }
 
   async #cardByHandle(target: string): Promise<{ bundle: CardBundle; relay: RelayClient; handle: string }> {
@@ -566,11 +574,12 @@ export class NetworkClient {
     const agent = typeof peer === 'string' ? await this.lookup(peer) : await this.importAgent(peer);
     const id = agent.descriptor.aceId;
     if (id === this.identity.getACEId()) throw new ACEError('invalid_argument', 'cannot invite this identity');
-    await this.#unblockAtRelay(await this.admission.get(id));
+    const revision = await this.admission.blockRevision(id);
+    const expectedBlockRevision = await this.#unblockAtRelay(await this.admission.get(id), revision);
     const permit = await this.#createPermit(id);
     await this.admission.update(id, (old) => ({
       ...unblocked(old, id), status: 'admitted', ...(o.profile !== undefined ? { profile: o.profile } : {}), updatedAt: this.#now(),
-    }));
+    }), { expectedBlockRevision });
     const invitation = { agent: await this.publish(), permit };
     await this.#noteIssued(id, permit); // handing the invitation to the host is the send
     return invitation;
@@ -721,8 +730,11 @@ export class NetworkClient {
   }
 
   /** Relay-first: register `blocked: false` before an explicit admission of a blocked peer. */
-  async #unblockAtRelay(rec: PeerRecord | null): Promise<void> {
-    if (rec?.status === 'blocked') await this.relay.setBlock(this.identity, rec.aceId, false, await this.admission.nextBlockRevision(rec.aceId));
+  async #unblockAtRelay(rec: PeerRecord | null, revision: number): Promise<number> {
+    if (rec?.status !== 'blocked') return revision;
+    const next = await this.admission.nextBlockRevision(rec.aceId, revision);
+    await this.relay.setBlock(this.identity, rec.aceId, false, next);
+    return next;
   }
 
   #sharedProfile(agent: PublishedAgent, profile: string): void {
@@ -743,9 +755,10 @@ export class NetworkClient {
     if ((await this.admission.get(id))?.status === 'blocked') throw blockedPeer();
     if (!(await this.#theirPermit(id)) && ((card ?? await this.#cardOrNone(id))?.record.contact ?? 'closed') !== 'open') throw new ACEError('not_permitted', 'the peer takes contact requests only from peers it issued a permit');
     const permit = await this.#createPermit(id);
-    await this.admission.update(id, (old) => ({
-      ...(old ?? { aceId: id }), status: old?.status === 'admitted' ? 'admitted' : 'pending', profile: o.profile, updatedAt: this.#now(),
-    }));
+    await this.admission.update(id, (old) => {
+      if (old?.status === 'blocked') throw blockedPeer();
+      return { ...(old ?? { aceId: id }), status: old?.status === 'admitted' ? 'admitted' : 'pending', profile: o.profile, updatedAt: this.#now() };
+    });
     const messageId = crypto.randomUUID();
     await this.#sendContact(id, { kind: 'request', profile: o.profile, note: o.note, permit }, { messageId });
     await this.#noteIssued(id, permit);
@@ -889,10 +902,11 @@ export class NetworkClient {
     } else if (rec?.status === 'pending' && rec.profile === profile) {
       if (kind === 'accepted') {
         await this.importAgent(e.source.agent);
-        await this.admission.update(e.from, (old) => old && { ...old, status: 'admitted', updatedAt: this.#now() });
-        await this.#hold(e.permit!);
+        await this.admission.update(e.from, (old) => old?.status === 'pending' && old.profile === profile
+          ? { ...old, status: 'admitted', updatedAt: this.#now() } : old);
+        await this.#hold(e.permit!, (r) => r?.status === 'admitted');
       } else {
-        await this.admission.update(e.from, () => null);
+        await this.admission.update(e.from, (old) => old?.status === 'pending' && old.profile === profile ? null : old);
       }
     }
     await this.options.onContact?.(e);

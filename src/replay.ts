@@ -95,6 +95,7 @@ export class ReplayDetector {
   #size = 0;
   #global = new MinHeap<GlobalEntry>(globalLess);
   #perSender = new Map<string, MinHeap<SenderEntry>>();
+  #senderHeapSize = 0;
 
   constructor(opts: ReplayDetectorOptions = {}) {
     const capacity = opts.capacity ?? DEFAULT_REPLAY_CAPACITY;
@@ -142,6 +143,7 @@ export class ReplayDetector {
     this.#enforceCapacity();
     // 4. sender-horizon compaction
     this.#compact();
+    this.#compactHeaps();
     return true;
   }
 
@@ -186,6 +188,7 @@ export class ReplayDetector {
     for (const s of [...det.#live.keys()].sort(compareUtf8)) det.#enforceQuota(s);
     det.#enforceCapacity();
     det.#compact();
+    det.#compactHeaps();
     return det;
   }
 
@@ -217,6 +220,7 @@ export class ReplayDetector {
       this.#perSender.set(s, h);
     }
     h.push([ts, mid]);
+    this.#senderHeapSize++;
   }
 
   #remove(s: string, mid: string): void {
@@ -225,6 +229,7 @@ export class ReplayDetector {
     this.#size--;
     if (m.size === 0) {
       this.#live.delete(s);
+      this.#senderHeapSize -= this.#perSender.get(s)!.items.length;
       this.#perSender.delete(s);
     }
   }
@@ -242,7 +247,10 @@ export class ReplayDetector {
   #peekSender(s: string): SenderEntry | undefined {
     const h = this.#perSender.get(s);
     if (h === undefined) return undefined;
-    for (let top = h.peek(); top !== undefined && !this.#isLive(s, top[1], top[0]); top = h.peek()) h.pop();
+    for (let top = h.peek(); top !== undefined && !this.#isLive(s, top[1], top[0]); top = h.peek()) {
+      h.pop();
+      this.#senderHeapSize--;
+    }
     return h.peek();
   }
 
@@ -298,5 +306,27 @@ export class ReplayDetector {
     this.#dropCoveredSh();
     this.#shHeap = new MinHeap<HorizonEntry>(pairLess);
     for (const [s, h] of this.#sh) this.#shHeap.push([h, s]);
+  }
+
+  /** Lazy deletion must bound physical heap storage as well as the live entries and horizons. */
+  #compactHeaps(): void {
+    const entryLimit = Math.max(64, this.#size * 4);
+    if (this.#global.items.length > entryLimit) {
+      this.#global = new MinHeap<GlobalEntry>(globalLess);
+      for (const [s, entries] of this.#live) for (const [id, ts] of entries) this.#global.push([ts, s, id]);
+    }
+    if (this.#senderHeapSize > entryLimit) {
+      this.#perSender = new Map();
+      this.#senderHeapSize = 0;
+      for (const [s, entries] of this.#live) {
+        const heap = new MinHeap<SenderEntry>(pairLess);
+        for (const [id, ts] of entries) { heap.push([ts, id]); this.#senderHeapSize++; }
+        this.#perSender.set(s, heap);
+      }
+    }
+    if (this.#shHeap.items.length > Math.max(64, this.#sh.size * 4)) {
+      this.#shHeap = new MinHeap<HorizonEntry>(pairLess);
+      for (const [s, h] of this.#sh) this.#shHeap.push([h, s]);
+    }
   }
 }

@@ -1,7 +1,7 @@
 // Admission (ace-spec/05): only local actions change admission; contact replies count only for our own pending request.
 import { describe, expect, it } from 'vitest';
 import {
-  ACEError, MemoryStore, NetworkClient, ProfileSet, contactContent, createInvitation, createPacket, createPermit,
+  ACEError, MemoryStore, NetworkClient, ProfileSet, canonicalStateBytes, contactContent, createInvitation, createPacket, createPermit, sha256Hex,
   type ParsedMessage, type PrivateContent,
 } from './sdk.js';
 import { CONTACT_REQUEST_TTL_SECONDS, MAX_PENDING_CONTACT_REQUESTS } from '../src/limits.js';
@@ -217,7 +217,8 @@ describe('admission', () => {
     const [held] = await alice.client.requests();
     await alice.client.block(B);
     expect(await alice.client.requests()).toEqual([]); // blocking discards the held request
-    await alice.client.admission.saveRequest(held!); // a residual request (e.g. stored by a racing receive)
+    // Simulate a residual record written by an older SDK; saveRequest now rejects blocked peers.
+    await alice.store.write(`admission/requests/${sha256Hex(B)}.json`, canonicalStateBytes(held!));
     await expect(alice.client.accept(B)).rejects.toMatchObject({ code: 'not_permitted' });
     expect((await alice.client.admission.get(B))!.status).toBe('blocked');
     expect(relay.blocks.get(`${A}|${B}`)).toEqual({ blocked: true, revision: 1 });

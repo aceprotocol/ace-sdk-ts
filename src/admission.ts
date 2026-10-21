@@ -88,9 +88,12 @@ export class AdmissionBook {
     return r.status === 'pending' && nowOf(this.#clock) >= r.updatedAt + OFFLINE_WINDOW_SECONDS;
   }
 
-  /** Read-modify-write one record under the `admission` lock. */
-  async update(aceId: string, fn: (old: PeerRecord | null) => PeerRecord | null): Promise<PeerRecord | null> {
+  /** Read-modify-write under `admission`; an optional block revision rejects a decision overtaken by a block change. */
+  async update(aceId: string, fn: (old: PeerRecord | null) => PeerRecord | null, o: { expectedBlockRevision?: number } = {}): Promise<PeerRecord | null> {
     return withLock(this.#store, 'admission', async () => {
+      if (o.expectedBlockRevision !== undefined && await this.blockRevision(aceId) !== o.expectedBlockRevision) {
+        throw new ACEError('not_permitted', 'the peer block changed during this admission');
+      }
       const next = fn(await this.get(aceId));
       if (next === null) await this.#store.delete(peerKey(aceId));
       else await this.#store.write(peerKey(aceId), canonicalStateBytes(next));
@@ -139,10 +142,15 @@ export class AdmissionBook {
    * CONTACT_REQUEST_TTL_SECONDS after `receivedAt`, and when the store is full the oldest held request is evicted.
    */
   async saveRequest(r: ContactRequest): Promise<void> {
-    await withLock(this.#store, 'admission-requests', async () => {
-      const held = (await this.requests()).filter((x) => x.from !== r.from);
-      while (held.length >= this.#maxRequests) await this.deleteRequest(held.shift()!.from);
-      await this.#store.write(requestKey(r.from), canonicalStateBytes(r));
+    await withLock(this.#store, 'admission', async () => {
+      // A block both changes admission and deletes the held request under this same lock.
+      // Do not let a receive that started earlier recreate it after that deletion.
+      if ((await this.get(r.from))?.status === 'blocked') return;
+      await withLock(this.#store, 'admission-requests', async () => {
+        const held = (await this.requests()).filter((x) => x.from !== r.from);
+        while (held.length >= this.#maxRequests) await this.deleteRequest(held.shift()!.from);
+        await this.#store.write(requestKey(r.from), canonicalStateBytes(r));
+      });
     });
   }
 
@@ -177,9 +185,23 @@ export class AdmissionBook {
    * The next relay block revision for `aceId` (05 § Blocks: strictly increasing per peer), persisted before it is used
    * and kept after an unblock, as the relay keeps it: a retried or lost request never reuses a revision.
    */
-  async nextBlockRevision(aceId: string): Promise<number> {
+  async nextBlockRevision(aceId: string, expectedRevision?: number): Promise<number> {
     if (!isACEId(aceId)) throw new ACEError('invalid_argument', 'aceId must be an ACE ID');
-    return withLock(this.#store, 'admission', () => this.#allocate(aceId));
+    return withLock(this.#store, 'admission', async () => {
+      if (expectedRevision !== undefined && await this.blockRevision(aceId) !== expectedRevision) {
+        throw new ACEError('not_permitted', 'the peer block changed during this admission');
+      }
+      return this.#allocate(aceId);
+    });
+  }
+
+  /** The durable block generation, including after the record was unblocked or its relay sync completed. */
+  async blockRevision(aceId: string): Promise<number> {
+    if (!isACEId(aceId)) throw new ACEError('invalid_argument', 'aceId must be an ACE ID');
+    const raw = await this.#store.read(revisionKey(aceId));
+    const revision = raw === null ? 0 : wireInt((parseStateBytes(raw, 'block revision') as { revision?: unknown }).revision);
+    if (revision === null) throw new ACEError('storage_failed', 'block revision is invalid');
+    return revision;
   }
 
   /**
@@ -213,9 +235,7 @@ export class AdmissionBook {
   }
 
   async #allocate(aceId: string): Promise<number> {
-    const raw = await this.#store.read(revisionKey(aceId));
-    const old = raw === null ? 0 : wireInt((parseStateBytes(raw, 'block revision') as { revision?: unknown }).revision);
-    if (old === null) throw new ACEError('storage_failed', 'block revision is invalid');
+    const old = await this.blockRevision(aceId);
     await this.#store.write(revisionKey(aceId), canonicalStateBytes({ revision: old + 1 }));
     return old + 1;
   }
