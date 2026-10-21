@@ -311,6 +311,24 @@ describe('card record over the relay', () => {
     await again.close();
   });
 
+  it('adopting a live descriptor by any path confirms a fallback-pinned KEL', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const A = alice.id.getACEId();
+    clock.advance(8 * 86400);
+    const bob = await agent(relay, clock);
+    expect((await bob.client.lookupCard(A)).kelLive).toBe(false);
+    // Alice is back: bob's plain descriptor lookup (no card lookup) imports it and confirms the pin, so the next card
+    // lookup needs no descriptor request of its own (one would fail here).
+    await alice.client.publish();
+    await bob.client.agent(A);
+    expect(await bob.client.peers.kelLive(A)).toBe(true);
+    relay.inject.push({ path: `/v1/descriptor/${encodeURIComponent(A)}`, status: 503, code: 'internal_error' });
+    expect((await bob.client.lookupCard(A)).kelLive).toBe(true);
+    relay.inject.length = 0;
+  });
+
   it('transient on one route plus unknown_peer on another does not fall back', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
@@ -330,6 +348,12 @@ describe('card record over the relay', () => {
     const bob = await agent(relay, clock, { foreignRelay: () => relayB.client() });
     expect((await bob.client.lookupCard(A)).kelLive).toBe(false);
     await bob.client.importAgent(twoRoutes); // shared out of band; it expires before bob looks again
+    // Importing a live descriptor confirms the pin; a KEL alone (here: re-pinned from a bundle) leaves it unconfirmed
+    // again, the cached descriptor still naming relay B.
+    expect(await bob.client.peers.kelLive(A)).toBe(true);
+    const peerPin = `peers/${sha256Hex(A)}.json`;
+    const pinned = JSON.parse(new TextDecoder().decode((await bob.store.read(peerPin))!));
+    await bob.store.write(peerPin, new TextEncoder().encode(JSON.stringify({ ...pinned, kelLive: false })));
     clock.advance(8 * 86400);
     // Relay B is unreachable and the home relay answers unknown_peer: the lookup fails instead of reporting not live.
     relayB.inject.push({ path: descriptorPath, status: 503, code: 'internal_error' });
@@ -359,11 +383,13 @@ describe('card record over the relay', () => {
       await expect(bob.client.lookupCard('@alice@relay.test')).rejects.toThrow(code('storage_failed'));
       await bob.store.write(key, good);
     }
-    // The record of how a KEL pin was confirmed, without its flag.
+    // A KEL pin whose live-confirmation flag is not a boolean.
     clock.advance(8 * 86400);
     const carol = await agent(relay, clock);
     expect((await carol.client.lookupCard(A)).kelLive).toBe(false);
-    await carol.store.write(`network/kel-provenance/${sha256Hex(A)}.json`, enc({ aceId: A }));
+    const peerPin = `peers/${sha256Hex(A)}.json`;
+    const pinned = JSON.parse(new TextDecoder().decode((await carol.store.read(peerPin))!));
+    await carol.store.write(peerPin, enc({ ...pinned, kelLive: null }));
     await expect(carol.client.lookupCard(A)).rejects.toThrow(code('storage_failed'));
   });
 

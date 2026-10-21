@@ -14,7 +14,7 @@
  */
 import { AdmissionBook } from './admission.js';
 import { checkContactBody, checkReceiptBody, type ContactBody, type ReceiptBody } from './core-messages.js';
-import { checkStrangerSource, delegationIssuers, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent } from './descriptor.js';
+import { checkStrangerSource, delegationIssuers, isBoundTo, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent } from './descriptor.js';
 import type { Contact } from './card-record.js';
 import { ACEError, asACEError } from './errors.js';
 import { canonicalStateBytes, conversationKey, isACEId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
@@ -385,7 +385,8 @@ export class Inbox {
       if (this.#replay.covers(packet.from, packet.timestamp)) throw new ACEError('replay_horizon', 'contact packet is beyond the replay horizon');
       await checkRules(this.#rules, this.#event(packet, content), content.body);
       // An admitted peer's newer KEL may be pinned; a stranger's never is.
-      if (!stranger) await this.#peers.adopt(structuredClone(source.state.events));
+      // The source verified unexpired: a live descriptor, so it confirms the KEL it was signed under.
+      if (!stranger) await this.#peers.adopt(structuredClone(source.state.events), { live: isBoundTo(source.agent, source.state) });
       const event: ContactEvent = { from: packet.from, messageId: packet.messageId, timestamp: packet.timestamp, body, source, stranger, ...(permit ? { permit } : {}) };
       await this.#o.onContact?.(event);
       this.#replay.commit(packet.messageId, packet.from, packet.timestamp, this.#floor());

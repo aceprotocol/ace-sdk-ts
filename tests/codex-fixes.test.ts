@@ -126,10 +126,10 @@ describe('A: cached descriptors are bound to the current pins', () => {
     await bob.id.delegate({ now: clock.t });
     // another path (e.g. a contact `source`) pins bob's newer KEL after the import read the pin, before it takes the
     // `peers` lock (pin and cache are written together under that lock, so nothing can intervene later)
-    const adopt = alice.client.peers.adopt.bind(alice.client.peers) as (kel: unknown, then?: (r: unknown) => Promise<unknown>) => Promise<unknown>;
-    (alice.client.peers as { adopt: unknown }).adopt = async (kel: unknown, then?: (r: unknown) => Promise<unknown>) => {
+    const adopt = alice.client.peers.adopt.bind(alice.client.peers) as (kel: unknown, o?: unknown) => Promise<unknown>;
+    (alice.client.peers as { adopt: unknown }).adopt = async (kel: unknown, o?: unknown) => {
       await adopt(bob.id.getKel());
-      return adopt(kel, then);
+      return adopt(kel, o);
     };
     await expect(alice.client.importAgent(old)).rejects.toMatchObject({ code: 'stale_peer_binding' });
     expect(await alice.client.store.list('network/agents/')).toEqual([]); // the stale descriptor was never cached

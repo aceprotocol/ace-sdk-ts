@@ -24,7 +24,7 @@ import { MessageLog } from './message-log.js';
 import { FileStore, publicRelay } from './node.js';
 import { Outbox, type OutboxEntry } from './outbox.js';
 import { createPacket } from './packet.js';
-import { PeerStore } from './peer-store.js';
+import { PeerStore, type Adopted } from './peer-store.js';
 import { StorePrekeyVault, type PrekeyVault } from './prekey.js';
 import { RelayClient } from './relay.js';
 import type { ProfileRules } from './rules.js';
@@ -103,17 +103,10 @@ const handlePinKey = (id: string) => `network/handles/${sha256Hex(id)}.json`;
 /** The reverse handle pin: the ACE ID `@handle@home` first resolved to. A binding is permanent, so a later other one is misbehavior. */
 interface HandleOwnerPin { home: string; handle: string; aceId: string }
 const handleOwnerKey = (home: string, handle: string) => `network/handle-owners/${sha256Hex(`${home} ${handle}`)}.json`;
-/**
- * How a peer's KEL pin was confirmed: `liveConfirmed: false` when a card lookup pinned the bundle's own KEL because the
- * identity had no live descriptor, until a live descriptor confirms it. No record: pinned through a descriptor.
- */
-interface KelProvenance { aceId: string; liveConfirmed: boolean }
-const kelProvenanceKey = (id: string) => `network/kel-provenance/${sha256Hex(id)}.json`;
 const isStr = (v: unknown): v is string => typeof v === 'string';
 const isCardPin = (v: Record<string, unknown>): boolean => Number.isSafeInteger(v.issuedAt) && isStr(v.digest) && isStr(v.home)
   && (v.handle === undefined || isStr(v.handle));
 const isHandleOwnerPin = (v: Record<string, unknown>): boolean => isStr(v.aceId) && isStr(v.home) && isStr(v.handle);
-const isKelProvenance = (v: Record<string, unknown>): boolean => isStr(v.aceId) && typeof v.liveConfirmed === 'boolean';
 const HANDLE_RE = /^@([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/;
 
 /**
@@ -339,8 +332,9 @@ export class NetworkClient {
     const now = this.#now();
     const [pinned, delegationPins] = await Promise.all([this.peers.get(id), this.peers.pins(delegationIssuers(value))]);
     const { agent, state } = verifyPublishedAgent(value, now, { ...this.#verifyOpts(), pinned, delegationPins });
-    // The pin and the cached descriptor change together, under the `peers` lock.
-    return this.peers.adopt(structuredClone(state.events), async ({ state: pin }) => {
+    // The pin and the cached descriptor change together, under the `peers` lock. The descriptor is live: it confirms the
+    // KEL it was signed under.
+    return this.peers.adopt(structuredClone(state.events), { live: isBoundTo(agent, state), then: async ({ state: pin }: Adopted) => {
       // Another path advanced the pin past the state the descriptor verified under (it was read before the lock).
       if (pin.lastHash !== state.lastHash) throw new ACEError('stale_peer_binding', 'the pin advanced past the descriptor');
       const old = await this.#read<PublishedAgent>(agentKey(id));
@@ -355,7 +349,7 @@ export class NetworkClient {
       const stored: PublishedAgent = { kel: structuredClone(state.events) as KelEvent[], descriptor: agent.descriptor };
       await this.store.write(agentKey(id), canonicalStateBytes(stored));
       return stored;
-    });
+    } });
   }
 
   /** Resolve `@name@relay-host` (through its card record) or a bare ACE ID to a verified, imported PublishedAgent. */
@@ -379,9 +373,8 @@ export class NetworkClient {
     if (isACEId(target)) return { agent: await this.agent(target) };
     const { bundle, relay, handle } = await this.#cardByHandle(target);
     const id = bundle.card.aceId;
-    // The descriptor first: it pins or advances the KEL, so the card verifies under the current KEL.
-    const [agent, provenance] = await Promise.all([this.#fetchAgent(id, [relay.baseUrl]), this.#readPin<KelProvenance>(kelProvenanceKey(id), isKelProvenance)]);
-    await this.#confirmLive(id, provenance);
+    // The descriptor first: it pins or advances the KEL (live), so the card verifies under the current KEL.
+    const agent = await this.#fetchAgent(id, [relay.baseUrl]);
     return { agent, card: await this.#checkCard(bundle, { home: relay.baseUrl, handle }) };
   }
 
@@ -409,45 +402,29 @@ export class NetworkClient {
 
   /**
    * The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A pin confirmed live is used as is.
-   * Otherwise the descriptor is looked up through `fetch` (pinning or reconciling the KEL): on success the pin is
-   * recorded as confirmed live. When every route answers `unknown_peer` (no live descriptor), an unconfirmed pin stays
+   * Otherwise the descriptor is looked up through `fetch` (importing it records the pin as confirmed live, `importAgent`). When every route answers `unknown_peer` (no live descriptor), an unconfirmed pin stays
    * unconfirmed, and without a pin the card's own bundle (`card`) pins the KEL: the bundle is verified, its KEL adopted
    * under the fork rules and recorded as not confirmed live, and the bundle returned. Every other failure propagates.
    */
   async #cardKel(id: string, fetch: () => Promise<PublishedAgent>, card: () => Promise<CardBundle>): Promise<{ kelLive: boolean; bundle?: CardBundle }> {
-    const [pinned, provenance] = await Promise.all([this.peers.get(id), this.#readPin<KelProvenance>(kelProvenanceKey(id), isKelProvenance)]);
-    if (pinned !== null && provenance?.liveConfirmed !== false) return { kelLive: true };
+    const [pinned, kelLive] = await Promise.all([this.peers.get(id), this.peers.kelLive(id)]);
+    if (pinned !== null && kelLive) return { kelLive: true };
     try {
       await fetch();
     } catch (e) {
       if (!isUnknownPeer(e)) throw e;
       return pinned !== null ? { kelLive: false } : this.#pinBundleKel(id, await card());
     }
-    await this.#confirmLive(id, provenance);
     return { kelLive: true };
   }
 
-  /** Record `id`'s KEL pin as not confirmed live (pinned without a live descriptor), under the `peers` lock. */
-  async #markUnconfirmed(id: string): Promise<void> {
-    await this.store.write(kelProvenanceKey(id), canonicalStateBytes({ aceId: id, liveConfirmed: false }));
-  }
-
-  /** After a live descriptor was reconciled with `id`'s pin: a pin recorded as not confirmed live is now confirmed. */
-  async #confirmLive(id: string, provenance: KelProvenance | null): Promise<void> {
-    if (provenance !== null && !provenance.liveConfirmed) {
-      await withLock(this.store, 'peers', () => this.store.write(kelProvenanceKey(id), canonicalStateBytes({ aceId: id, liveConfirmed: true })));
-    }
-  }
-
-  /** Pin the verified KEL of `bundle` (no live descriptor), recorded as not confirmed live with the pin, atomically. */
+  /** Pin the verified KEL of `bundle` (no live descriptor: not live). */
   async #pinBundleKel(id: string, bundle: CardBundle): Promise<{ kelLive: false; bundle: CardBundle }> {
     const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
     if (v.aceId !== id) throw new ACEError('invalid_authorization', 'the card record names another identity');
-    await this.peers.adopt(structuredClone(v.kelState.events), async ({ state: pin }) => {
-      // As for a descriptor: another path advanced the pin past the state the card verified under.
-      if (pin.lastHash !== v.kelState.lastHash) throw new ACEError('stale_peer_binding', 'the pin advanced past the card record');
-      await this.#markUnconfirmed(id);
-    });
+    const { state: pin } = await this.peers.adopt(structuredClone(v.kelState.events));
+    // As for a descriptor: another path advanced the pin past the state the card verified under (left as it was).
+    if (pin.lastHash !== v.kelState.lastHash) throw new ACEError('stale_peer_binding', 'the pin advanced past the card record');
     return { kelLive: false, bundle };
   }
 
@@ -802,13 +779,9 @@ export class NetworkClient {
       // descriptor, from the source's routes while the source is bound to the pin.
       // A KEL pinned (or advanced) from the source alone is not confirmed live, as a card bundle's own KEL is not,
       // until the refreshed descriptor confirms it (04 § Card record).
-      const state = await this.peers.adopt(structuredClone(req.source.kel), async ({ state, outcome }) => {
-        if (outcome !== 'unchanged') await this.#markUnconfirmed(state.aceId);
-        return state;
-      });
+      const { state } = await this.peers.adopt(structuredClone(req.source.kel));
       if (isBoundTo(req.source, state)) await this.#fetchAgent(req.from, req.source.descriptor.relays);
       else await this.agent(req.from, { refresh: true });
-      await this.#confirmLive(state.aceId, await this.#readPin<KelProvenance>(kelProvenanceKey(state.aceId), isKelProvenance));
     }
     const permit = await this.#createPermit(req.from);
     await this.admission.update(req.from, (old) => {
