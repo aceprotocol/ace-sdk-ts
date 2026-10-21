@@ -2,12 +2,14 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
-  FileStore, MemoryStore, SoftwareIdentity, SoftwareKey, canonicalStateBytes, createDelegation, generateSoftwareKey, keyDigest, relayErrorFor,
-  validateNetworkRelay, verifiedCacheUsage, verifyCardBundle, verifyKel, verifyPublishedAgent,
+  ACEError, FileStore, MemoryStore, OFFLINE_WINDOW_SECONDS, ReplayDetector, SoftwareIdentity, SoftwareKey, canonicalStateBytes, createDelegation,
+  generateSoftwareKey, keyDigest, receiptContent, relayErrorFor, validateNetworkRelay, verifiedCacheUsage, verifyCardBundle, verifyKel,
+  verifyPublishedAgent,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, agent, stateOf } from './helpers.js';
+import { inboxWorld, msg } from './helpers2.js';
 
 const code = (c: string) => expect.objectContaining({ code: c });
 const rootOf = (id: SoftwareIdentity) => new SoftwareKey(Buffer.from(id.exportPrivateKey().rootSeed, 'base64'));
@@ -23,12 +25,54 @@ describe('C1: relay URL host grammar (02 § Relay URLs)', () => {
   });
 });
 
+describe('C2: receipts pass step 9 and commit the seen entry', () => {
+  it('a replayed receipt is a duplicate, handed over once', async () => {
+    const onReceipt = vi.fn();
+    const w = await inboxWorld({ onReceipt });
+    const packet = await w.pack(w.sender, receiptContent({ messageId: crypto.randomUUID(), outcome: 'delivered' }));
+    expect((await w.inbox.receive(packet)).kind).toBe('receipt');
+    expect(await w.inbox.receive(packet)).toMatchObject({ kind: 'duplicate', from: w.sender.getACEId() });
+    expect(onReceipt).toHaveBeenCalledTimes(1);
+    expect(w.receipts).toEqual([]);
+  });
+});
+
+describe('C3: a delivered packet whose receipt cannot be sent', () => {
+  it('is acknowledged after the fetch budget without a quarantine record', async () => {
+    const clock = new Clock(), relay = new FakeRelay(clock.now);
+    const w = await inboxWorld({ world: clock, sendReceipt: async () => { throw new ACEError('relay_unavailable', 'down'); } });
+    const rc = relay.client();
+    await rc.register(w.me);
+    relay.queues.set(w.me.getACEId(), [{ streamId: '1-0', packet: await w.pack(w.sender, msg('once')), raw: '' }]);
+    for (let i = 0; i < 2; i++) expect((await w.inbox.pull(rc))[0].kind).toBe('deferred');
+    expect(relay.pending(w.me.getACEId())).toBe(1);
+    expect((await w.inbox.pull(rc))[0].kind).toBe('duplicate');
+    expect(relay.pending(w.me.getACEId())).toBe(0);
+    expect(w.delivered).toHaveLength(1);
+    expect(await w.store.list('inbox/quarantine/')).toEqual([]);
+    expect(await w.store.list('inbox/attempts/')).toEqual([]);
+  });
+});
+
 describe('C4: relay error strings', () => {
   it('lose their control characters before they enter the error', () => {
     const e = relayErrorFor(400, null, JSON.stringify({ error: 'bad\u0007code\n', message: 'line\r\nFORGED\u009b\u0000 entry' }));
     expect(e.relayCode).toBe('badcode');
     expect(e.message).toBe('relay_rejected: HTTP 400 badcode: lineFORGED entry');
     expect(e.message).not.toMatch(/\p{Cc}/u);
+  });
+});
+
+describe('C5: ReplayDetector defaults (06 § Deduplication)', () => {
+  it('a new detector starts at H = F - 1 and commits with floor F', () => {
+    const F = NOW - 2 * OFFLINE_WINDOW_SECONDS;
+    const d = new ReplayDetector({ clock: () => NOW });
+    expect(d.exportState().horizon).toBe(F - 1);
+    expect(d.covers('s', F - 1)).toBe(true);
+    const id = crypto.randomUUID();
+    expect(d.commit(id, 's', F)).toBe(true);
+    expect(d.commit(crypto.randomUUID(), 's', NOW - 3600)).toBe(true);
+    expect(d.hasSeen(id, 's')).toBe(true); // at the floor, not below it
   });
 });
 
@@ -64,6 +108,21 @@ describe('C7: shape before KEL work (04 § Verification, § Card record)', () =>
     const card = relay.cards.get(alice.id.getACEId())!;
     expect(() => verifyCardBundle({ kel: [], card: { ...card.card, signature: { ...card.card.signature, value: 'AAAA' } } }, clock.t))
       .toThrow(code('invalid_authorization'));
+  });
+});
+
+describe('C8: step 3 refresh rate', () => {
+  it('a transient refresh failure counts: at most one attempt per sender per 30 s', async () => {
+    const w = await inboxWorld();
+    w.refreshPeer.mockRejectedValue(new ACEError('relay_unavailable', 'down'));
+    await w.sender.delegate({ now: w.clock.t });
+    expect((await w.inbox.receive(await w.pack(w.sender, msg('1')))).kind).toBe('deferred');
+    w.clock.advance(10);
+    expect((await w.inbox.receive(await w.pack(w.sender, msg('2')))).kind).toBe('deferred');
+    expect(w.refreshPeer).toHaveBeenCalledTimes(1);
+    w.clock.advance(21);
+    await w.inbox.receive(await w.pack(w.sender, msg('3')));
+    expect(w.refreshPeer).toHaveBeenCalledTimes(2);
   });
 });
 

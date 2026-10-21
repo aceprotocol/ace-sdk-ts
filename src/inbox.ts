@@ -10,7 +10,7 @@
  * failures are answered with `rejected:<code>`; a duplicate is answered `delivered`; a message beyond the replay
  * horizon is dropped (`replay_horizon`) without a receipt; storage failures and capacity back-pressure are `deferred`
  * (not acknowledged). A packet fetched MAX_FETCH_ATTEMPTS times without a final disposition is quarantined and
- * acknowledged.
+ * acknowledged; one already delivered whose receipt send keeps failing is acknowledged without a quarantine record.
  */
 import { AdmissionBook } from './admission.js';
 import { checkContactBody, checkReceiptBody, type ContactBody, type ReceiptBody } from './core-messages.js';
@@ -26,7 +26,7 @@ import { checkPacketTime, decodePacket, decryptPacket, parsePacket, verifyPacket
 import { PeerStore } from './peer-store.js';
 import type { PrekeyVault } from './prekey.js';
 import type { RelayClient } from './relay.js';
-import { ReplayDetector, type ReplayState } from './replay.js';
+import { ReplayDetector, SEEN_FLOOR_SECONDS, type ReplayState } from './replay.js';
 import { checkRules, commitRules, ruleEvent, rulesFor, type ProfileRules, type RuleEvent } from './rules.js';
 import { SerialQueue, type ACEStore } from './store.js';
 import type { ParsedMessage, PrivateContent } from './types.js';
@@ -102,8 +102,6 @@ type Journal = { from: string; messageId: string; timestamp: number } & ({ statu
  */
 export const RECEIVE_LOCK = 'receive';
 const REPLAY_KEY = 'inbox/replay.json';
-/** Seen-store floor: retries are re-signed for OFFLINE_WINDOW_SECONDS and may wait that long at the relay. */
-const SEEN_FLOOR_SECONDS = 2 * OFFLINE_WINDOW_SECONDS;
 const SNAPSHOT_EVERY = 256;
 const journalKey = (from: string, id: string) => `inbox/journal/${pairKey(from, id)}.json`;
 const attemptsKey = (fp: string) => `inbox/attempts/${fp}.json`;
@@ -129,6 +127,11 @@ const drop = (error: ACEError): ReceiveOutcome => ({ kind: 'dropped', error });
 const defer = (error: ACEError): ReceiveOutcome => ({ kind: 'deferred', error });
 /** A transient failure is retried later; anything else is dropped. */
 const settle = (error: ACEError): ReceiveOutcome => error.isTransient ? defer(error) : drop(error);
+/**
+ * Deferrals of a packet already delivered (or a duplicate) whose `delivered` receipt failed to send, mapped to the
+ * outcome it had: past the fetch budget it is acknowledged as that, without a quarantine record (06 § Acknowledgement).
+ */
+const RECEIPT_ONLY = new WeakMap<ReceiveOutcome, ReceiveOutcome>();
 
 /** A persisted journal entry, validated: anything malformed is `storage_failed`, never read as done. */
 function checkJournal(v: unknown, key: string): Journal {
@@ -173,7 +176,7 @@ export class Inbox {
       // 06 § Deduplication: missing state beside existing delivery history is a storage failure, not a new store.
       if (raw === null && (await o.store.list('inbox/journal/')).length > 0) throw new ACEError('storage_failed', `${REPLAY_KEY} is missing beside the inbox journal`);
       const replay = raw === null
-        ? new ReplayDetector({ capacity, horizon: Math.max(0, nowOf(o.clock) - SEEN_FLOOR_SECONDS - 1), clock: o.clock })
+        ? new ReplayDetector({ capacity, clock: o.clock })
         : ReplayDetector.fromState(parseStateBytes(raw, REPLAY_KEY) as ReplayState, { capacity, clock: o.clock });
       const inbox = new Inbox(o, release, replay);
       await inbox.#recover();
@@ -323,7 +326,7 @@ export class Inbox {
     return this.#application(packet, content);
   }
 
-  /** Refresh a sender at most once per PIN_REFRESH_INTERVAL_SECONDS; a transient failure does not count as an attempt. */
+  /** Refresh a sender at most once per PIN_REFRESH_INTERVAL_SECONDS (06 step 3), a failed attempt included. */
   async #refresh(aceId: string): Promise<KelState | null> {
     if (this.#o.refreshPeer === undefined) return null;
     const now = this.#now();
@@ -331,13 +334,8 @@ export class Inbox {
     // 06 step 3: a suppressed refresh is a retry, never a drop.
     if (this.#lastRefresh.has(aceId)) throw new ACEError('relay_unavailable', 'sender refresh suppressed; retry later');
     this.#lastRefresh.set(aceId, now);
-    try {
-      await this.#o.refreshPeer(aceId);
-      return await this.#peers.get(aceId);
-    } catch (e) {
-      if (asACEError(e, 'relay_unavailable').isTransient) this.#lastRefresh.delete(aceId);
-      throw e;
-    }
+    await this.#o.refreshPeer(aceId);
+    return this.#peers.get(aceId);
   }
 
   /** A sender outside the admission table: only an `open` identity's contact request; no lookup, no pin. */
@@ -397,6 +395,9 @@ export class Inbox {
   }
 
   async #receipt(packet: Packet, content: PrivateContent, state: KelState): Promise<ReceiveOutcome> {
+    // 9. dedupe like every packet (a duplicate receipt is never answered); then 10. the core rules, hand-over, seen store
+    if (this.#replay.hasSeen(packet.messageId, packet.from)) return { kind: 'duplicate', from: packet.from, messageId: packet.messageId };
+    if (this.#replay.covers(packet.from, packet.timestamp)) return drop(new ACEError('replay_horizon', 'receipt is beyond the replay horizon'));
     let body: ReceiptBody;
     try {
       body = checkReceiptBody(content.body);
@@ -409,6 +410,8 @@ export class Inbox {
     } catch (e) {
       return defer(asACEError(e, 'storage_failed'));
     }
+    this.#replay.commit(packet.messageId, packet.from, packet.timestamp, this.#floor());
+    await this.#bump();
     return { kind: 'receipt', from: packet.from, body };
   }
 
@@ -458,8 +461,8 @@ export class Inbox {
     if (aborted) return this.#reject(packet, aborted);
     await this.#bump();
     // 11. receipt (a transient failure is retried: the re-fetched packet is a duplicate and is answered again)
-    const failed = await this.#sendReceipt(from, { messageId, outcome: 'delivered' });
-    return failed ?? { kind: 'delivered', message };
+    const delivered: ReceiveOutcome = { kind: 'delivered', message };
+    return this.#delivered(await this.#sendReceipt(from, { messageId, outcome: 'delivered' }), delivered);
   }
 
   async #bump(): Promise<void> {
@@ -467,8 +470,15 @@ export class Inbox {
   }
 
   async #duplicate(packet: Packet): Promise<ReceiveOutcome> {
-    return await this.#sendReceipt(packet.from, { messageId: packet.messageId, outcome: 'delivered' })
-      ?? { kind: 'duplicate', from: packet.from, messageId: packet.messageId };
+    const duplicate: ReceiveOutcome = { kind: 'duplicate', from: packet.from, messageId: packet.messageId };
+    return this.#delivered(await this.#sendReceipt(packet.from, { messageId: packet.messageId, outcome: 'delivered' }), duplicate);
+  }
+
+  /** `outcome` after the `delivered` receipt; a deferral of the receipt alone remembers that the message was processed. */
+  #delivered(failed: ReceiveOutcome | undefined, outcome: ReceiveOutcome): ReceiveOutcome {
+    if (failed === undefined) return outcome;
+    RECEIPT_ONLY.set(failed, outcome);
+    return failed;
   }
 
   /** `rejected:<code>`; a rejected message is not added to the seen store. */
@@ -550,6 +560,11 @@ export class Inbox {
       if (attempts < MAX_FETCH_ATTEMPTS) {
         await this.#o.store.write(key, canonicalStateBytes({ attempts, at: wireInt(prior?.at) ?? this.#now() }));
         return out;
+      }
+      const processed = RECEIPT_ONLY.get(out);
+      if (processed !== undefined) {
+        await this.#o.store.delete(key);
+        return processed;
       }
       await this.#quarantine(fp, value, out.error);
       await this.#o.store.delete(key);

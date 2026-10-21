@@ -2,7 +2,12 @@
 
 import { ACEError } from './errors.js';
 import { compareUtf8, isMessageId, isObj, nowOf, wireInt } from './encoding.js';
-import { DEFAULT_REPLAY_CAPACITY, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import { DEFAULT_REPLAY_CAPACITY, OFFLINE_WINDOW_SECONDS } from './limits.js';
+
+/** 06 § Deduplication: the floor `F = now - 2 · OFFLINE_WINDOW_SECONDS` (retries are re-signed for the offline window and may wait that long at the relay). */
+export const SEEN_FLOOR_SECONDS = 2 * OFFLINE_WINDOW_SECONDS;
+const floorAt = (now: number) => Math.max(0, now - SEEN_FLOOR_SECONDS);
+
 /** Canonical replay state: entries `[messageId, sender, timestamp]` sorted by (timestamp, sender, messageId). */
 export interface ReplayState {
   entries: Array<[string, string, number]>;
@@ -68,6 +73,7 @@ function tsArg(v: unknown, what: string): number {
 
 export interface ReplayDetectorOptions {
   capacity?: number;
+  /** Default `F - 1` at the clock: a new store (06 § Deduplication). */
   horizon?: number;
   clock?: () => number;
 }
@@ -105,9 +111,7 @@ export class ReplayDetector {
     this.capacity = capacity;
     this.#quota = Math.max(1, Math.floor(capacity / 16));
     this.#clock = opts.clock;
-    this.#horizon = opts.horizon === undefined
-      ? Math.max(0, nowOf(opts.clock) - TIMESTAMP_WINDOW_SECONDS)
-      : tsArg(opts.horizon, 'horizon');
+    this.#horizon = opts.horizon === undefined ? Math.max(0, floorAt(nowOf(opts.clock)) - 1) : tsArg(opts.horizon, 'horizon');
   }
 
   /** True when `ts` is covered by the global horizon or `sender`'s horizon (beyond the replay horizon). */
@@ -125,10 +129,10 @@ export class ReplayDetector {
     return this.#accepts(messageId, sender, timestamp);
   }
 
-  /** Record a verified message. False if it is a duplicate or covered by a horizon. */
+  /** Record a verified message. False if it is a duplicate or covered by a horizon. `floor` defaults to `F` at the clock. */
   commit(messageId: string, sender: string, timestamp: number, floor?: number): boolean {
     ReplayDetector.#checkArgs(messageId, sender, timestamp);
-    const f = floor === undefined ? Math.max(0, nowOf(this.#clock) - TIMESTAMP_WINDOW_SECONDS) : tsArg(floor, 'floor');
+    const f = floor === undefined ? floorAt(nowOf(this.#clock)) : tsArg(floor, 'floor');
     if (!this.#accepts(messageId, sender, timestamp)) return false;
     this.#insert(timestamp, sender, messageId);
     // 1. floor eviction raises H
@@ -145,6 +149,11 @@ export class ReplayDetector {
     this.#compact();
     this.#compactHeaps();
     return true;
+  }
+
+  /** Internal (tests): the physical lengths of the lazy heaps, stale entries included. */
+  get heapSizes(): { global: number; senders: number; horizons: number } {
+    return { global: this.#global.items.length, senders: this.#senderHeapSize, horizons: this.#shHeap.items.length };
   }
 
   /** Canonical state: entries sorted by (timestamp, sender, messageId), horizons sorted by sender. */

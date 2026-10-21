@@ -167,24 +167,15 @@ describe('security review regressions', () => {
     const id = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, '0')}`;
     detector.commit(id(0), 'review-anchor', 1, 0);
     reference.commit(id(0), 'review-anchor', 1, 0);
-    // Observe actual retained arrays without exposing private detector state in the SDK API.
-    const push = Array.prototype.push;
     let largestHeap = 0;
-    Array.prototype.push = function (...items: unknown[]) {
-      const result = push.apply(this, items);
-      if (items.some((item) => Array.isArray(item) && typeof item[0] === 'number'
-        && typeof item[1] === 'string' && item[1].startsWith('review-'))) largestHeap = Math.max(largestHeap, this.length);
-      return result;
-    };
-    try {
-      for (let n = 1; n <= 20_000; n++) {
-        detector.commit(id(n), 'review-sender', n + 1, 0);
-        reference.commit(id(n), 'review-sender', n + 1, 0);
-        // Rebuilding from canonical state is an independent reference with no stale heap entries.
-        reference = ReplayDetector.fromState(reference.exportState(), { capacity: 16 });
-      }
-    } finally { Array.prototype.push = push; }
-    expect(largestHeap).toBeLessThanOrEqual(65);
+    for (let n = 1; n <= 20_000; n++) {
+      detector.commit(id(n), 'review-sender', n + 1, 0);
+      reference.commit(id(n), 'review-sender', n + 1, 0);
+      // Rebuilding from canonical state is an independent reference with no stale heap entries.
+      reference = ReplayDetector.fromState(reference.exportState(), { capacity: 16 });
+      largestHeap = Math.max(largestHeap, ...Object.values(detector.heapSizes));
+    }
+    expect(largestHeap).toBeLessThanOrEqual(64);
     expect(detector.exportState()).toEqual(reference.exportState());
     expect(detector.accepts(id(1), 'review-sender', 2)).toBe(false);
     expect(detector.hasSeen(id(0), 'review-anchor')).toBe(true);
@@ -192,18 +183,12 @@ describe('security review regressions', () => {
 
   it('bounds sender heaps when floor eviction leaves one live entry without exceeding its quota', () => {
     const detector = new ReplayDetector({ capacity: 32, horizon: 0 });
-    const push = Array.prototype.push;
     let largestHeap = 0;
-    Array.prototype.push = function (...items: unknown[]) {
-      const result = push.apply(this, items);
-      if (items.some((item) => Array.isArray(item) && typeof item[0] === 'number' && typeof item[1] === 'string'
-        && item[1].startsWith('review-id-'))) largestHeap = Math.max(largestHeap, this.length);
-      return result;
-    };
-    try {
-      for (let n = 1; n <= 20_000; n++) detector.commit(`review-id-${n}`, 'sender', n, n);
-    } finally { Array.prototype.push = push; }
-    expect(largestHeap).toBeLessThanOrEqual(65);
+    for (let n = 1; n <= 20_000; n++) {
+      detector.commit(`review-id-${n}`, 'sender', n, n);
+      largestHeap = Math.max(largestHeap, ...Object.values(detector.heapSizes));
+    }
+    expect(largestHeap).toBeLessThanOrEqual(64);
     expect(detector.hasSeen('review-id-20000', 'sender')).toBe(true);
     expect(detector.exportState().entries).toHaveLength(1);
   });
