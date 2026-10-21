@@ -111,7 +111,7 @@ describe('card record over the relay', () => {
     await expect(relay.client().publishCard(await card({ now: clock.t + 2 }))).rejects.toMatchObject({ relayCode: 'invalid_argument' });
     await expect(relay.client().publishCard(await card({ handle: 'alice', now: clock.t + 3 }, mallory))).rejects.toMatchObject({ relayCode: 'handle_taken' });
     await relay.client().publishCard(await card({ handle: 'alice', now: clock.t + 4 }));
-    expect((await relay.client().handle('alice')).card.aceId).toBe(alice.id.getACEId());
+    expect((await relay.client().handle('alice')).aceId).toBe(alice.id.getACEId());
   });
 
   it('a handle lookup is checked against the handle pin too', async () => {
@@ -135,7 +135,7 @@ describe('card record over the relay', () => {
     const mallory = await agent(relay, clock);
     const A = alice.id.getACEId();
     await relay.client().publishCard(await createCardRecord(alice.id, { home: 'https://relay-b.test', contact: 'closed', listed: false, now: clock.t + 1 }));
-    expect((await relay.client().card(A)).card.home).toBe('https://relay-b.test');
+    expect((await relay.client().card(A)).record.home).toBe('https://relay-b.test');
     expect(relay.handles.get('alice')).toBe(A);
     await expect(relay.client().handle('alice')).rejects.toThrow(code('unknown_peer'));
     const taken = await createCardRecord(mallory.id, { home: RELAY, handle: 'alice', contact: 'closed', listed: false, now: clock.t + 2 });

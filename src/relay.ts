@@ -4,7 +4,7 @@ import { ACEError, categoryOf, type ACEErrorCode } from './errors.js';
 import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isHandle, isObj, isStreamId, nowOf, pairKey, parseJSONBytes, parseStateBytes, utf8, wireInt } from './encoding.js';
 import { withLock, type ACEStore } from './store.js';
 import { createAuthHeaders, type AuthHeaders, type RelayAuthRequest } from './auth.js';
-import { verifyCardBundle, type CardBundle } from './card-record.js';
+import { verifyCardBundle, type CardBundle, type VerifiedCard } from './card-record.js';
 import { verifyPublishedAgent, type DeliveryPermit, type PublishedAgent } from './descriptor.js';
 import type { ACEIdentity } from './identity.js';
 import { DEFAULT_PAGE_LIMIT, MAX_INBOX_PAGE, MAX_JSON_DEPTH, MAX_PACKET_BYTES, MAX_PAGE_BYTES } from './limits.js';
@@ -309,25 +309,29 @@ export class RelayClient {
     await this.#request('POST', this.#url('/v1/card'), { body: bundle });
   }
 
-  #card(res: unknown, aceId?: string): CardBundle {
-    return this.#verified(res, (v) => verifyCardBundle(v, nowOf(this.#clock), this.#verify).bundle, (b) => b.card.aceId, 'card record', aceId);
+  /** A served CardBundle, verified under its own KEL (any failure is `relay_protocol_error`). */
+  #card(res: unknown, aceId?: string): VerifiedCard {
+    return this.#verified(res, (v) => verifyCardBundle(v, nowOf(this.#clock), this.#verify), (c) => c.aceId, 'card record', aceId);
   }
 
-  /** `GET /v1/card/{aceId}`: anonymous; the stored card record of a registered identity. */
-  async card(aceId: string): Promise<CardBundle> {
+  /**
+   * `GET /v1/card/{aceId}`: anonymous; the stored card record of a registered identity, verified under the bundle's own
+   * KEL (`kelLive` false: no descriptor confirmed it; `NetworkClient.lookupCard` does).
+   */
+  async card(aceId: string): Promise<VerifiedCard> {
     if (!isACEId(aceId)) throw new ACEError('invalid_argument', 'invalid ACE ID');
     return this.#card(await this.#request('GET', this.#url(`/v1/card/${encodeURIComponent(aceId)}`)), aceId);
   }
 
   /**
-   * `GET /v1/handles/{handle}`: the card record of the identity the handle is bound to at this relay. A record whose
-   * `home` is not this relay or whose `handle` differs is `unknown_peer` (04 § Card record).
+   * `GET /v1/handles/{handle}`: the card record of the identity the handle is bound to at this relay, verified as `card`.
+   * A record whose `home` is not this relay or whose `handle` differs is `unknown_peer` (04 § Card record).
    */
-  async handle(handle: string): Promise<CardBundle> {
+  async handle(handle: string): Promise<VerifiedCard> {
     if (!isHandle(handle)) throw new ACEError('invalid_argument', 'invalid handle');
-    const bundle = this.#card(await this.#request('GET', this.#url(`/v1/handles/${handle}`)));
-    if (bundle.card.home !== this.baseUrl || bundle.card.handle !== handle) throw new ACEError('unknown_peer', 'the record does not hold this handle at this relay');
-    return bundle;
+    const card = this.#card(await this.#request('GET', this.#url(`/v1/handles/${handle}`)));
+    if (card.record.home !== this.baseUrl || card.record.handle !== handle) throw new ACEError('unknown_peer', 'the record does not hold this handle at this relay');
+    return card;
   }
 
   /**

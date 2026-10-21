@@ -501,12 +501,12 @@ export class NetworkClient {
     const m = typeof target === 'string' ? HANDLE_RE.exec(target) : null;
     if (!m || !isHandle(m[1])) throw new ACEError('invalid_argument', 'use an ACE ID or @name@relay-host');
     const relay = m[2] === new URL(this.relay.baseUrl).host ? this.relay : this.#relayFor(`https://${m[2]}`);
-    return { bundle: await relay.handle(m[1]), relay, handle: m[1] };
+    return { bundle: (await relay.handle(m[1])).bundle, relay, handle: m[1] };
   }
 
   /** The peer's card record from the first route that serves it: its cached descriptor's relays, then the home relay. */
   async #fetchCard(aceId: string): Promise<CardBundle> {
-    return firstServed(this.#routesOf(await this.#read<PublishedAgent>(agentKey(aceId))), (route) => this.#relayFor(route).card(aceId));
+    return firstServed(this.#routesOf(await this.#read<PublishedAgent>(agentKey(aceId))), async (route) => (await this.#relayFor(route).card(aceId)).bundle);
   }
 
   /**
