@@ -71,6 +71,9 @@ export class ACEError extends Error {
   get isTransient(): boolean { return this.category !== 'permanent'; }
 }
 
+/** Whether `e` is the `unknown_peer` ACEError (nothing there, as opposed to a failure). */
+export const isUnknownPeer = (e: unknown): boolean => e instanceof ACEError && e.code === 'unknown_peer';
+
 /** `e` as an ACEError; anything else becomes `fallback` (never a permanent code for an unknown failure). */
 export function asACEError(e: unknown, fallback: ACEErrorCode = 'storage_failed'): ACEError {
   return e instanceof ACEError ? e : new ACEError(fallback, e instanceof Error ? e.message.slice(0, 200) : 'unexpected failure', { cause: e });

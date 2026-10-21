@@ -156,13 +156,13 @@ export class FakeRelay {
       // 07 § Descriptors and cards: a handle is set once per identity and never reassigned.
       // A record naming another home claims nothing here (an existing binding stays).
       const bound = this.#handleOf(record.aceId);
-      if (record.home !== this.baseUrl) {
-        // nothing to claim
-      } else if (bound !== undefined) {
-        if (record.handle !== bound) throw new HTTPError(400, 'invalid_argument');
-      } else if (record.handle !== undefined) {
-        if (this.handles.has(record.handle)) throw new HTTPError(409, 'handle_taken');
-        this.handles.set(record.handle, record.aceId);
+      if (record.home === this.baseUrl) {
+        if (bound !== undefined) {
+          if (record.handle !== bound) throw new HTTPError(400, 'invalid_argument');
+        } else if (record.handle !== undefined) {
+          if (this.handles.has(record.handle)) throw new HTTPError(409, 'handle_taken');
+          this.handles.set(record.handle, record.aceId);
+        }
       }
       this.cards.set(record.aceId, body as CardBundle);
       return { ok: true };

@@ -272,17 +272,25 @@ export class RelayClient {
     await this.#request('POST', this.#url('/v1/descriptor'), { body: agent });
   }
 
-  #agent(res: unknown, aceId?: string): PublishedAgent {
-    contained(res); // never a skipped entry: a conformant relay refused it on input
-    let agent: PublishedAgent;
+  /**
+   * A relay response verified by `verify`, of identity `aceId` when given. Any failure is `relay_protocol_error`: a
+   * conformant relay refused the document on input, so serving it is the relay's fault, never a verdict on the peer
+   * (a permanent code would let one bad route end a lookup the next route serves).
+   */
+  #verified<T>(res: unknown, verify: (v: unknown) => T, idOf: (t: T) => string, what: string, aceId?: string): T {
+    contained(res); // never a skipped entry
+    let doc: T;
     try {
-      ({ agent } = verifyPublishedAgent(res, nowOf(this.#clock), this.#verify));
+      doc = verify(res);
     } catch (e) {
-      if (e instanceof ACEError) throw e;
-      throw new ACEError('relay_protocol_error', 'unverifiable descriptor', { cause: e });
+      throw new ACEError('relay_protocol_error', `relay served an invalid ${what}${e instanceof ACEError ? `: ${e.message}` : ''}`, { cause: e });
     }
-    if (aceId !== undefined && agent.descriptor.aceId !== aceId) throw protocolError('descriptor identity mismatch');
-    return agent;
+    if (aceId !== undefined && idOf(doc) !== aceId) throw protocolError(`${what} identity mismatch`);
+    return doc;
+  }
+
+  #agent(res: unknown, aceId?: string): PublishedAgent {
+    return this.#verified(res, (v) => verifyPublishedAgent(v, nowOf(this.#clock), this.#verify).agent, (a) => a.descriptor.aceId, 'descriptor', aceId);
   }
 
   /** `GET /v1/descriptor/{aceId}`: anonymous; the unexpired descriptor of any registered identity. */
@@ -298,16 +306,7 @@ export class RelayClient {
   }
 
   #card(res: unknown, aceId?: string): CardBundle {
-    contained(res);
-    let bundle: CardBundle;
-    try {
-      ({ bundle } = verifyCardBundle(res, nowOf(this.#clock), this.#verify));
-    } catch (e) {
-      if (e instanceof ACEError) throw e;
-      throw new ACEError('relay_protocol_error', 'unverifiable card record', { cause: e });
-    }
-    if (aceId !== undefined && bundle.card.aceId !== aceId) throw protocolError('card record identity mismatch');
-    return bundle;
+    return this.#verified(res, (v) => verifyCardBundle(v, nowOf(this.#clock), this.#verify).bundle, (b) => b.card.aceId, 'card record', aceId);
   }
 
   /** `GET /v1/card/{aceId}`: anonymous; the stored card record of a registered identity. */

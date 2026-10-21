@@ -41,7 +41,7 @@ Spec: `ace-spec` chapters 00–08 (packet version `"1"`). Every signature is ML-
 - **Glue** — `NetworkClient.open(config)`: the store (an `ACEStore` or a directory), the home relay (`relayUrl` or a
   `RelayClient`), installed profiles (names or manifests; `'commerce'` adds `commerceRules` and `client.threads`) and a
   `MessageLog` (`client.messages`: indexed unread cap, ack, filters). Methods: `publish({force})` (registers on
-  demand), `discover`, `importAgent`, `lookup`, `agent`, `connect`, `requests`, `accept`, `reject`, `block`, `unblock`,
+  demand), `discover`, `importAgent`, `lookup`, `lookupWithCard`, `agent`, `connect`, `requests`, `accept`, `reject`, `block`, `unblock`,
   `createInvitation`, `importInvitation`, `send`, `flush`, `pull`, `follow`, `maintain`, `setWake`, `clearWake` (07 § Wake
   hints), `close`; the `onReceipt` hook
   sees each receipt with its settled Outbox entry. `receive: false` opens a send-only client.

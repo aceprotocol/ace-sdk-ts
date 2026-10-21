@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { MemoryStore, NetworkClient, ProfileSet, createDelegationCredential, createInvitation, verifyInvitation, verifyKel, MAX_PERMIT_LIFETIME } from './sdk.js';
-import { Clock, FakeRelay, agent, identity } from './helpers.js';
+import { ACEError, MemoryStore, NetworkClient, ProfileSet, createDelegationCredential, createDescriptor, createInvitation, verifyInvitation, verifyKel, MAX_PERMIT_LIFETIME } from './sdk.js';
+import { Clock, FakeRelay, RELAY, agent, identity } from './helpers.js';
 
 describe('NetworkClient', () => {
   it('contact flow, delivery with receipts, permit renewal through receipts', async () => {
@@ -248,5 +248,56 @@ describe('NetworkClient', () => {
     // Malformed gateways and tokens are covered by the vectors (auth.wake.invalid).
     relay.inject.push({ path: '/v1/wake', status: 404, code: 'not_found' });
     await expect(alice.client.setWake('https://push.example/ace', 'w'.repeat(32))).rejects.toMatchObject({ code: 'relay_rejected', relayCode: 'not_found' });
+  });
+
+  describe('descriptor routes', () => {
+    const B = 'https://relay-b.test';
+    const setup = async () => {
+      const clock = new Clock();
+      const relay = new FakeRelay(clock.now), relayB = new FakeRelay(clock.now, B);
+      const alice = await agent(relay, clock);
+      const { prekey, profiles } = relay.descriptors.get(alice.id.getACEId())!.descriptor;
+      const descriptor = (relays: string[], ttl?: number) => {
+        clock.advance(1);
+        return createDescriptor(alice.id, { relays, prekey, profiles, now: clock.t, ...(ttl !== undefined ? { ttl } : {}) });
+      };
+      const paths: string[] = [];
+      const fetch = relay.fetch;
+      relay.fetch = (input, init) => { paths.push(new URL(String(input)).pathname); return fetch(input, init); };
+      const bob = await agent(relay, clock, {
+        foreignRelay: (url) => { if (url !== B) throw new ACEError('blocked_address', url); return relayB.client(); },
+      });
+      return { clock, relay, relayB, alice, A: alice.id.getACEId(), descriptor, paths, bob };
+    };
+
+    it('every route is tried: one replaying an older descriptor never blocks a lookup the next route serves', async () => {
+      const { clock, relay, relayB, alice, A, descriptor, bob } = await setup();
+      // Relay B keeps serving an older revision; the home relay serves the newest.
+      const old = await descriptor([B, RELAY]);
+      await relayB.client().register(alice.id);
+      await relayB.client().publishDescriptor(old);
+      const held = await descriptor([B, RELAY], 60);
+      const newest = await descriptor([RELAY]);
+      await relay.client().publishDescriptor(newest);
+      await bob.client.importAgent(held);
+      clock.advance(120); // the held one expired: refreshed from its routes, relay B first (stale_peer_binding there)
+      expect(await bob.client.agent(A)).toEqual(newest);
+    });
+
+    it('a cached descriptor no longer bound to the pin is refreshed from its relays and the home relay; a bound one from its relays alone', async () => {
+      const { clock, alice, A, descriptor, paths, bob } = await setup();
+      await bob.client.importAgent(await descriptor([B]));
+      paths.length = 0;
+      const asked = () => paths.filter((p) => p.startsWith('/v1/descriptor/'));
+      // Bound: a refresh asks its relays alone (relay B does not serve it), never the home relay.
+      await expect(bob.client.agent(A, { refresh: true })).rejects.toMatchObject({ code: 'unknown_peer' });
+      expect(asked()).toEqual([]);
+      // Alice's key moves on: the cached descriptor was signed under a superseded key, so the home relay is asked too.
+      await alice.id.delegate({ now: clock.t });
+      await bob.client.peers.adopt(alice.id.getKel());
+      const current = await alice.client.publish();
+      expect(await bob.client.agent(A)).toEqual(current);
+      expect(asked()).toHaveLength(1);
+    });
   });
 });

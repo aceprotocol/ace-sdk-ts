@@ -276,11 +276,8 @@ export const AGENT_TOOLS: AgentTool[] = [
           return result({ agents: await Promise.all(page.agents.map((a) => agentView(client, a))), cursor: page.cursor }, under('agents[]', AGENT_UNTRUSTED));
         }
         case 'lookup': {
-          const agent = await client.lookup(need(args.peer as string | undefined, 'peer'));
-          const card = await client.lookupCard(agent.descriptor.aceId).then(cardView, (e) => {
-            if (e instanceof ACEError && e.code === 'unknown_peer') return undefined; // no card record: closed, unlisted
-            throw e;
-          });
+          const found = await client.lookupWithCard(need(args.peer as string | undefined, 'peer'));
+          const agent = found.agent, card = found.card && cardView(found.card);
           return result({ agent: await agentView(client, agent), ...(card ? { card } : {}) }, [...under('agent', AGENT_UNTRUSTED), ...(card ? ['card'] : [])]);
         }
         case 'import': return result({ agent: await agentView(client, await client.importAgent(need(args.source, 'source'))) }, under('agent', AGENT_UNTRUSTED));

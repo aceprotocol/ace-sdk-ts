@@ -184,10 +184,10 @@ describe('card record over the relay', () => {
       await expect(bob.client.lookupCard(target)).rejects.toThrow(code('stale_descriptor'));
       relay.cards.set(A, v.bundle);
     }
-    // Any other descriptor failure (here a tampered one) still fails the lookup, pinning nothing.
+    // Any other descriptor failure (here a tampered one: the relay's fault) still fails the lookup, pinning nothing.
     const carol = await agent(relay, clock);
     relay.descriptors.set(A, { ...relay.descriptors.get(A)!, descriptor: { ...relay.descriptors.get(A)!.descriptor, expiresAt: clock.t + 3600 } });
-    await expect(carol.client.lookupCard(A)).rejects.toThrow(code('invalid_authorization'));
+    await expect(carol.client.lookupCard(A)).rejects.toThrow(code('relay_protocol_error'));
     expect(await carol.client.peers.get(A)).toBeNull();
   });
 
@@ -199,6 +199,59 @@ describe('card record over the relay', () => {
     expect((await bob.client.lookupCard(alice.id.getACEId())).kelLive).toBe(true);
     const carol = await agent(relay, clock);
     expect((await carol.client.lookupCard('@alice@relay.test')).kelLive).toBe(true);
+  });
+
+  it('a handle lookup reuses the card record it resolved through', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const paths: string[] = [];
+    const fetch = relay.fetch;
+    relay.fetch = (input, init) => { paths.push(new URL(String(input)).pathname); return fetch(input, init); };
+    const bob = await agent(relay, clock);
+    paths.length = 0;
+    const found = await bob.client.lookupWithCard('@alice@relay.test');
+    expect(found.card?.record.contact).toBe('open');
+    expect(found.card?.kelLive).toBe(true);
+    await bob.client.connect('@alice@relay.test', { profile: 'ace:text:1' });
+    expect(paths.filter((p) => p.startsWith('/v1/card/'))).toEqual([]);
+    expect(paths.filter((p) => p.startsWith('/v1/handles/'))).toHaveLength(2);
+    // By ACE ID, the card record is looked up after the descriptor.
+    expect((await bob.client.lookupWithCard(alice.id.getACEId())).card?.record.handle).toBe('alice');
+  });
+
+  it('a relay serving an unverifiable document is relay_protocol_error, never a verdict on the peer', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open', handle: 'alice' });
+    const A = alice.id.getACEId();
+    const card = relay.cards.get(A)!;
+    relay.cards.set(A, { ...card, card: { ...card.card, listed: true } }); // signature no longer verifies
+    await expect(relay.client().card(A)).rejects.toThrow(code('relay_protocol_error'));
+    await expect(relay.client().handle('alice')).rejects.toThrow(code('relay_protocol_error'));
+  });
+
+  it('accepting a request whose source expired pins its KEL as not confirmed live until a descriptor confirms it', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { contact: 'open' });
+    const bob = await agent(relay, clock);
+    const B = bob.id.getACEId();
+    clock.t = (await bob.client.publish()).descriptor.expiresAt - 3601;
+    await bob.client.connect(alice.id.getACEId(), { profile: 'ace:text:1' });
+    await alice.client.pull();
+    expect((await alice.client.requests()).map((r) => r.from)).toEqual([B]);
+    // Bob goes offline past his descriptor's lifetime: the held request outlives its source.
+    clock.advance(7200);
+    relay.descriptors.delete(B);
+    await expect(alice.client.accept(B)).rejects.toThrow(code('unknown_peer'));
+    expect(await alice.client.peers.get(B)).not.toBeNull();
+    expect((await alice.client.lookupCard(B)).kelLive).toBe(false);
+    // Bob republishes: the next card lookup sees a live descriptor and confirms the pin, durably.
+    await bob.client.publish();
+    expect((await alice.client.lookupCard(B)).kelLive).toBe(true);
+    relay.descriptors.delete(B);
+    expect((await alice.client.lookupCard(B)).kelLive).toBe(true);
   });
 
   it('unparseable pin is storage_failed', async () => {

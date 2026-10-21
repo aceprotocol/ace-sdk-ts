@@ -23,7 +23,8 @@ import { isMessageType, type JSONObject } from './types.js';
 
 // --- shared ------------------------------------------------------------------------------------
 
-function claimsOf<T extends { signature?: unknown }>(doc: T): Omit<T, 'signature'> {
+/** `doc` without its `signature`: the bytes a signature and a digest cover. */
+export function claimsOf<T extends { signature?: unknown }>(doc: T): Omit<T, 'signature'> {
   const { signature: _s, ...claims } = doc;
   return claims;
 }

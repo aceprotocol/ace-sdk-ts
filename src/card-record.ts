@@ -3,7 +3,7 @@
  * whether strangers may request contact and whether it is listed — published as the closed CardBundle `{kel, card}`
  * and signed with action `card-record` over `canonicalStateBytes(claims)`. It has no expiry.
  */
-import { validateCard, validateNetworkRelay, type AgentCard, type VerifyOptions } from './descriptor.js';
+import { claimsOf, validateCard, validateNetworkRelay, type AgentCard, type VerifyOptions } from './descriptor.js';
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isCaip10, isHandle, nowOf, wireInt } from './encoding.js';
 import { signClaims, type ACEIdentity } from './identity.js';
@@ -43,9 +43,7 @@ const R_REQUIRED = ['aceId', 'issuedAt', 'home', 'card', 'contact', 'listed', 's
 const R_OPTIONAL = ['handle', 'pay'];
 
 /** A CAIP-10 account id (`namespace:reference:address`). */
-export function isCaip10Account(s: string): boolean {
-  return isCaip10(s);
-}
+export const isCaip10Account: (s: unknown) => s is string = isCaip10;
 
 /** Create and sign this identity's CardBundle (verified before it is returned). */
 export async function createCardRecord(identity: ACEIdentity, o: {
@@ -79,8 +77,10 @@ export function verifyCardBundle(value: unknown, now: number = nowOf(), o: Verif
   const issuedAt = wireInt(r.issuedAt);
   if (issuedAt === null || issuedAt > now + TIMESTAMP_WINDOW_SECONDS) throw bad('invalid card record issuedAt');
   validateNetworkRelay(r.home, o);
-  if (r.handle !== undefined && !isHandle(r.handle)) throw bad('handle must match [a-z][a-z0-9_-]{2,31}');
-  if (r.handle !== undefined && new URL(r.home as string).pathname !== '/') throw bad('a handle needs a home without a path (it resolves at https://host)');
+  if (r.handle !== undefined) {
+    if (!isHandle(r.handle)) throw bad('handle must match [a-z][a-z0-9_-]{2,31}');
+    if (new URL(r.home as string).pathname !== '/') throw bad('a handle needs a home without a path (it resolves at https://host)');
+  }
   validateCard(r.card);
   if (r.pay !== undefined && (!Array.isArray(r.pay) || r.pay.length < 1 || r.pay.length > MAX_PAY_ACCOUNTS
     || new Set(r.pay).size !== r.pay.length || !r.pay.every(isCaip10))) {
@@ -92,8 +92,7 @@ export function verifyCardBundle(value: unknown, now: number = nowOf(), o: Verif
   if (!isUsable(state, now)) throw new ACEError('invalid_kel', 'identity has no live signing delegation');
   if (state.aceId !== r.aceId) throw bad('kel does not derive aceId');
   if (o.pinned) state = reconcileKel(o.pinned, state).state;
-  const { signature, ...claims } = r;
-  verifyOperationalSignature(state, 'card-record', issuedAt, canonicalStateBytes(claims), signature, now, 'invalid_authorization');
+  verifyOperationalSignature(state, 'card-record', issuedAt, canonicalStateBytes(claimsOf(r)), r.signature, now, 'invalid_authorization');
   const bundle = structuredClone(value) as unknown as CardBundle;
   return { aceId: r.aceId, kelState: state, record: bundle.card, bundle, kelLive: false };
 }
