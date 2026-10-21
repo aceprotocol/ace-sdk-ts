@@ -1,7 +1,7 @@
 /** Key event log: inception, rotation, delegation. ACE ID = SHA-256 of the inception bytes. */
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { ACEError, type ACEErrorCode } from './errors.js';
-import { canonicalStateBytes, closedKeys, concat, decimal, decodeB64, isHex64, isObj, sha256Hex, toBase64, utf8, wireInt } from './encoding.js';
+import { bytesEqual, canonicalStateBytes, closedKeys, concat, decimal, decodeB64, isHex64, isObj, sha256Hex, toBase64, utf8, wireInt } from './encoding.js';
 import { MAX_KEL_EVENTS, MAX_SIGNING_KEY_LIFETIME, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { type KeyProvider, keyDigestHex } from './keys.js';
 import { decodeSignature, encodePayload, isValidSigningPublicKey, signingMessage, verifySignature } from './signing.js';
@@ -93,9 +93,15 @@ export async function createRotation(state: KelState, newRoot: KeyProvider, next
   return ev;
 }
 
-/** `dlg` delegating an `ml-dsa-65` signing key (the only delegated role). */
+/**
+ * `dlg` delegating an `ml-dsa-65` signing key (the only delegated role). The signer refuses a key equal to the current
+ * root or committed as the next root (01 § Rotation and recovery): a verifier cannot detect that reuse.
+ */
 export async function createDelegation(state: KelState, root: KeyProvider, keyPublic: Uint8Array, ts: number, notAfter?: number): Promise<KelEvent> {
   if (notAfter !== undefined && !(ts < notAfter && notAfter <= ts + MAX_SIGNING_KEY_LIFETIME)) throw bad('notAfter must be in (ts, ts + 31622400]');
+  if (bytesEqual(keyPublic, state.rootPublicKey) || keyDigestHex('ml-dsa-65', keyPublic) === state.next) {
+    throw new ACEError('invalid_argument', 'the signing key must differ from the current and the next root');
+  }
   const ev: KelEvent = { t: 'dlg', seq: state.seq + 1, ts, prev: state.lastHash, key: { scheme: 'ml-dsa-65', publicKey: toBase64(keyPublic) } };
   if (notAfter !== undefined) ev.notAfter = notAfter;
   const eb = eventBytes(ev);
@@ -104,42 +110,68 @@ export async function createDelegation(state: KelState, root: KeyProvider, keyPu
 }
 
 const VERIFIED_CACHE_SIZE = 256;
-const verified = new Map<string, { state: KelState; lastTs: number }>();
+/** The cache's budget in canonical log bytes: 256 maximal logs would hold far more than a process should keep. */
+const VERIFIED_CACHE_BYTES = 16 * 1024 * 1024;
+const verified = new Map<string, { state: KelState; lastTs: number; bytes: number }>();
+let verifiedBytes = 0;
+
+/** Internal (tests): the cache's entry count and canonical log bytes. */
+export function verifiedCacheUsage(): { entries: number; bytes: number } {
+  return { entries: verified.size, bytes: verifiedBytes };
+}
 
 /**
  * Chained content keys: `key[i]` is the SHA-256 over `key[i-1]` and the canonical JSON of event `i` (its `sig`
- * included), so it identifies the exact prefix `events[0..i]`. Null for a value that is not a bounded JSON array.
+ * included), so it identifies the exact prefix `events[0..i]`; `bytes` is the log's canonical size. Null for a value
+ * that is not a bounded JSON array.
  */
-function prefixKeys(events: unknown): string[] | null {
+function prefixKeys(events: unknown): { keys: string[]; bytes: number } | null {
   if (!Array.isArray(events) || events.length === 0 || events.length > MAX_KEL_EVENTS) return null;
   const keys: string[] = [];
+  let bytes = 0;
   try {
-    for (const ev of events) keys.push(sha256Hex(concat([utf8(keys.at(-1) ?? ''), canonicalStateBytes(ev)])));
+    for (const ev of events) {
+      const b = canonicalStateBytes(ev);
+      bytes += b.length;
+      keys.push(sha256Hex(concat([utf8(keys.at(-1) ?? ''), b])));
+    }
   } catch {
     return null;
   }
-  return keys;
+  return { keys, bytes };
+}
+
+/** Cache a verified log usable at `now` (an unusable one is never a pin), evicting the oldest past either bound. */
+function remember(key: string, state: KelState, bytes: number, now: number): void {
+  if (!isUsable(state, now) || bytes > VERIFIED_CACHE_BYTES || verified.has(key)) return;
+  verified.set(key, { state: structuredClone(state), lastTs: wireInt(state.events[state.events.length - 1].ts) ?? 0, bytes });
+  verifiedBytes += bytes;
+  for (const [k, v] of verified) {
+    if (verified.size <= VERIFIED_CACHE_SIZE && verifiedBytes <= VERIFIED_CACHE_BYTES) break;
+    verified.delete(k);
+    verifiedBytes -= v.bytes;
+  }
 }
 
 /**
  * Verify a KEL at `now` (01 § Verifier rules). Verified states are cached by their prefix key (05 § Receiver
  * admission): verification is a pure function of the log and `now`, and only the future bound
  * `ts <= now + TIMESTAMP_WINDOW_SECONDS` depends on `now`, so a hit re-checks that bound alone. A log extending a cached
- * one (e.g. a pin plus new events) re-checks the whole structure but verifies only the new events' signatures.
+ * one (e.g. a pin plus new events) re-checks the whole structure but verifies only the new events' signatures. Only a
+ * log usable at `now` is cached, within VERIFIED_CACHE_SIZE entries and VERIFIED_CACHE_BYTES (a stranger's junk logs
+ * cannot crowd out the pins or hold unbounded memory).
  */
 export function verifyKel(events: unknown, now: number): KelState {
-  const keys = prefixKeys(events);
+  const prefix = prefixKeys(events);
   let resume: KelState | undefined;
-  if (keys !== null) {
+  if (prefix !== null) {
+    const { keys } = prefix;
     const hit = verified.get(keys[keys.length - 1]);
     if (hit !== undefined && hit.lastTs <= now + TIMESTAMP_WINDOW_SECONDS) return structuredClone(hit.state);
     for (let i = keys.length - 2; i >= 0 && resume === undefined; i--) resume = verified.get(keys[i])?.state;
   }
   const state = verifyKelUncached(events, now, resume);
-  if (keys !== null) {
-    if (verified.size >= VERIFIED_CACHE_SIZE) verified.delete(verified.keys().next().value as string);
-    verified.set(keys[keys.length - 1], { state: structuredClone(state), lastTs: wireInt(state.events[state.events.length - 1].ts) ?? 0 });
-  }
+  if (prefix !== null) remember(prefix.keys[prefix.keys.length - 1], state, prefix.bytes, now);
   return state;
 }
 

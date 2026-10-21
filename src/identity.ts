@@ -39,20 +39,18 @@ function checkNextDigest(nextRootDigest: Uint8Array | null | undefined): Uint8Ar
 
 /**
  * The next root to commit (generated, or none held when `nextRootDigest` is given) and its digest. `current` is the
- * root after the event and `events` the (verified) log before it: committing any current or past root, each possibly
- * exposed, would let that key rotate (pre-rotation).
+ * root after the event and `events` the (verified) log before it: committing any current or past root or delegated
+ * signing key, each possibly exposed, would let that key rotate (01 § Rotation and recovery: a signer-side refusal).
  */
 function newNextRoot(nextRootDigest: Uint8Array | undefined, current: SoftwareKey, events: readonly KelEvent[]): { key: SoftwareKey | null; digest: Uint8Array } {
   const key = nextRootDigest === undefined ? generateSoftwareKey() : null;
   const digest = key === null ? Uint8Array.from(nextRootDigest!) : keyDigest(key.scheme, key.publicKey());
   const roots = new Set([keyDigestHex(current.scheme, current.publicKey())]);
-  for (const ev of events) {   // icp and every rot reveal a root
-    if ((ev.t === 'icp' || ev.t === 'rot') && isObj(ev.root)) {
-      const r = ev.root;
-      roots.add(keyDigestHex(String(r.scheme), decodeB64(r.publicKey, 'invalid_kel', 'root.publicKey')));
-    }
+  for (const ev of events) {   // icp and every rot reveal a root, every dlg a signing key
+    const k = ev.t === 'dlg' ? ev.key : ev.root;
+    if (isObj(k)) roots.add(keyDigestHex(String(k.scheme), decodeB64(k.publicKey, 'invalid_kel', 'publicKey')));
   }
-  if (roots.has(bytesToHex(digest))) throw new ACEError('invalid_argument', 'the next root must differ from every current or past root');
+  if (roots.has(bytesToHex(digest))) throw new ACEError('invalid_argument', 'the next root must differ from every key the log has revealed');
   return { key, digest };
 }
 
@@ -151,7 +149,7 @@ export class SoftwareIdentity implements ACEIdentity {
     const ts = Math.max(nowTs, events[start].ts as number);
     const state = verifyKel(events, ts);
     checkCommitted(nextRoot, state);
-    const { key: newNext, digest } = newNextRoot(next, nextRoot, events);
+    const { key: newNext, digest } = newNextRoot(next, nextRoot, full.events);
     const signing = generateSoftwareKey();
     events.push(await createRotation(state, nextRoot, digest, ts));
     events.push(await createDelegation(verifyKel(events, ts), nextRoot, signing.publicKey(), ts));

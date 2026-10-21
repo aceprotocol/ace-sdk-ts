@@ -4,10 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  FileStore, MemoryStore, relayErrorFor, validateNetworkRelay,
+  FileStore, MemoryStore, SoftwareIdentity, SoftwareKey, canonicalStateBytes, createDelegation, generateSoftwareKey, keyDigest, relayErrorFor,
+  validateNetworkRelay, verifiedCacheUsage, verifyCardBundle, verifyKel, verifyPublishedAgent,
 } from './sdk.js';
+import { Clock, FakeRelay, NOW, agent, stateOf } from './helpers.js';
 
 const code = (c: string) => expect.objectContaining({ code: c });
+const rootOf = (id: SoftwareIdentity) => new SoftwareKey(Buffer.from(id.exportPrivateKey().rootSeed, 'base64'));
 
 describe('C1: relay URL host grammar (02 § Relay URLs)', () => {
   it.each(['https://[::1]', 'https://a..b', 'https://-a.example', 'https://a-.example', 'https://example.com.'])('%s is not a canonical relay URL', (url) => {
@@ -27,6 +30,63 @@ describe('C4: relay error strings', () => {
     expect(e.message).toBe('relay_rejected: HTTP 400 badcode: lineFORGED entry');
     expect(e.message).not.toMatch(/\p{Cc}/u);
   });
+});
+
+describe('C6: signer refusals (01 § Rotation and recovery)', () => {
+  it('a next root committing to a revealed signing key is refused', async () => {
+    const id = await SoftwareIdentity.generate({ now: NOW });
+    const signing = keyDigest('ml-dsa-65', id.getSigningPublicKey());
+    await expect(id.rotate({ now: NOW, nextRootDigest: signing })).rejects.toThrow(code('invalid_argument'));
+    expect(id.getKel()).toHaveLength(2);
+  });
+
+  it('a dlg key equal to the current root is refused', async () => {
+    const id = await SoftwareIdentity.generate({ now: NOW });
+    const root = rootOf(id);
+    await expect(createDelegation(stateOf(id), root, root.publicKey(), NOW)).rejects.toThrow(code('invalid_argument'));
+  });
+
+  it('a dlg key committed as the next root is refused', async () => {
+    const next = generateSoftwareKey();
+    const id = await SoftwareIdentity.generate({ now: NOW, nextRootDigest: keyDigest(next.scheme, next.publicKey()) });
+    await expect(createDelegation(stateOf(id), rootOf(id), next.publicKey(), NOW)).rejects.toThrow(code('invalid_argument'));
+  });
+});
+
+describe('C7: shape before KEL work (04 § Verification, § Card record)', () => {
+  it('a malformed signature or delegation entry is invalid_authorization even when the KEL is invalid too', async () => {
+    const clock = new Clock(), relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { handle: 'alice' });
+    const published = await alice.client.publish();
+    const d = published.descriptor, short = { ...d.signature, value: 'AAAA' };
+    expect(() => verifyPublishedAgent({ kel: [], descriptor: { ...d, signature: short } }, clock.t)).toThrow(code('invalid_authorization'));
+    expect(() => verifyPublishedAgent({ kel: [], descriptor: { ...d, delegations: [{ kel: [] }] } }, clock.t)).toThrow(code('invalid_authorization'));
+    const card = relay.cards.get(alice.id.getACEId())!;
+    expect(() => verifyCardBundle({ kel: [], card: { ...card.card, signature: { ...card.card.signature, value: 'AAAA' } } }, clock.t))
+      .toThrow(code('invalid_authorization'));
+  });
+});
+
+describe('C10: verified-KEL cache', () => {
+  it('never caches an unusable log', async () => {
+    const id = await SoftwareIdentity.generate({ now: NOW });
+    const before = verifiedCacheUsage();
+    verifyKel(id.getKel().slice(0, 1), NOW); // icp only: no signing delegation
+    expect(verifiedCacheUsage()).toEqual(before);
+  });
+
+  it('holds at most 16 MiB of logs', async () => {
+    const id = await SoftwareIdentity.generate({ now: NOW });
+    for (let i = 0; i < 90; i++) await id.delegate({ now: NOW });
+    const kel = id.getKel();
+    let total = 0;
+    for (let n = 2; n <= kel.length; n++) {
+      verifyKel(kel.slice(0, n), NOW);
+      total += kel.slice(0, n).reduce((sum, ev) => sum + canonicalStateBytes(ev).length, 0);
+    }
+    expect(total).toBeGreaterThan(16 * 1024 * 1024);
+    expect(verifiedCacheUsage().bytes).toBeLessThanOrEqual(16 * 1024 * 1024);
+  }, 60_000); // 90 root signatures
 });
 
 describe('C11: list prefixes are validated like keys', () => {

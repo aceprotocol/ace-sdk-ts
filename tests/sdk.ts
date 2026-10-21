@@ -3,7 +3,7 @@ export * from '../src/index.js';
 export { categoryOf } from '../src/errors.js';
 export { isCaip10, isStreamId } from '../src/encoding.js';
 export { checkUsable, signOperational } from '../src/identity.js';
-export { computeACEId, createDelegation, createInception, createRotation, eventBytes, isUsable } from '../src/kel.js';
+export { computeACEId, createDelegation, createInception, createRotation, eventBytes, isUsable, verifiedCacheUsage } from '../src/kel.js';
 export { decodePrekey, prekeyId } from '../src/prekey.js';
 export { decodePrivateContent, encodePrivateContent } from '../src/packet.js';
 export { checkStrangerSource, validateNetworkRelay } from '../src/descriptor.js';

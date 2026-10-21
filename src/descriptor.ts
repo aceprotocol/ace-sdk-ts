@@ -10,7 +10,9 @@ import {
   isHttpsUrl, isObj, nowOf, parseJSONBytes, sha256Hex, utf8, wireInt,
 } from './encoding.js';
 import { signClaims, type ACEIdentity } from './identity.js';
-import { isUsable, lastEventHash, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature } from './kel.js';
+import {
+  checkSignatureShape, isUsable, lastEventHash, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature,
+} from './kel.js';
 import {
   DEFAULT_DESCRIPTOR_LIFETIME, MAX_DELEGATION_LIFETIME, MAX_DESCRIPTOR_DELEGATIONS, MAX_DESCRIPTOR_ERC8004, MAX_DESCRIPTOR_LIFETIME, MAX_DESCRIPTOR_PROFILES,
   MAX_DESCRIPTOR_RELAYS, MAX_EXT_BYTES, MAX_PERMIT_LIFETIME, MAX_PUBLISHED_AGENT_BYTES, MAX_STRANGER_DELEGATIONS, MAX_STRANGER_KEL_EVENTS,
@@ -264,8 +266,8 @@ const D_REQUIRED = ['aceId', 'issuedAt', 'expiresAt', 'relays', 'prekey', 'profi
 const D_OPTIONAL = ['ext', 'delegations', 'erc8004'];
 
 /**
- * Verify a PublishedAgent at `now`, in order: shape including `ext`, `delegations` and `erc8004`
- * (`invalid_authorization`); KEL usable at `now` (`invalid_kel` / `invalid_signature`) naming `aceId`
+ * Verify a PublishedAgent at `now`, in order: shape including `ext`, `delegations` (`{kel, credential}` entries) and
+ * `erc8004` and the signature's (its value of the scheme's length) (`invalid_authorization`); KEL usable at `now` (`invalid_kel` / `invalid_signature`) naming `aceId`
  * (`invalid_authorization`); the signature as an operational signature of the KEL reconciled with `o.pinned`
  * (`stale_peer_binding` / `invalid_authorization`); each delegation (an entry that only expired is dropped from
  * `delegations`).
@@ -277,6 +279,7 @@ export function verifyPublishedAgent(value: unknown, now: number = nowOf(), o: V
   if (canonicalStateBytes(value).length > MAX_PUBLISHED_AGENT_BYTES) throw bad(`published agent exceeds ${MAX_PUBLISHED_AGENT_BYTES} bytes`);
   const d = value.descriptor;
   if (!closedKeys(d, D_REQUIRED, D_OPTIONAL) || !isACEId(d.aceId)) throw bad('invalid descriptor shape');
+  checkSignatureShape(d.signature, 'invalid_authorization');
   lifetime(d, now, MAX_DESCRIPTOR_LIFETIME, 'descriptor');
   if (!Array.isArray(d.relays) || d.relays.length < 1 || d.relays.length > MAX_DESCRIPTOR_RELAYS || new Set(d.relays).size !== d.relays.length) throw bad('relays must be 1-4 distinct URLs');
   d.relays.forEach((r) => validateNetworkRelay(r, o));
@@ -292,6 +295,7 @@ export function verifyPublishedAgent(value: unknown, now: number = nowOf(), o: V
   }
   if (d.delegations !== undefined) {
     if (!Array.isArray(d.delegations) || d.delegations.length < 1 || d.delegations.length > MAX_DESCRIPTOR_DELEGATIONS) throw bad('delegations must hold 1-4 entries');
+    if (!d.delegations.every((e) => closedKeys(e, ['kel', 'credential']))) throw bad('delegations must be {kel, credential}');
     const issuers = d.delegations.map(issuerOf);
     if (new Set(issuers).size !== issuers.length) throw bad('delegation issuers must be distinct');
   }

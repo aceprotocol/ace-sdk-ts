@@ -7,7 +7,9 @@ import { claimsOf, validateCard, validateNetworkRelay, type AgentCard, type Veri
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isCaip10, isHandle, nowOf, wireInt } from './encoding.js';
 import { signClaims, type ACEIdentity } from './identity.js';
-import { isUsable, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature } from './kel.js';
+import {
+  checkSignatureShape, isUsable, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature,
+} from './kel.js';
 import { MAX_CARD_RECORD_BYTES, MAX_PAY_ACCOUNTS, MAX_PUBLISHED_AGENT_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 
 /** Whether strangers' contact requests are processed (05 § Flow). No card record means `closed`. */
@@ -61,8 +63,8 @@ export async function createCardRecord(identity: ACEIdentity, o: {
 }
 
 /**
- * Verify a CardBundle at `now`, in order (04 § Card record): shape, both size bounds and field rules
- * (`invalid_authorization`); KEL usable at `now` (`invalid_kel` / `invalid_signature`) naming `aceId`
+ * Verify a CardBundle at `now`, in order (04 § Card record): shape (the signature's included), both size bounds and
+ * field rules (`invalid_authorization`); KEL usable at `now` (`invalid_kel` / `invalid_signature`) naming `aceId`
  * (`invalid_authorization`); the signature as an operational signature of the KEL reconciled with `o.pinned`
  * (`stale_peer_binding` / `invalid_authorization`). No expiry check.
  */
@@ -73,6 +75,7 @@ export function verifyCardBundle(value: unknown, now: number = nowOf(), o: Verif
   if (canonicalStateBytes(value).length > MAX_PUBLISHED_AGENT_BYTES) throw bad(`card bundle exceeds ${MAX_PUBLISHED_AGENT_BYTES} bytes`);
   const r = value.card;
   if (!closedKeys(r, R_REQUIRED, R_OPTIONAL) || !isACEId(r.aceId)) throw bad('invalid card record shape');
+  checkSignatureShape(r.signature, 'invalid_authorization');
   if (canonicalStateBytes(r).length > MAX_CARD_RECORD_BYTES) throw bad(`card record exceeds ${MAX_CARD_RECORD_BYTES} bytes`);
   const issuedAt = wireInt(r.issuedAt);
   if (issuedAt === null || issuedAt > now + TIMESTAMP_WINDOW_SECONDS) throw bad('invalid card record issuedAt');
