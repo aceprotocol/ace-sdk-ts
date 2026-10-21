@@ -1,6 +1,6 @@
 {
   "name": "@ace-protocol/sdk",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "ACE Protocol SDK: post-quantum agent identity, prekey-encrypted packets and profile-based interaction vocabularies",
   "type": "module",
   "main": "dist/index.js",
