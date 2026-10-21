@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
-  ACEError, FileStore, MemoryStore, OFFLINE_WINDOW_SECONDS, ReplayDetector, SoftwareIdentity, SoftwareKey, canonicalStateBytes, createDelegation,
-  generateSoftwareKey, keyDigest, receiptContent, relayErrorFor, validateNetworkRelay, verifiedCacheUsage, verifyCardBundle, verifyKel,
-  verifyPublishedAgent,
+  ACEError, AdmissionBook, FileStore, MemoryStore, OFFLINE_WINDOW_SECONDS, ReplayDetector, SoftwareIdentity, SoftwareKey, canonicalStateBytes,
+  createDelegation, createPermit, generateSoftwareKey, keyDigest, receiptContent, relayErrorFor, validateNetworkRelay, verifiedCacheUsage,
+  verifyCardBundle, verifyKel, verifyPublishedAgent,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, agent, stateOf } from './helpers.js';
 import { inboxWorld, msg } from './helpers2.js';
@@ -126,6 +126,19 @@ describe('C8: step 3 refresh rate', () => {
   });
 });
 
+describe('C9: handle lookups report the pin\'s kelLive', () => {
+  it('a relay-served descriptor that does not confirm the pin is reported as not live', async () => {
+    const clock = new Clock(), relay = new FakeRelay(clock.now);
+    const alice = await agent(relay, clock, { handle: 'alice' }), bob = await agent(relay, clock);
+    const adopt = bob.client.peers.adopt.bind(bob.client.peers);
+    vi.spyOn(bob.client.peers, 'adopt').mockImplementation((events, o) => adopt(events, { ...o, live: false }));
+    try {
+      expect((await bob.client.lookupWithCard('@alice@relay.test')).card?.kelLive).toBe(false);
+      expect((await bob.client.lookupCard(alice.id.getACEId())).kelLive).toBe(false);
+    } finally { await alice.client.close(); await bob.client.close(); }
+  });
+});
+
 describe('C10: verified-KEL cache', () => {
   it('never caches an unusable log', async () => {
     const id = await SoftwareIdentity.generate({ now: NOW });
@@ -159,5 +172,21 @@ describe('C11: list prefixes are validated like keys', () => {
     expect(await store.list('inbox/journal/')).toEqual(['inbox/journal/a.json']);
     expect(await store.list('inbox/jo')).toEqual(['inbox/journal/a.json']);
     expect(await store.list('')).toEqual(['inbox/journal/a.json']);
+  });
+});
+
+describe('sdk-ts: admission request lock', () => {
+  it('saveRequest takes only the admission lock', async () => {
+    const store = new MemoryStore(), book = new AdmissionBook(store, { clock: () => NOW });
+    const lock = vi.spyOn(store, 'lock');
+    const bob = await SoftwareIdentity.generate({ now: NOW });
+    const clock = new Clock(), relay = new FakeRelay(clock.now);
+    const a = await agent(relay, clock);
+    try {
+      await book.saveRequest({ from: a.id.getACEId(), messageId: crypto.randomUUID(), profile: 'ace:text:1', note: '', source: await a.client.publish(),
+        permit: await createPermit(a.id, bob.getACEId(), { now: clock.t }), receivedAt: NOW });
+      expect(lock.mock.calls.map(([name]) => name)).toEqual(['admission']);
+      expect(await book.requests()).toHaveLength(1);
+    } finally { await a.client.close(); }
   });
 });

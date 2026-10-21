@@ -146,11 +146,9 @@ export class AdmissionBook {
       // A block both changes admission and deletes the held request under this same lock.
       // Do not let a receive that started earlier recreate it after that deletion.
       if ((await this.get(r.from))?.status === 'blocked') return;
-      await withLock(this.#store, 'admission-requests', async () => {
-        const held = (await this.requests()).filter((x) => x.from !== r.from);
-        while (held.length >= this.#maxRequests) await this.deleteRequest(held.shift()!.from);
-        await this.#store.write(requestKey(r.from), canonicalStateBytes(r));
-      });
+      const held = (await this.requests()).filter((x) => x.from !== r.from);
+      while (held.length >= this.#maxRequests) await this.deleteRequest(held.shift()!.from);
+      await this.#store.write(requestKey(r.from), canonicalStateBytes(r));
     });
   }
 

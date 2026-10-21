@@ -382,9 +382,10 @@ export class NetworkClient {
     if (isACEId(target)) return { agent: await this.agent(target) };
     const { bundle, relay, handle } = await this.#cardByHandle(target);
     const id = bundle.card.aceId;
-    // The descriptor first: it pins or advances the KEL (live), so the card verifies under the current KEL.
+    // The descriptor first: it pins or advances the KEL (live), so the card verifies under the current KEL. `kelLive` is
+    // the pin's, as for `lookupCard`: a relay-served descriptor that did not confirm the pin leaves it false.
     const agent = await this.#fetchAgent(id, [relay.baseUrl]);
-    return { agent, card: await this.#checkCard(bundle, { home: relay.baseUrl, handle }) };
+    return { agent, card: await this.#checkCard(bundle, { home: relay.baseUrl, handle }, await this.peers.kelLive(id)) };
   }
 
   /**
@@ -456,7 +457,7 @@ export class NetworkClient {
    * set-once handle per home (a record naming the pinned home must carry the pinned handle; a new home re-pins). A
    * record `resolved` from `@handle@home` must name the ACE ID that handle first resolved to (`invalid_authorization`).
    */
-  async #checkCard(bundle: CardBundle, resolved?: { home: string; handle: string }, kelLive = true): Promise<VerifiedCard> {
+  async #checkCard(bundle: CardBundle, resolved: { home: string; handle: string } | undefined, kelLive: boolean): Promise<VerifiedCard> {
     const id = bundle.card.aceId;
     const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
     await withLock(this.store, 'network-handles', async () => {
