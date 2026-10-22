@@ -11,8 +11,11 @@ describe('NetworkClient', () => {
     const A = alice.id.getACEId(), B = bob.id.getACEId();
 
     // discovery and handle
-    expect((await bob.client.discover()).agents.map((a) => a.descriptor.aceId)).toEqual([A]);
+    expect((await bob.client.discover()).cards.map((c) => c.aceId)).toEqual([A]);
     expect((await bob.client.lookup('@alice@relay.test')).descriptor.aceId).toBe(A);
+    // a typed address: the leading @ optional, any ASCII case; never a Unicode case fold (U+212A KELVIN SIGN)
+    expect((await bob.client.lookup('Alice@Relay.Test')).descriptor.aceId).toBe(A);
+    await expect(bob.client.lookup('@\u212Aalice@relay.test')).rejects.toMatchObject({ code: 'invalid_argument' });
     // bob (closed, unlisted) is absent from the directory but resolvable by ACE ID
     expect((await alice.client.agent(B)).descriptor.aceId).toBe(B);
     expect((await alice.client.lookupCard(B)).record).toMatchObject({ contact: 'closed', listed: false });

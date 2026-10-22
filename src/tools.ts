@@ -139,10 +139,19 @@ export async function agentView(client: NetworkClient, a: PublishedAgent) {
   };
 }
 
-/** The agent-facing view of a verified card record (self-asserted: `pay` accounts are claimed, not proven). */
+/** Remote-authored parts of a card view (the handle is relay-bound; `address` is derived from it). */
+const CARD_UNTRUSTED = ['home', 'card', 'pay'];
+
+/**
+ * The agent-facing view of a verified card record (self-asserted: `pay` accounts are claimed, not proven), with its
+ * `@handle@host` address when it has a handle.
+ */
 export function cardView(v: VerifiedCard) {
   const r = v.record;
-  return { home: r.home, ...(r.handle ? { handle: r.handle } : {}), card: r.card, ...(r.pay ? { pay: r.pay } : {}), contact: r.contact, listed: r.listed };
+  return {
+    aceId: r.aceId, home: r.home, ...(r.handle ? { handle: r.handle, address: handleAddress(r.handle, r.home) } : {}), card: r.card,
+    ...(r.pay ? { pay: r.pay } : {}), contact: r.contact, listed: r.listed,
+  };
 }
 
 /** A sent message and its delivery state. */
@@ -249,7 +258,7 @@ export const AGENT_TOOLS: AgentTool[] = [
   tool({
     name: 'ace_network',
     description: [
-      'discover: the public directory (optional profile filter, cursor, limit). lookup: an ACE ID or @name@relay-host. import: a PublishedAgent shared out of band (source).',
+      'discover: the public directory of listed card records (optional tag filter and profile hint, cursor, limit); lookup or connect an entry by its aceId. lookup: an ACE ID or @name@relay-host. import: a PublishedAgent shared out of band (source).',
       'import_invitation: an invitation {agent, permit} someone issued you; it pins the agent and keeps the permit so connect can reach them, and never admits them.',
       'invite (ace:admission): admit one peer (peer: ACE ID or @name@relay-host, or source: its shared PublishedAgent) and return an invitation {agent, permit} to hand it privately; the permit lets that peer reach you even while your contact is closed.',
       'publish: republish your signed descriptor now and return it, to share out of band.',
@@ -262,7 +271,8 @@ export const AGENT_TOOLS: AgentTool[] = [
     inputSchema: closed({
       action: { type: 'string', enum: Object.keys(NETWORK_ACTIONS) },
       peer: { ...TARGET, description: 'ACE ID (or @name@relay-host for lookup, connect and invite)' },
-      profile: { type: 'string', maxLength: 256, description: 'Profile ID: directory filter (discover) or the contact purpose (connect, invite)' },
+      tag: { type: 'string', pattern: '^[a-z0-9-]{1,32}$', description: 'discover: only cards carrying this tag' },
+      profile: { type: 'string', maxLength: 256, description: 'Profile ID: directory hint (discover) or the contact purpose (connect, invite)' },
       note: { type: 'string', maxLength: MAX_NOTE_BYTES, description: 'connect: a note for the peer, encrypted' },
       source: { ...OBJECT, description: 'A PublishedAgent {kel, descriptor}' },
       invitation: { ...OBJECT, description: 'An invitation {agent, permit} (import_invitation)' },
@@ -273,8 +283,10 @@ export const AGENT_TOOLS: AgentTool[] = [
       const action = args.action as string;
       switch (action) {
         case 'discover': {
-          const page = await client.discover({ profile: args.profile as string | undefined, cursor: args.cursor as string | undefined, limit: args.limit as number | undefined });
-          return result({ agents: await Promise.all(page.agents.map((a) => agentView(client, a))), cursor: page.cursor }, under('agents[]', AGENT_UNTRUSTED));
+          const page = await client.discover({
+            tag: args.tag as string | undefined, profile: args.profile as string | undefined, cursor: args.cursor as string | undefined, limit: args.limit as number | undefined,
+          });
+          return result({ cards: page.cards.map(cardView), cursor: page.cursor }, under('cards[]', CARD_UNTRUSTED));
         }
         case 'lookup': {
           const found = await client.lookupWithCard(need(args.peer as string | undefined, 'peer'));

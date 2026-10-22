@@ -10,7 +10,7 @@ const SOL = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:7xKXtg2CW87d97TXJSDpbD5jBkh
 
 async function aliceCard(extra: Partial<Parameters<typeof createCardRecord>[1]> = {}) {
   const id = await identity();
-  const bundle = await createCardRecord(id, { home: RELAY, handle: 'alice', card: { name: 'Alice' }, pay: [SOL], contact: 'open', listed: false, now: NOW, ...extra });
+  const bundle = await createCardRecord(id, { home: RELAY, handle: 'alice', card: { description: 'translation agent' }, pay: [SOL], contact: 'open', listed: false, now: NOW, ...extra });
   return { id, bundle };
 }
 const withRecord = (b: CardBundle, patch: Record<string, unknown>): unknown => ({ kel: b.kel, card: { ...b.card, ...patch } });
@@ -32,6 +32,8 @@ describe('card record', () => {
   it('rejects unknown member', async () => {
     const { bundle } = await aliceCard();
     expect(() => verifyCardBundle(withRecord(bundle, { visibility: 'public' }), NOW)).toThrow(code('invalid_authorization'));
+    // a display name is application data (04 § Card)
+    expect(() => verifyCardBundle(withRecord(bundle, { card: { name: 'Alice' } }), NOW)).toThrow(code('invalid_authorization'));
     expect(() => verifyCardBundle({ ...bundle, extra: 1 }, NOW)).toThrow(code('invalid_authorization'));
     expect(() => verifyCardBundle(withRecord(bundle, { contact: 'public' }), NOW)).toThrow(code('invalid_authorization'));
   });
@@ -58,7 +60,7 @@ describe('card record', () => {
 
   it('rejects oversized record', async () => {
     const { bundle } = await aliceCard();
-    const big = withRecord(bundle, { card: { name: 'Alice', description: 'x'.repeat(MAX_CARD_RECORD_BYTES) } });
+    const big = withRecord(bundle, { card: { description: 'x'.repeat(MAX_CARD_RECORD_BYTES) } });
     expect(() => verifyCardBundle(big, NOW)).toThrow(expect.objectContaining({ code: 'invalid_authorization', message: expect.stringMatching(/16384/) }));
   });
 
@@ -66,7 +68,9 @@ describe('card record', () => {
     const { bundle } = await aliceCard({ now: NOW + 301 });
     expect(() => verifyCardBundle(bundle, NOW)).toThrow(code('invalid_authorization'));
     await expect(aliceCard({ home: 'https://Relay.test/' })).rejects.toThrow(code('invalid_authorization'));
-    await expect(aliceCard({ handle: 'Al' })).rejects.toThrow(code('invalid_authorization'));
+    for (const handle of ['Al', 'al_ice', 'al--ice', 'alice-', '-alice', 'a'.repeat(33)]) {
+      await expect(aliceCard({ handle }), handle).rejects.toThrow(code('invalid_authorization'));
+    }
   });
 
   it('card signed by superseded key is stale', async () => {

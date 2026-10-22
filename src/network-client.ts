@@ -112,7 +112,9 @@ const isCardPin = (v: Record<string, unknown>): boolean => wireInt(v.issuedAt) !
     && Object.entries(v.handles).every(([home, handle]) => isHandleHome(home) && isHandle(handle))
     && v.handles[v.home as string] === v.handle));
 const isHandleOwnerPin = (v: Record<string, unknown>): boolean => isStr(v.aceId) && isStr(v.home) && isStr(v.handle);
-const HANDLE_RE = /^@([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/;
+const HANDLE_RE = /^@?([^@]+)@([a-z0-9.-]+(?::[0-9]+)?)$/;
+/** ASCII-only lowercasing: `toLowerCase` folds some non-ASCII characters (U+212A KELVIN SIGN) to ASCII letters. */
+const asciiLower = (s: string) => s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
 
 /**
  * The result of `get` at the first of `routes` that serves it. `unknown_peer` only when every route answered it;
@@ -328,9 +330,12 @@ export class NetworkClient {
 
   // --- discovery ----------------------------------------------------------------------------
 
-  /** The public directory of the home relay: identities whose card record is listed (every entry verified). */
-  discover(o: { profile?: string; cursor?: string; limit?: number } = {}): Promise<{ agents: PublishedAgent[]; cursor: string | null }> {
-    return this.relay.listDescriptors(o);
+  /**
+   * The public directory of the home relay: listed card records (verified, not pinned; `RelayClient.directory`). `lookup`
+   * an entry's ACE ID to obtain its descriptor before connecting.
+   */
+  discover(o: { tag?: string; profile?: string; cursor?: string; limit?: number } = {}): Promise<{ cards: VerifiedCard[]; cursor: string | null }> {
+    return this.relay.directory(o);
   }
 
   /**
@@ -506,7 +511,8 @@ export class NetworkClient {
   }
 
   async #cardByHandle(target: string): Promise<{ bundle: CardBundle; relay: RelayClient; handle: string }> {
-    const m = typeof target === 'string' ? HANDLE_RE.exec(target) : null;
+    // A typed address: the leading @ optional, any ASCII case (04 § Card record, Handles).
+    const m = typeof target === 'string' ? HANDLE_RE.exec(asciiLower(target)) : null;
     if (!m || !isHandle(m[1])) throw new ACEError('invalid_argument', 'use an ACE ID or @name@relay-host');
     const relay = m[2] === new URL(this.relay.baseUrl).host ? this.relay : this.#relayFor(`https://${m[2]}`);
     return { bundle: (await relay.handle(m[1])).bundle, relay, handle: m[1] };

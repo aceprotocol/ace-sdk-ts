@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { AGENT_TOOLS, checkArgs, requiredScope, type AgentTool } from '../src/tools.js';
 import type { JSONObject } from './sdk.js';
-import { Clock, FakeRelay, agent, type TestAgent } from './helpers.js';
+import { Clock, FakeRelay, RELAY, agent, type TestAgent } from './helpers.js';
 
 const T = Object.fromEntries(AGENT_TOOLS.map((t) => [t.name, t])) as Record<string, AgentTool>;
 const run = async (a: TestAgent, name: string, args: JSONObject = {}) => (await T[name].run(a.client, args)).data as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -69,7 +69,7 @@ describe('AGENT_TOOLS', () => {
 
   it('runs the hosted flows end to end and marks remote content untrusted', async () => {
     const clock = new Clock(), relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { contact: 'open', listed: true, handle: 'alice', card: { name: 'Alice' }, profiles: ['text', 'commerce'] });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, handle: 'alice', card: { description: 'translation', tags: ['nlp'] }, profiles: ['text', 'commerce'] });
     const bob = await agent(relay, clock, { profiles: ['text', 'commerce'] });
     const A = alice.id.getACEId(), B = bob.id.getACEId();
 
@@ -78,10 +78,13 @@ describe('AGENT_TOOLS', () => {
     expect(me.profiles.map((p: { id: string }) => p.id)).toEqual(['ace:core:1', 'ace:text:1', 'ace:commerce:1']);
 
     const found = await run(bob, 'ace_network', { action: 'discover' });
-    expect(found.agents.map((x: { aceId: string }) => x.aceId)).toEqual([A]);
-    expect(found.untrusted).toEqual(['agents[].relays', 'agents[].ext', 'agents[].delegations[].issuer', 'agents[].erc8004']);
+    expect(found.cards).toEqual([{ aceId: A, home: RELAY, handle: 'alice', address: '@alice@relay.test', card: { description: 'translation', tags: ['nlp'] }, contact: 'open', listed: true }]);
+    expect(found.untrusted).toEqual(['cards[].home', 'cards[].card', 'cards[].pay']);
+    expect((await run(bob, 'ace_network', { action: 'discover', tag: 'nlp' })).cards).toHaveLength(1);
+    expect((await run(bob, 'ace_network', { action: 'discover', tag: 'absent' })).cards).toEqual([]);
+    await expect(run(bob, 'ace_network', { action: 'discover', tag: 'NLP' })).rejects.toMatchObject({ code: 'invalid_argument' });
     const looked = await run(bob, 'ace_network', { action: 'lookup', peer: '@alice@relay.test' });
-    expect(looked.card).toMatchObject({ handle: 'alice', card: { name: 'Alice' }, contact: 'open' });
+    expect(looked.card).toMatchObject({ aceId: A, handle: 'alice', card: { description: 'translation' }, contact: 'open' });
     expect(looked.untrusted).toContain('card');
 
     expect(await run(bob, 'ace_network', { action: 'connect', peer: '@alice@relay.test', note: 'hi, bob here' })).toMatchObject({ status: 'pending', aceId: A, profile: 'ace:text:1' });

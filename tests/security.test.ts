@@ -1,8 +1,8 @@
 // Regression tests for the 2026-10-13 security review fixes.
 import { describe, expect, it } from 'vitest';
 import {
-  CONTACT_SCHEMA_DIGEST, MemoryStore, NetworkClient, Outbox, ProfileSet, RelayClient, contactContent, createDescriptor, createPermit,
-  type PublishedAgent,
+  CONTACT_SCHEMA_DIGEST, MemoryStore, NetworkClient, Outbox, ProfileSet, RelayClient, contactContent, createCardRecord, createDescriptor, createPermit,
+  type CardBundle, type PublishedAgent,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, identity } from './helpers.js';
 import { inboxWorld, text } from './helpers2.js';
@@ -126,16 +126,25 @@ describe('security fixes', () => {
   it('directory entries that do not match the query are skipped; a lookup must return the requested identity', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { contact: 'open', listed: true });
+    const alice = await agent(relay, clock, { contact: 'open', listed: true, card: { tags: ['nlp'] } });
     const bob = await agent(relay, clock);
+    const good = relay.cards.get(alice.id.getACEId())!;
+    const forged = structuredClone(good);
+    forged.card.card = { description: 'Mallory' }; // changed after signing
+    const unlisted = relay.cards.get(bob.id.getACEId())!; // valid but not listed
+    const elsewhere = await createCardRecord(bob.id, { home: 'https://relay.b', contact: 'open', listed: true, now: clock.t + 1 }); // listed at another relay
     const orig = relay.route.bind(relay);
     relay.route = async (m, url, h, body) => {
-      if (url.pathname === '/v1/descriptors') return { agents: [await alice.client.publish()], cursor: null };
+      if (url.pathname === '/v1/cards') return { cards: [forged, unlisted, elsewhere, good] satisfies CardBundle[], cursor: null };
       if (url.pathname.startsWith('/v1/descriptor/')) return (relay.descriptors.get(bob.id.getACEId()) as PublishedAgent);
       return orig(m, url, h, body);
     };
-    expect(await bob.client.discover({ profile: 'ace:commerce:1' })).toEqual({ agents: [], cursor: null });
-    expect((await bob.client.discover({ profile: 'ace:text:1' })).agents.map((x) => x.descriptor.aceId)).toEqual([alice.id.getACEId()]);
+    // the bad entries are skipped; profile is the relay's hint, never checked here
+    expect((await bob.client.discover()).cards.map((x) => x.aceId)).toEqual([alice.id.getACEId()]);
+    expect((await bob.client.discover({ profile: 'ace:commerce:1' })).cards.map((x) => x.aceId)).toEqual([alice.id.getACEId()]);
+    expect((await bob.client.discover({ tag: 'nlp' })).cards.map((x) => x.aceId)).toEqual([alice.id.getACEId()]);
+    expect(await bob.client.discover({ tag: 'absent' })).toEqual({ cards: [], cursor: null }); // not carrying the tag
+    await expect(bob.client.discover({ tag: 'NLP' })).rejects.toMatchObject({ code: 'invalid_argument' });
     await expect(relay.client().getDescriptor(alice.id.getACEId())).rejects.toMatchObject({ code: 'relay_protocol_error' });
   });
 });

@@ -19,9 +19,12 @@ Spec: `ace-spec` chapters 00–08 (packet version `"1"`). Every signature is ML-
   salt, info = header binding `from`, `to`, `messageId`, `timestamp`, prekey and KEM ciphertext) → AES-256-GCM, signed
   with ML-DSA-65 (action `packet`). The recipient need not be online.
 - **Card record** — `createCardRecord` / `verifyCardBundle`: the durable identity record `{kel, card}` with its home
-  relay, set-once handle, card, `pay` (CAIP-10 accounts), `contact` (`open` takes stranger contact requests) and
-  `listed` (directory). No expiry; re-signed after a new `dlg`. `NetworkClient.lookupCard` resolves an ACE ID or
-  `@name@host`; with no live descriptor it verifies under the bundle's own KEL and says `kelLive: false`.
+  relay, set-once handle (`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`, 3–32 characters), card (`description`, `image`, `tags`;
+  no name: a display name is application data), `pay` (CAIP-10 accounts), `contact` (`open` takes stranger contact
+  requests) and `listed` (directory). No expiry; re-signed after a new `dlg`. `NetworkClient.lookupCard` resolves an
+  ACE ID or `@name@host` (typed without the `@` or in any ASCII case is accepted); with no live descriptor it verifies
+  under the bundle's own KEL and says `kelLive: false`. `NetworkClient.discover` / `RelayClient.directory` read the
+  directory (`GET /v1/cards`, optional `tag`, `profile` hint): listed card records, each verified on its own.
 - **Descriptor** — `createDescriptor` / `verifyPublishedAgent`: relays, prekey, profiles, `ext`, Delegation credentials and ERC-8004 bindings
   (`verifyErc8004Registration` checks the reverse direction against the registration file's `services`; the host
   reads the chain). Every operational signature is checked by one `verifyOperationalSignature` (01 rules 1–5: the

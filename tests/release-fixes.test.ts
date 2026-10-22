@@ -18,12 +18,12 @@ describe('received JSON depth (02 § JSON values: MAX_JSON_DEPTH)', () => {
   it('a deeply nested relay response is relay_protocol_error, never a RangeError', async () => {
     const bodies = [
       `{"kel":[],"descriptor":${deep(200_000)}}`,
-      `{"agents":[{"kel":[],"descriptor":${deep(200_000)}}],"cursor":null}`,
+      `{"cards":[{"kel":[],"card":${deep(200_000)}}],"cursor":null}`,
       `{"kel":[],"descriptor":${deep(40)}}`, // over the limit, far below the stack
     ];
     for (const body of bodies) {
       const relay = new RelayClient(RELAY, { fetch: async () => json(body), clock: () => NOW });
-      const call = body.startsWith('{"agents"') ? relay.listDescriptors() : relay.getDescriptor(aceId);
+      const call = body.startsWith('{"cards"') ? relay.directory() : relay.getDescriptor(aceId);
       await expect(call).rejects.toMatchObject({ code: 'relay_protocol_error' });
     }
   });
@@ -70,13 +70,12 @@ describe('response depth: MAX_JSON_DEPTH per contained object, + 3 for the wrapp
   };
   const client = (body: string, type?: string) => new RelayClient(RELAY, { fetch: async () => json(body, type), clock: () => NOW });
 
-  it('a PublishedAgent at depth 32 passes in a descriptor response and a directory page; 33 is relay_protocol_error', async () => {
+  it('a PublishedAgent at depth 32 passes in a descriptor response; 33 is relay_protocol_error, also in a directory page', async () => {
     const ok = await boundaryAgent(), bad = await boundaryAgent(true);
     expect((await client(JSON.stringify(ok)).getDescriptor(ok.descriptor.aceId)).descriptor.aceId).toBe(ok.descriptor.aceId);
-    expect((await client(JSON.stringify({ agents: [ok], cursor: null })).listDescriptors()).agents).toHaveLength(1);
     await expect(client(JSON.stringify(bad)).getDescriptor(bad.descriptor.aceId)).rejects.toMatchObject({ code: 'relay_protocol_error' });
-    // never skipped: a conformant relay refused it on input
-    await expect(client(JSON.stringify({ agents: [ok, bad], cursor: null })).listDescriptors()).rejects.toMatchObject({ code: 'relay_protocol_error' });
+    // a directory entry over the depth bound is never skipped: a conformant relay refused it on input
+    await expect(client(JSON.stringify({ cards: [{ kel: [], card: nest(33) }], cursor: null })).directory()).rejects.toMatchObject({ code: 'relay_protocol_error' });
   });
 
   it('a packet at depth 32 passes in an inbox page and an SSE frame; 33 is relay_protocol_error', async () => {

@@ -81,7 +81,7 @@ export function verifyCardBundle(value: unknown, now: number = nowOf(), o: Verif
   if (issuedAt === null || issuedAt > now + TIMESTAMP_WINDOW_SECONDS) throw bad('invalid card record issuedAt');
   validateNetworkRelay(r.home, o);
   if (r.handle !== undefined) {
-    if (!isHandle(r.handle)) throw bad('handle must match [a-z][a-z0-9_-]{2,31}');
+    if (!isHandle(r.handle)) throw bad('handle must match [a-z][a-z0-9]*(-[a-z0-9]+)*, 3-32 characters');
     if (new URL(r.home as string).pathname !== '/') throw bad('a handle needs a home without a path (it resolves at https://host)');
   }
   validateCard(r.card);

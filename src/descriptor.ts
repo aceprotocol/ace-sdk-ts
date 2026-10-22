@@ -84,21 +84,24 @@ export function validateNetworkRelay(value: unknown, o: VerifyOptions = {}): str
   return value;
 }
 
-/** Self-asserted presentation metadata (a card record's `card`). The tag `hosted` means a hosting provider holds the keys. */
-export interface AgentCard { name?: string; description?: string; image?: string; tags?: string[] }
+/**
+ * Self-asserted discovery metadata (a card record's `card`). The tag `hosted` means a hosting provider holds the keys. No
+ * name: a display name is application data; the handle is the human-readable identifier (04 § Card).
+ */
+export interface AgentCard { description?: string; image?: string; tags?: string[] }
 
-const TAG_RE = /^[a-z0-9-]{1,32}$/;
+/** A card tag (also the directory's `tag` filter). */
+export const TAG_RE = /^[a-z0-9-]{1,32}$/;
 
 /** Validate a card (`invalid_authorization`); returns a copy. */
 export function validateCard(value: unknown): AgentCard {
-  if (!closedKeys(value, [], ['name', 'description', 'image', 'tags'])) throw new ACEError('invalid_authorization', 'card permits only name, description, image and tags');
+  if (!closedKeys(value, [], ['description', 'image', 'tags'])) throw new ACEError('invalid_authorization', 'card permits only description, image and tags');
   const text = (v: unknown, name: string, lo: number, hi: number) => {
     if (v === undefined) return;
     if (typeof v !== 'string' || codePointLength(v) < lo || codePointLength(v) > hi || CONTROL_CHAR_RE.test(v)) {
       throw new ACEError('invalid_authorization', `card.${name} must be ${lo}-${hi} characters without control characters`);
     }
   };
-  text(value.name, 'name', 1, 64);
   text(value.description, 'description', 0, 256);
   if (value.image !== undefined && !isHttpsUrl(value.image)) {
     throw new ACEError('invalid_authorization', 'card.image must be an ACE HTTPS URL');

@@ -182,11 +182,14 @@ export class FakeRelay {
       if (!c || c.card.home !== this.baseUrl) throw new HTTPError(404, 'unknown_peer');
       return c;
     }
-    if (method === 'GET' && path === '/v1/descriptors') {
-      const profile = url.searchParams.get('profile');
-      const agents = [...this.descriptors.values()].filter((a) => this.cards.get(a.descriptor.aceId)?.card.listed === true && this.#live(a.descriptor.aceId)
-        && (!profile || a.descriptor.profiles.some((p) => p.id === profile)));
-      return { agents, cursor: null };
+    if (method === 'GET' && path === '/v1/cards') {
+      // Listed records naming this relay as home whose descriptor is unexpired, by ACE ID; `profile` reads the descriptor.
+      const tag = url.searchParams.get('tag'), profile = url.searchParams.get('profile');
+      const cards = [...this.cards.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).filter(([id, c]) => {
+        const d = c.card.listed === true && c.card.home === this.baseUrl ? this.#live(id) : undefined;
+        return d !== undefined && (!tag || (c.card.card.tags ?? []).includes(tag)) && (!profile || d.descriptor.profiles.some((p) => p.id === profile));
+      }).map(([, c]) => c);
+      return { cards: cards.slice(0, Number(url.searchParams.get('limit') ?? 20)), cursor: null };
     }
     if (method === 'POST' && path === '/v1/blocks') {
       const owner = this.#auth(headers, { action: 'block', peer: body.peer, blocked: body.blocked, revision: body.revision });

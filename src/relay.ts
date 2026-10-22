@@ -5,7 +5,7 @@ import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isHandle, isO
 import { withLock, type ACEStore } from './store.js';
 import { createAuthHeaders, type AuthHeaders, type RelayAuthRequest } from './auth.js';
 import { verifyCardBundle, type CardBundle, type VerifiedCard } from './card-record.js';
-import { verifyPublishedAgent, type DeliveryPermit, type PublishedAgent } from './descriptor.js';
+import { TAG_RE, verifyPublishedAgent, type DeliveryPermit, type PublishedAgent } from './descriptor.js';
 import type { ACEIdentity } from './identity.js';
 import { DEFAULT_PAGE_LIMIT, MAX_INBOX_PAGE, MAX_JSON_DEPTH, MAX_PACKET_BYTES, MAX_PAGE_BYTES } from './limits.js';
 import type { Packet } from './packet.js';
@@ -335,23 +335,26 @@ export class RelayClient {
   }
 
   /**
-   * `GET /v1/descriptors?profile=&cursor=&limit=`: the public directory (identities whose card record is listed). Every
-   * entry is verified; one that fails permanently or does not list the requested profile is skipped.
+   * `GET /v1/cards?tag=&profile=&cursor=&limit=`: the public directory (card records listed at this relay). Each entry is
+   * verified on its own: one that fails verification permanently, is not listed here or does not carry `tag` is
+   * skipped; the rest of the page is kept. `profile` is the relay's hint: the descriptor obtained before connecting is
+   * what counts (07 § Descriptors and cards). Entries are verified, not pinned (`kelLive` false).
    */
-  async listDescriptors(o: { profile?: string; cursor?: string; limit?: number } = {}): Promise<{ agents: PublishedAgent[]; cursor: string | null }> {
+  async directory(o: { tag?: string; profile?: string; cursor?: string; limit?: number } = {}): Promise<{ cards: VerifiedCard[]; cursor: string | null }> {
     const limit = o.limit ?? DEFAULT_PAGE_LIMIT;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_INBOX_PAGE) throw new ACEError('invalid_argument', 'invalid page limit');
-    const res = await this.#request('GET', this.#url('/v1/descriptors', { profile: o.profile, cursor: o.cursor, limit: String(limit) }));
-    if (!isObj(res) || !Array.isArray(res.agents) || res.agents.length > limit || !(res.cursor === null || typeof res.cursor === 'string')) throw protocolError('invalid descriptor page');
-    const agents: PublishedAgent[] = [];
-    for (const a of res.agents) {
-      let agent: PublishedAgent;
-      try { agent = this.#agent(a); } catch (e) { if (!(e instanceof ACEError) || e.isTransient) throw e; continue; }
-      // Filtered by the exact profile ID when one was requested.
-      if (o.profile !== undefined && !agent.descriptor.profiles.some((p) => p.id === o.profile)) continue;
-      agents.push(agent);
+    if (o.tag !== undefined && !(typeof o.tag === 'string' && TAG_RE.test(o.tag))) throw new ACEError('invalid_argument', 'tag must match [a-z0-9-]{1,32}');
+    const res = await this.#request('GET', this.#url('/v1/cards', { tag: o.tag, profile: o.profile, cursor: o.cursor, limit: String(limit) }));
+    if (!isObj(res) || !Array.isArray(res.cards) || res.cards.length > limit || !(res.cursor === null || typeof res.cursor === 'string')) throw protocolError('invalid directory page');
+    const cards: VerifiedCard[] = [];
+    for (const value of res.cards) {
+      contained(value); // never a skipped entry
+      let c: VerifiedCard;
+      try { c = verifyCardBundle(value, nowOf(this.#clock), this.#verify); } catch (e) { if (!(e instanceof ACEError) || e.isTransient) throw e; continue; }
+      const r = c.record;
+      if (r.home === this.baseUrl && r.listed && (o.tag === undefined || (r.card.tags ?? []).includes(o.tag))) cards.push(c);
     }
-    return { agents, cursor: res.cursor };
+    return { cards, cursor: res.cursor };
   }
 
   /** `POST /v1/blocks`: a signed block or unblock of `peer`; `revision` must increase. */

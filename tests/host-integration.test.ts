@@ -8,12 +8,12 @@ describe('host integration', () => {
     const seen: string[] = [];
     const fetch: typeof globalThis.fetch = async (input) => {
       seen.push(String(input));
-      return new Response(JSON.stringify({ agents: [], cursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ cards: [], cursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
     };
     const relay = new RelayClient(RELAY, { connectUrl: 'http://relay-internal:8080/', fetch });
     expect(relay.baseUrl).toBe(RELAY);
-    await relay.listDescriptors({ limit: 5 });
-    expect(seen).toEqual(['http://relay-internal:8080/v1/descriptors?limit=5']);
+    await relay.directory({ limit: 5 });
+    expect(seen).toEqual(['http://relay-internal:8080/v1/cards?limit=5']);
   });
 
   it('an expired configured delegation drops out of the next descriptor', async () => {

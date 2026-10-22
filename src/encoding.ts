@@ -15,8 +15,8 @@ const HEX64_RE = /^[0-9a-f]{64}$/;
 /** CAIP-10 account id (`namespace:reference:address`); `isCaip10` is the check (exported so schemas can show the same pattern). */
 export const CAIP10_RE = /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}$/;
 export const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
-/** A relay-scoped public handle (the only copy of this grammar). */
-export const HANDLE_RE = /^[a-z][a-z0-9_-]{2,31}$/;
+/** A relay-scoped public handle (the only copy of this grammar), also 3-32 characters (`isHandle`): hence a DNS label. */
+export const HANDLE_RE = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const B64_CHARS_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 const B64_VALUE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const LABEL = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?';
@@ -80,7 +80,7 @@ export function isCaip10(value: unknown): value is string {
 }
 
 export function isHandle(value: unknown): value is string {
-  return typeof value === 'string' && HANDLE_RE.test(value);
+  return typeof value === 'string' && value.length >= 3 && value.length <= 32 && HANDLE_RE.test(value);
 }
 
 /** How a handle is written (04 § Handles): `@name@host`, `host` being the host (with its port, if any) of `home`. */
