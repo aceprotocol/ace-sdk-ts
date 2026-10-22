@@ -355,9 +355,9 @@ export class Inbox {
     try {
       checkPacketTime(packet, this.#now());
       const content = await decryptPacket(packet, this.#o.vault);
-      if (content.type !== CONTACT_TYPE) throw new ACEError('not_permitted', 'strangers may only send contact requests');
+      if (content.type !== CONTACT_TYPE) throw new ACEError('not_permitted', 'an unpinned sender may only send contact packets');
       this.#o.profiles.validate(content.type, content.schemaDigest, content.body);
-      if (stranger && content.body.kind !== 'request') throw new ACEError('not_permitted', 'strangers may only send contact requests');
+      if (stranger && content.body.kind !== 'request') throw new ACEError('not_permitted', 'a stranger may only send a contact request');
       if (stranger) checkStrangerSource(content.body.source);
       return await this.#contact(packet, content, stranger);
     } catch (e) {

@@ -71,6 +71,20 @@ describe('NetworkClient', () => {
     expect(relay.blocks.get(`${A}|${B}`)).toEqual({ blocked: false, revision: 2 });
   });
 
+  it('a blocked stranger\'s contact request reads like one to a closed peer (05 § Blocks)', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const open = await agent(relay, clock, { contact: 'open', listed: true });
+    const closed = await agent(relay, clock);
+    const bob = await agent(relay, clock);
+    await open.client.block(bob.id.getACEId());
+    const refusal = (target: string) => bob.client.connect(target, { profile: 'ace:text:1' }).then(() => null, (e: unknown) => e as ACEError);
+    const blocked = (await refusal(open.id.getACEId()))!, shut = (await refusal(closed.id.getACEId()))!;
+    expect(blocked).toBeInstanceOf(ACEError);
+    expect({ code: blocked.code, message: blocked.message, status: blocked.status, relayCode: blocked.relayCode })
+      .toEqual({ code: 'not_permitted', message: shut.message, status: undefined, relayCode: undefined });
+  });
+
   it('rejected:unknown_prekey refreshes the descriptor and retries; outbox backs off and expires', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);

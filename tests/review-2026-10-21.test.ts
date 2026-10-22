@@ -89,7 +89,7 @@ describe('C4: relay error strings', () => {
   it('lose their control characters before they enter the error', () => {
     const e = relayErrorFor(400, null, JSON.stringify({ error: 'bad\u0007code\n', message: 'line\r\nFORGED\u009b\u0000 entry' }));
     expect(e.relayCode).toBe('badcode');
-    expect(e.message).toBe('relay_rejected: HTTP 400 badcode: lineFORGED entry');
+    expect(e.message).toBe('relay_rejected: relay HTTP 400 badcode: lineFORGED entry');
     expect(e.message).not.toMatch(/\p{Cc}/u);
   });
 });

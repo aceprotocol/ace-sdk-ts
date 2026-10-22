@@ -132,6 +132,14 @@ async function firstServed<T>(routes: readonly string[], get: (route: string) =>
 }
 
 const blockedPeer = () => new ACEError('not_permitted', 'the peer is blocked; unblock it first');
+/** The one refusal of a message, whether no permit verifies here or the relay answers `not_permitted`. */
+const noValidPermit = () => new ACEError('not_permitted', 'no valid permit from this peer');
+/**
+ * The one refusal of a contact request, whether the card record is closed or the relay answers `not_permitted`. It
+ * names no cause: a closed peer and a blocking one read the same (05 § Blocks).
+ */
+const contactRefused = () => new ACEError('not_permitted', 'the peer does not accept contact requests from this identity');
+const isNotPermitted = (e: unknown): boolean => e instanceof ACEError && e.code === 'not_permitted';
 
 /** The record an explicit admission starts from: the old one without its block sync state. */
 function unblocked(old: PeerRecord | null, aceId: string): Omit<PeerRecord, 'status' | 'updatedAt'> {
@@ -615,7 +623,7 @@ export class NetworkClient {
       createPacket({ identity: this.identity, to, prekey, content, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: this.#now() }),
       this.#theirPermit(to, o.permit),
     ]);
-    if (o.needPermit && permit === undefined) throw new ACEError('not_permitted', 'no permit from this peer valid under its current pin');
+    if (o.needPermit && permit === undefined) throw noValidPermit();
     let error: unknown;
     for (const route of agent.descriptor.relays) {
       try {
@@ -623,6 +631,8 @@ export class NetworkClient {
         return { prekey: prekey.id };
       } catch (e) {
         error = e;
+        // An Outbox attempt the relay refuses (a block among others) reads exactly like a missing permit.
+        if (o.needPermit && isNotPermitted(e)) throw noValidPermit();
         if (e instanceof ACEError && !e.isTransient && e.code !== 'unknown_peer') throw e;
       }
     }
@@ -648,7 +658,7 @@ export class NetworkClient {
    */
   async send(to: string, type: string, body: JSONObject, o: { threadId?: string } = {}): Promise<OutboxEntry> {
     if (!isACEId(to)) throw new ACEError('invalid_argument', 'to must be an ACE ID');
-    if (!(await this.#theirPermit(to))) throw new ACEError('not_permitted', 'no valid permit from this peer');
+    if (!(await this.#theirPermit(to))) throw noValidPermit();
     const entry = await this.outbox.enqueue({ to, type, body, ...(o.threadId !== undefined ? { threadId: o.threadId } : {}) });
     return (await this.outbox.attempt(entry.messageId)) ?? entry;
   }
@@ -754,14 +764,19 @@ export class NetworkClient {
     const id = agent.descriptor.aceId;
     this.#sharedProfile(agent, o.profile);
     if ((await this.admission.get(id))?.status === 'blocked') throw blockedPeer();
-    if (!(await this.#theirPermit(id)) && ((card ?? await this.#cardOrNone(id))?.record.contact ?? 'closed') !== 'open') throw new ACEError('not_permitted', 'the peer takes contact requests only from peers it issued a permit');
+    if (!(await this.#theirPermit(id)) && ((card ?? await this.#cardOrNone(id))?.record.contact ?? 'closed') !== 'open') throw contactRefused();
     const permit = await this.#createPermit(id);
     await this.admission.update(id, (old) => {
       if (old?.status === 'blocked') throw blockedPeer();
       return { ...(old ?? { aceId: id }), status: old?.status === 'admitted' ? 'admitted' : 'pending', profile: o.profile, updatedAt: this.#now() };
     });
     const messageId = crypto.randomUUID();
-    await this.#sendContact(id, { kind: 'request', profile: o.profile, note: o.note, permit }, { messageId });
+    try {
+      await this.#sendContact(id, { kind: 'request', profile: o.profile, note: o.note, permit }, { messageId });
+    } catch (e) {
+      // The relay's refusal (a block among others) reads exactly like a closed peer's: no block is revealed.
+      throw isNotPermitted(e) ? contactRefused() : e;
+    }
     await this.#noteIssued(id, permit);
     return messageId;
   }

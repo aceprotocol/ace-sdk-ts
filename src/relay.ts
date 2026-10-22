@@ -116,7 +116,7 @@ export function relayErrorFor(status: number, retryAfter: string | null, body: s
     const n = Number(retryAfter);
     if (Number.isSafeInteger(n)) opts.retryAfterSeconds = n;
   }
-  const text = `HTTP ${status}${relayCode ? ` ${relayCode.slice(0, 64)}` : ''}${message ? `: ${message}` : ''}`;
+  const text = `relay HTTP ${status}${relayCode ? ` ${relayCode.slice(0, 64)}` : ''}${message ? `: ${message}` : ''}`;
   return new ACEError(code, text, opts);
 }
 
