@@ -97,9 +97,9 @@ describe('I3: a permit counts as issued only after the packet carrying it was se
     const seq = bob.id.getSigningSeq();
     relay.inject.push({ path: '/v1/send', status: 503, code: 'internal_error' });
     await bob.client.maintain(); // the permit push hits the 503
-    expect((await bob.client.admission.get(a))?.issued?.seq).not.toBe(seq);
+    expect((await bob.client.admission.get(a))?.issued?.signature.seq).not.toBe(seq);
     await bob.client.maintain(); // retried
-    expect((await bob.client.admission.get(a))?.issued?.seq).toBe(seq);
+    expect((await bob.client.admission.get(a))?.issued?.signature.seq).toBe(seq);
     await alice.client.pull();
     expect((await alice.client.admission.heldPermit(b))?.signature.seq).toBe(seq);
   });
@@ -126,7 +126,7 @@ describe('I4: block is local-first', () => {
     const { relay, alice, bob, a, b } = await pair();
     relay.inject.push({ path: '/v1/blocks', status: 503, code: 'internal_error' });
     await alice.client.block(b);
-    expect(await alice.client.admission.get(b)).toMatchObject({ status: 'blocked', unsyncedRevision: 1 });
+    expect(await alice.client.admission.get(b)).toMatchObject({ status: 'blocked', unsyncedRevision: NOW });
     expect(relay.blocks.get(`${a}|${b}`)).toBeUndefined();
     await bob.client.send(a, TEXT, { message: 'blocked?' });
     expect(await alice.client.pull()).toMatchObject([{ kind: 'dropped', error: { code: 'not_permitted' } }]);
@@ -321,41 +321,41 @@ describe('fix round 1', () => {
     return { relay, alice, a: alice.id.getACEId(), b: bob.id.getACEId(), log, arm };
   }
 
-  it('a late block retry (revision 1) sent after an unblock (revision 2) is refused stale_revision and leaves the peer unblocked', async () => {
+  it('a late block retry (revision NOW) sent after an unblock (revision NOW + 1) is refused stale_revision and leaves the peer unblocked', async () => {
     const { relay, alice, a, b, log, arm } = await gatedBlocks();
     relay.inject.push({ path: '/v1/blocks', status: 503, code: 'internal_error' });
-    await alice.client.block(b); // the relay is down: revision 1 stays unsynced
-    expect(await alice.client.admission.get(b)).toMatchObject({ status: 'blocked', unsyncedRevision: 1 });
+    await alice.client.block(b); // the relay is down: revision NOW (max(0 + 1, now)) stays unsynced
+    expect(await alice.client.admission.get(b)).toMatchObject({ status: 'blocked', unsyncedRevision: NOW });
     const g = arm((body) => body.blocked === true);
     const upkeep = alice.client.maintain(); // the block re-sync is held in flight
     await g.atGate();
-    await alice.client.unblock(b); // relay first, revision 2
+    await alice.client.unblock(b); // relay first, revision NOW + 1
     g.release();
     await upkeep;
     expect(log.slice(1)).toEqual([
-      { blocked: false, revision: 2, status: 200 },
-      { blocked: true, revision: 1, status: 409, error: 'stale_revision' },
+      { blocked: false, revision: NOW + 1, status: 200 },
+      { blocked: true, revision: NOW, status: 409, error: 'stale_revision' },
     ]);
     expect(await alice.client.admission.get(b)).toBeNull(); // no unsyncedRevision left behind
-    expect(relay.blocks.get(`${a}|${b}`)).toEqual({ blocked: false, revision: 2 });
+    expect(relay.blocks.get(`${a}|${b}`)).toEqual({ blocked: false, revision: NOW + 1 });
     await alice.client.maintain();
     expect(log).toHaveLength(3);
   });
 
   it('a block during an in-flight unblock keeps its record, and maintain registers it after the unblock', async () => {
     const { relay, alice, a, b, arm } = await gatedBlocks();
-    await alice.client.block(b); // revision 1, synced
+    await alice.client.block(b); // revision NOW, synced
     const g = arm((body) => body.blocked === false);
-    const unblocking = alice.client.unblock(b); // revision 2, held in flight
+    const unblocking = alice.client.unblock(b); // revision NOW + 1, held in flight
     await g.atGate();
     relay.inject.push({ path: '/v1/blocks', status: 503, code: 'internal_error' });
-    await alice.client.block(b); // revision 3, relay down: unsynced
+    await alice.client.block(b); // revision NOW + 2, relay down: unsynced
     g.release();
     await unblocking;
-    expect(await alice.client.admission.get(b)).toMatchObject({ status: 'blocked', unsyncedRevision: 3 }); // not wiped
-    expect(relay.blocks.get(`${a}|${b}`)).toEqual({ blocked: false, revision: 2 });
+    expect(await alice.client.admission.get(b)).toMatchObject({ status: 'blocked', unsyncedRevision: NOW + 2 }); // not wiped
+    expect(relay.blocks.get(`${a}|${b}`)).toEqual({ blocked: false, revision: NOW + 1 });
     await alice.client.maintain();
-    expect(relay.blocks.get(`${a}|${b}`)).toEqual({ blocked: true, revision: 3 });
+    expect(relay.blocks.get(`${a}|${b}`)).toEqual({ blocked: true, revision: NOW + 2 });
     expect((await alice.client.admission.get(b))?.unsyncedRevision).toBeUndefined();
   });
 

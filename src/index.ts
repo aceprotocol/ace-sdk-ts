@@ -7,7 +7,7 @@ export {
   isHex64, isHttpsUrl,
 } from './encoding.js';
 export { encodePayload, signingMessage, verifySignature } from './signing.js';
-export type { SigningScheme, JSONValue, JSONObject, PrivateContent, ParsedMessage } from './types.js';
+export type { SigningScheme, JSONValue, JSONObject, Admission, PrivateContent, ParsedMessage } from './types.js';
 export { isMessageType } from './types.js';
 
 export { SoftwareKey, generateSoftwareKey, keyDigest, type KeyProvider } from './keys.js';

@@ -1,7 +1,8 @@
 /**
  * The sender side. Each entry stores `{messageId, to, privateContent, createdAt}` plus attempt state. Every attempt
  * re-encrypts the stored content to the peer's current prekey and re-signs it with the current time (the messageId
- * never changes). Retries back off 60 s · 2^(n-1) up to 3600 s until a receipt arrives or OFFLINE_WINDOW_SECONDS
+ * never changes); every attempt after the first refreshes the descriptor and lets the transport add `admission`
+ * (05 § Admission recovery). Retries back off 60 s · 2^(n-1) up to 3600 s until a receipt arrives or OFFLINE_WINDOW_SECONDS
  * have passed since the first attempt (`expired`). A relay `{ok:true}` is not delivery. `expired` (also set by
  * `abandon`) only means attempts stopped: the outcome is unknown and a late receipt still settles the entry. Receipts and
  * contact packets never enter the Outbox.
@@ -49,8 +50,16 @@ export interface OutboxEntry {
 /** One attempt: encrypt to the current prekey, sign, post. Returns the prekey ID used. */
 export type OutboxTransport = (attempt: {
   messageId: string; to: string; content: PrivateContent;
-  /** Refresh the peer's descriptor first; throw `unknown_prekey` if its current prekey is still `avoidPrekey`. */
+  /**
+   * Refresh the peer's descriptor first (every retry: the peer may have lost its prekeys with its state, 06 § Outbox
+   * step 1); throw `unknown_prekey` if its current prekey is still `avoidPrekey`.
+   */
   refresh: boolean; avoidPrekey?: string;
+  /**
+   * An attempt after the first: the transport adds `admission` to this attempt's content when it holds `to` as
+   * `admitted` (05 § Admission recovery). The stored content never carries it.
+   */
+  retry: boolean;
 }) => Promise<{ prekey: string }>;
 
 export interface OutboxOptions {
@@ -217,8 +226,9 @@ export class Outbox {
       const e = claimed.e;
       let prekey: string | undefined, error: ACEError | undefined;
       try {
+        const retry = e.attempts > 0;
         ({ prekey } = await this.#o.transport({
-          messageId, to: e.to, content: e.content, refresh: e.rejectedPrekey !== undefined,
+          messageId, to: e.to, content: e.content, refresh: retry || e.rejectedPrekey !== undefined, retry,
           ...(e.rejectedPrekey !== undefined ? { avoidPrekey: e.rejectedPrekey } : {}),
         }));
       } catch (err) {

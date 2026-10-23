@@ -5,7 +5,7 @@ import {
   type ParsedMessage, type PrivateContent,
 } from './sdk.js';
 import { CONTACT_REQUEST_TTL_SECONDS, MAX_PENDING_CONTACT_REQUESTS } from '../src/limits.js';
-import { Clock, FakeRelay, agent, type TestAgent } from './helpers.js';
+import { Clock, FakeRelay, NOW, agent, type TestAgent } from './helpers.js';
 
 const text = new ProfileSet(['text']);
 const msg = (message: string): PrivateContent => ({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message } });
@@ -221,7 +221,7 @@ describe('admission', () => {
     await alice.store.write(`admission/requests/${sha256Hex(B)}.json`, canonicalStateBytes(held!));
     await expect(alice.client.accept(B)).rejects.toMatchObject({ code: 'not_permitted' });
     expect((await alice.client.admission.get(B))!.status).toBe('blocked');
-    expect(relay.blocks.get(`${A}|${B}`)).toEqual({ blocked: true, revision: 1 });
+    expect(relay.blocks.get(`${A}|${B}`)).toEqual({ blocked: true, revision: NOW }); // max(0 + 1, now)
   });
 
   it('a concurrent block and accept never end admitted', async () => {
@@ -293,7 +293,7 @@ describe('admission', () => {
     clock.advance(10);
     await bob.id.delegate({ now: clock.t });
     await bob.client.maintain(); // republishes (registering the new KEL) and re-sends a request carrying a fresh permit
-    expect((await bob.client.admission.get(A))!.issued!.seq).toBe(bob.id.getSigningSeq()); // once per delegation
+    expect((await bob.client.admission.get(A))!.issued!.signature.seq).toBe(bob.id.getSigningSeq()); // once per delegation
     const sends = relay.sent.length;
     await bob.client.maintain();
     expect(relay.sent.length).toBe(sends);

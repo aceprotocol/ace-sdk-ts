@@ -13,6 +13,17 @@ export function isMessageType(t: unknown): t is string {
   return typeof t === 'string' && t.length <= 256 && NAMESPACED_ID_RE.test(t);
 }
 
+/**
+ * What an Outbox retry carries (05 § Admission recovery): `proof`, the permit the receiver issued the sender; `permit`,
+ * a reply permit the sender issues the receiver; and `source`, the sender's current PublishedAgent. Decoding checks
+ * only that all three are JSON objects; the receiver verifies them and never hands them to the application.
+ */
+export interface Admission {
+  proof: JSONObject;
+  permit: JSONObject;
+  source: JSONObject;
+}
+
 /** The encrypted private content of a packet: its canonical JSON is the plaintext. */
 export interface PrivateContent {
   type: string;
@@ -20,6 +31,8 @@ export interface PrivateContent {
   schemaDigest: string;
   threadId?: string;
   body: JSONObject;
+  /** Only on an application message's Outbox retry (03 § Private content); never on receipts or contact packets. */
+  admission?: Admission;
 }
 
 /** A verified, decrypted and schema-checked inbound message. */

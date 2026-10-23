@@ -1,7 +1,8 @@
 /**
  * The local admission table: which peers may deliver to this identity, the permits exchanged with them, blocks, and
  * pending incoming contact requests. Only explicit local actions (connect, accept, block) change admission; a remote
- * packet never does, except the `accepted` answer to a request this identity sent.
+ * packet never does, except the `accepted` answer to a request this identity sent and a packet presenting a permit this
+ * identity issued (05 § Admission recovery). The table caches those decisions: the issued permits are the decision.
  */
 import { canonicalStateBytes, isACEId, isObj, nowOf, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
 import { CONTACT_REQUEST_TTL_SECONDS, MAX_PENDING_CONTACT_REQUESTS, OFFLINE_WINDOW_SECONDS } from './limits.js';
@@ -15,10 +16,13 @@ export type PeerStatus = 'pending' | 'admitted' | 'blocked';
 export interface PeerRecord {
   aceId: string;
   status: PeerStatus;
-  /** The profile the relationship was opened for. */
+  /** The profile the relationship was opened for; absent on a row restored by admission recovery (05). */
   profile?: string;
-  /** The newest permit we issued to the peer, recorded once the packet carrying it was sent (renewed through receipts). */
-  issued?: { expiresAt: number; seq: number };
+  /**
+   * The newest permit we issued to the peer, recorded once the packet carrying it was sent (renewed through receipts);
+   * an Outbox retry presents it again as its reply permit while it is valid (05 § Admission recovery).
+   */
+  issued?: DeliveryPermit;
   /**
    * While a local block is not yet registered at the relay: the revision allocated for it, sent unchanged by every
    * retry (`maintain`); absent once the relay confirmed or superseded it.
@@ -55,7 +59,8 @@ async function readAll(store: ACEStore, prefix: string): Promise<Array<[string, 
 function checkRecord(v: unknown, aceId: string): PeerRecord {
   const ok = isObj(v) && v.aceId === aceId && STATUSES.has(v.status) && wireInt(v.updatedAt) !== null
     && (v.profile === undefined || typeof v.profile === 'string')
-    && (v.issued === undefined || (isObj(v.issued) && wireInt(v.issued.expiresAt) !== null && wireInt(v.issued.seq) !== null))
+    && (v.issued === undefined || (isObj(v.issued) && v.issued.subject === aceId && wireInt(v.issued.expiresAt) !== null
+      && isObj(v.issued.signature) && wireInt(v.issued.signature.seq) !== null))
     && (v.unsyncedRevision === undefined || (v.status === 'blocked' && wireInt(v.unsyncedRevision) !== null));
   if (!ok) throw new ACEError('storage_failed', 'admission record is invalid');
   return v as unknown as PeerRecord;
@@ -180,8 +185,9 @@ export class AdmissionBook {
   }
 
   /**
-   * The next relay block revision for `aceId` (05 § Blocks: strictly increasing per peer), persisted before it is used
-   * and kept after an unblock, as the relay keeps it: a retried or lost request never reuses a revision.
+   * The next relay block revision for `aceId` (05 § Blocks: strictly increasing per peer, `max(previous + 1, now)` so a
+   * decision made after the records were lost still outranks the earlier ones), persisted before it is used and kept
+   * after an unblock, as the relay keeps it: a retried or lost request never reuses a revision.
    */
   async nextBlockRevision(aceId: string, expectedRevision?: number): Promise<number> {
     if (!isACEId(aceId)) throw new ACEError('invalid_argument', 'aceId must be an ACE ID');
@@ -233,8 +239,8 @@ export class AdmissionBook {
   }
 
   async #allocate(aceId: string): Promise<number> {
-    const old = await this.blockRevision(aceId);
-    await this.#store.write(revisionKey(aceId), canonicalStateBytes({ revision: old + 1 }));
-    return old + 1;
+    const next = Math.max(await this.blockRevision(aceId) + 1, nowOf(this.#clock));
+    await this.#store.write(revisionKey(aceId), canonicalStateBytes({ revision: next }));
+    return next;
   }
 }

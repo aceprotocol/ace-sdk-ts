@@ -7,7 +7,7 @@
  *   payload = nonce[12] ‖ AES-256-GCM(key, nonce, plaintext, aad = header)
  *   signature (action "packet") over M(from, timestamp, seq, encodePayload(to, messageId, prekeyId, kemCiphertext, payload))
  *
- * The plaintext is the canonical JSON of the private content `{type, schemaDigest, threadId?, body}`.
+ * The plaintext is the canonical JSON of the private content `{type, schemaDigest, threadId?, body, admission?}`.
  */
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
@@ -22,7 +22,7 @@ import { checkSignatureShape, verifyOperationalSignature, type KelState, type Op
 import { KEM_CIPHERTEXT_SIZE, MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, OFFLINE_WINDOW_SECONDS, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { decodePrekey, type Prekey, type PrekeyVault } from './prekey.js';
 import { encodePayload, SIGNATURE_SIZE, signingMessage } from './signing.js';
-import { isMessageType, type JSONObject, type PrivateContent } from './types.js';
+import { isMessageType, type Admission, type JSONObject, type PrivateContent } from './types.js';
 
 const VERSION = '1';
 const DOMAIN = 'ace.v1.packet';
@@ -168,11 +168,16 @@ export function encodePrivateContent(content: PrivateContent): Uint8Array {
 }
 
 function checkPrivateContent(c: unknown): asserts c is PrivateContent {
-  if (!closedKeys(c, ['type', 'schemaDigest', 'body'], ['threadId'])) throw new ACEError('invalid_body', 'private content must be {type, schemaDigest, threadId?, body}');
+  if (!closedKeys(c, ['type', 'schemaDigest', 'body'], ['threadId', 'admission'])) throw new ACEError('invalid_body', 'private content must be {type, schemaDigest, threadId?, body, admission?}');
   if (!isMessageType(c.type)) throw new ACEError('invalid_body', 'type must be a namespaced identifier');
   if (!isHex64(c.schemaDigest)) throw new ACEError('invalid_body', 'schemaDigest must be 64 lowercase hex');
   if (c.threadId !== undefined && !isThreadId(c.threadId)) throw new ACEError('invalid_body', 'invalid threadId');
   if (!isObj(c.body)) throw new ACEError('invalid_body', 'body must be a JSON object');
+  // 03 § Private content: the closed `{proof, permit, source}` of three JSON objects; their contents are checked by 05.
+  const a = c.admission;
+  if (a !== undefined && !(closedKeys(a, ['proof', 'permit', 'source']) && isObj(a.proof) && isObj(a.permit) && isObj(a.source))) {
+    throw new ACEError('invalid_body', 'admission must be {proof, permit, source} of three JSON objects');
+  }
   checkJsonValue(c); // 02 § JSON values: depth counted from the plaintext's top-level value
 }
 
@@ -180,7 +185,10 @@ function checkPrivateContent(c: unknown): asserts c is PrivateContent {
 export function decodePrivateContent(raw: Uint8Array): PrivateContent {
   const c = parseJSONBytes(raw, 'invalid_body', 'plaintext');
   checkPrivateContent(c);
-  return { type: c.type, schemaDigest: c.schemaDigest, ...(c.threadId !== undefined ? { threadId: c.threadId } : {}), body: c.body as JSONObject };
+  return {
+    type: c.type, schemaDigest: c.schemaDigest, ...(c.threadId !== undefined ? { threadId: c.threadId } : {}), body: c.body as JSONObject,
+    ...(c.admission !== undefined ? { admission: c.admission as unknown as Admission } : {}),
+  };
 }
 
 export interface CreatePacketInput {

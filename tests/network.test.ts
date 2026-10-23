@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ACEError, MemoryStore, NetworkClient, ProfileSet, createDelegationCredential, createDescriptor, createInvitation, verifyInvitation, verifyKel, MAX_PERMIT_LIFETIME } from './sdk.js';
-import { Clock, FakeRelay, RELAY, agent, identity } from './helpers.js';
+import { Clock, FakeRelay, NOW, RELAY, agent, identity } from './helpers.js';
 
 describe('NetworkClient', () => {
   it('contact flow, delivery with receipts, permit renewal through receipts', async () => {
@@ -67,11 +67,11 @@ describe('NetworkClient', () => {
     expect((await bob.client.admission.get(A))!.status).toBe('admitted');
 
     await alice.client.block(B);
-    expect(relay.blocks.get(`${A}|${B}`)).toEqual({ blocked: true, revision: 1 });
+    expect(relay.blocks.get(`${A}|${B}`)).toEqual({ blocked: true, revision: NOW });
     const e = await bob.client.send(A, 'ace:text:1', { message: 'x' });
     expect(e.code).toBe('not_permitted'); // the relay refuses, the Outbox keeps retrying until expiry
     await alice.client.unblock(B);
-    expect(relay.blocks.get(`${A}|${B}`)).toEqual({ blocked: false, revision: 2 });
+    expect(relay.blocks.get(`${A}|${B}`)).toEqual({ blocked: false, revision: NOW + 1 });
   });
 
   it('a blocked stranger\'s contact request reads like one to a closed peer (05 § Blocks)', async () => {

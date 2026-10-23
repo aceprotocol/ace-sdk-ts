@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { NetworkClient, ReplayDetector, canonicalStateBytes, contactContent, createCardRecord, createPacket, createPermit, sha256Hex } from './sdk.js';
-import { Clock, FakeRelay, RELAY, agent } from './helpers.js';
+import { Clock, FakeRelay, NOW, RELAY, agent } from './helpers.js';
 
 // Insert a local block at the await between a network operation's admission read and its locked update.
 async function blockBeforeNextUpdate(client: NetworkClient, peer: string) {
@@ -98,7 +98,7 @@ describe('security review regressions', () => {
       await bob.client.block(A);
       await bob.client.createInvitation(A);
       expect((await bob.client.admission.get(A))?.status).toBe('admitted');
-      expect(relay.blocks.get(`${B}|${A}`)).toEqual({ blocked: false, revision: 2 });
+      expect(relay.blocks.get(`${B}|${A}`)).toEqual({ blocked: false, revision: NOW + 1 });
       await bob.client.block(A);
       const setBlock = bob.client.relay.setBlock.bind(bob.client.relay);
       vi.spyOn(bob.client.relay, 'setBlock').mockImplementationOnce(async (...args) => {
@@ -107,7 +107,7 @@ describe('security review regressions', () => {
       });
       await expect(bob.client.createInvitation(A)).rejects.toMatchObject({ code: 'not_permitted' });
       expect((await bob.client.admission.get(A))?.status).toBe('blocked');
-      expect(relay.blocks.get(`${B}|${A}`)).toEqual({ blocked: true, revision: 5 });
+      expect(relay.blocks.get(`${B}|${A}`)).toEqual({ blocked: true, revision: NOW + 4 });
     } finally { await alice.client.close(); await bob.client.close(); }
   });
 

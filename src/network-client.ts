@@ -18,7 +18,7 @@ import type { KelEvent, KelState } from './kel.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
 import { Inbox, type ContactEvent, type ReceiveOutcome } from './inbox.js';
 import { verifyInvitation, type Invitation } from './invitation.js';
-import { MAX_PERMIT_LIFETIME, PERMIT_RENEWAL_SECONDS, PREKEY_ROTATION_SECONDS } from './limits.js';
+import { MAX_PERMIT_LIFETIME, MAX_PLAINTEXT_BYTES, PERMIT_RENEWAL_SECONDS, PREKEY_ROTATION_SECONDS } from './limits.js';
 import { ProfileSet, type ProfileManifest } from './manifest.js';
 import { MessageLog } from './message-log.js';
 import { FileStore, publicRelay } from './node.js';
@@ -143,6 +143,17 @@ const noValidPermit = () => new ACEError('not_permitted', 'no valid permit from 
 const contactRefused = () => new ACEError('not_permitted', 'the peer does not accept contact requests from this identity');
 const isNotPermitted = (e: unknown): boolean => e instanceof ACEError && e.code === 'not_permitted';
 
+/**
+ * `content` with the `admission` of an Outbox retry (05 § Admission recovery): `proof`, the permit presented to the
+ * relay; `permit`, our reply permit; `source`, our current PublishedAgent (relays do not federate, so the receiver
+ * cannot look us up). Left out when the content with it would exceed MAX_PLAINTEXT_BYTES.
+ */
+function withAdmission(content: PrivateContent, proof: DeliveryPermit, permit: DeliveryPermit, source: PublishedAgent): PrivateContent {
+  const json = (v: unknown) => v as JSONObject;
+  const next: PrivateContent = { ...content, admission: { proof: json(proof), permit: json(permit), source: json(source) } };
+  return canonicalStateBytes(next).length <= MAX_PLAINTEXT_BYTES ? next : content;
+}
+
 /** The record an explicit admission starts from: the old one without its block sync state. */
 function unblocked(old: PeerRecord | null, aceId: string): Omit<PeerRecord, 'status' | 'updatedAt'> {
   if (old === null) return { aceId };
@@ -182,7 +193,7 @@ export class NetworkClient {
     for (const p of o.acceptProfiles ?? []) if (!this.profiles.has(p)) throw new ACEError('invalid_argument', `acceptProfiles entry ${p} is not installed`);
     this.outbox = new Outbox({
       identity: o.identity, store, profiles: this.profiles, rules: this.#rules(), clock: o.clock,
-      transport: ({ to, content, messageId, refresh, avoidPrekey }) => this.#post(to, content, { messageId, refresh, avoidPrekey, needPermit: true }),
+      transport: ({ to, content, messageId, refresh, avoidPrekey, retry }) => this.#post(to, content, { messageId, refresh, avoidPrekey, needPermit: true, recover: retry }),
       // A cached descriptor (even a stale one: attempts refresh it) suffices; otherwise one must resolve now.
       resolvePeer: async (to) => { if (await this.#read<PublishedAgent>(agentKey(to)) === null) await this.agent(to); },
     });
@@ -208,6 +219,7 @@ export class NetworkClient {
       onContact: (e) => c.#onContact(e),
       sendReceipt: (to, body) => c.#sendReceipt(to, body),
       refreshPeer: async (id) => { await c.agent(id, { refresh: true }); },
+      importSource: async (agent) => { await c.importAgent(agent); },
       threadBusy: async (peer, threadId) => (await c.outbox.busy(peer, threadId)) !== null,
     });
     return c;
@@ -619,21 +631,29 @@ export class NetworkClient {
   /**
    * Encrypt `content` to the peer's current prekey and post it to its routes (single attempt). `needPermit` (every
    * Outbox attempt, 06 § Outbox step 3): without a permit valid under the peer's current pin the attempt fails
-   * `not_permitted` and nothing is posted; it never falls back to the stranger path.
+   * `not_permitted` and nothing is posted; it never falls back to the stranger path. `recover` (an Outbox retry): the
+   * content carries `admission`, with our current PublishedAgent, for this attempt only (05 § Admission recovery).
    */
-  async #post(to: string, content: PrivateContent, o: { messageId?: string; refresh: boolean; avoidPrekey?: string; permit?: DeliveryPermit; needPermit?: boolean }): Promise<{ prekey: string }> {
-    const agent = await this.agent(to, { refresh: o.refresh });
+  async #post(to: string, content: PrivateContent, o: { messageId?: string; refresh: boolean; avoidPrekey?: string; permit?: DeliveryPermit; needPermit?: boolean; recover?: boolean }): Promise<{ prekey: string }> {
+    // A retry's refresh (the peer may have lost its prekeys) falls back to a cached descriptor still unexpired and bound to
+    // the pins; a refresh asked by `unknown_prekey` (`avoidPrekey`) does not (06 § Outbox step 1).
+    const agent = o.recover === true && o.avoidPrekey === undefined && o.refresh
+      ? await this.agent(to, { refresh: true }).catch(() => this.agent(to))
+      : await this.agent(to, { refresh: o.refresh });
     const prekey = agent.descriptor.prekey;
     if (o.avoidPrekey !== undefined && prekey.id === o.avoidPrekey) throw new ACEError('unknown_prekey', 'the peer still publishes the rejected prekey');
-    const [packet, permit] = await Promise.all([
-      createPacket({ identity: this.identity, to, prekey, content, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: this.#now() }),
-      this.#theirPermit(to, o.permit),
-    ]);
+    const permit = await this.#theirPermit(to, o.permit);
     if (o.needPermit && permit === undefined) throw noValidPermit();
+    const reply = o.recover && permit !== undefined ? await this.#replyPermit(to) : undefined;
+    const source = reply !== undefined ? await this.#ownSource() : undefined;
+    const sent = reply !== undefined && source !== undefined ? withAdmission(content, permit!, reply.permit, source) : content;
+    const packet = await createPacket({ identity: this.identity, to, prekey, content: sent, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: this.#now() });
     let error: unknown;
     for (const route of agent.descriptor.relays) {
       try {
         await this.#relayFor(route).send(packet, permit);
+        // A fresh reply permit counts as issued once the attempt carrying it was sent.
+        if (reply?.fresh && sent !== content) await this.#noteIssued(to, reply.permit);
         return { prekey: prekey.id };
       } catch (e) {
         error = e;
@@ -649,6 +669,31 @@ export class NetworkClient {
   async #sendContact(to: string, body: Omit<ContactBody, 'note' | 'source'> & { note?: string; source?: PublishedAgent }, o: { messageId?: string; permit?: DeliveryPermit } = {}): Promise<void> {
     const source = body.source ?? await this.publish();
     await this.#post(to, contactContent({ ...body, note: body.note ?? '', source }), { refresh: false, ...o });
+  }
+
+  /**
+   * The reply permit of an Outbox retry to `peer` (05 § Admission recovery), only while we hold it as `admitted`: the
+   * newest one issued to it while still good for a receipt (`#issuedLive`), else a fresh one (`fresh`), recorded as
+   * issued only once the attempt was sent.
+   */
+  async #replyPermit(peer: string): Promise<{ permit: DeliveryPermit; fresh: boolean } | undefined> {
+    const rec = await this.admission.get(peer);
+    if (rec?.status !== 'admitted') return undefined;
+    const live = this.#issuedLive(rec);
+    return live !== undefined ? { permit: live, fresh: false } : { permit: await this.#createPermit(peer), fresh: true };
+  }
+
+  /**
+   * Our PublishedAgent for an Outbox retry's `admission.source`; never fails the attempt: `publish` (it posts only when
+   * due), else the last published one while unexpired, else undefined (the attempt goes without `admission`).
+   */
+  async #ownSource(): Promise<PublishedAgent | undefined> {
+    try {
+      return await this.publish();
+    } catch {
+      const self = await this.#read<SelfRecord>(SELF_KEY).catch(() => null);
+      return self !== null && self.agent.descriptor.expiresAt > this.#now() ? self.agent : undefined;
+    }
   }
 
   /** One receipt attempt, carrying a permit renewal when due; the renewal counts as issued once the receipt was sent. */
@@ -712,10 +757,11 @@ export class NetworkClient {
     const seq = this.identity.getSigningSeq();
     let source: PublishedAgent | undefined;
     for (const rec of await this.admission.list()) {
-      if (rec.status !== 'admitted' || rec.issued?.seq === seq) continue;
+      if (rec.status !== 'admitted' || rec.issued?.signature.seq === seq) continue;
       try {
         const agent = await this.agent(rec.aceId);
         const shared = agent.descriptor.profiles.filter((p) => this.profiles.shares(p)).map((p) => p.id);
+        // A row restored by admission recovery records no profile: the first both list (05 § Delivery permits).
         const profile = rec.profile !== undefined && shared.includes(rec.profile) ? rec.profile : shared[0];
         if (profile === undefined) continue;
         const permit = await this.#createPermit(rec.aceId);
@@ -734,15 +780,23 @@ export class NetworkClient {
 
   /** Record `permit` as the newest one issued to `peer`, once the packet (or invitation) carrying it was sent. */
   async #noteIssued(peer: string, permit: DeliveryPermit): Promise<void> {
-    await this.admission.update(peer, (old) => old && { ...old, issued: { expiresAt: permit.expiresAt, seq: permit.signature.seq } });
+    await this.admission.update(peer, (old) => old && { ...old, issued: permit });
+  }
+
+  /**
+   * The newest permit issued to the peer of `rec` while it is not due for renewal: it verifies under our current KEL
+   * and has at least PERMIT_RENEWAL_SECONDS left (05 § Renewal).
+   */
+  #issuedLive(rec: PeerRecord): DeliveryPermit | undefined {
+    const now = this.#now(), issued = rec.issued;
+    if (issued === undefined || issued.expiresAt - now < PERMIT_RENEWAL_SECONDS) return undefined;
+    try { return verifyPermit(issued, checkUsable(this.identity, now), rec.aceId, now); } catch { return undefined; }
   }
 
   /** A fresh permit for a receipt to `peer` when the newest one issued to it is due for renewal (05 § Renewal). */
   async #renewal(peer: string): Promise<DeliveryPermit | undefined> {
     const rec = await this.admission.get(peer);
-    if (rec === null || rec.status === 'blocked') return undefined;
-    const i = rec.issued;
-    if (i && i.expiresAt - this.#now() >= PERMIT_RENEWAL_SECONDS && i.seq === this.identity.getSigningSeq()) return undefined;
+    if (rec === null || rec.status === 'blocked' || this.#issuedLive(rec) !== undefined) return undefined;
     return this.#createPermit(peer);
   }
 
@@ -874,7 +928,10 @@ export class NetworkClient {
     });
   }
 
-  /** Remove a block, relay first (the peer becomes a stranger again until contact is re-established). */
+  /**
+   * Remove a block, relay first. The peer becomes a stranger again until it presents a permit it still holds, which
+   * re-admits it (05 § Admission recovery), or contact is established again.
+   */
   async unblock(aceId: string): Promise<void> {
     const old = await this.admission.get(aceId);
     if (old?.status !== 'blocked') return;
