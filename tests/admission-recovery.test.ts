@@ -5,10 +5,27 @@ import { vi } from 'vitest';
 import {
   ACEError, AdmissionBook, MemoryStore, NetworkClient, MAX_PLAINTEXT_BYTES, canonicalStateBytes, createDescriptor,
   createPermit, decodePacket, decodePrivateContent, decryptPacket, encodePrivateContent, receiptContent, contactContent,
+  encodePayload, signingMessage, toBase64, type Prekey, type SoftwareIdentity,
   type DeliveryPermit, type InboxOptions, type JSONObject, type NetworkClientOptions, type PrivateContent, type ProfileManifest,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, type TestAgent } from './helpers.js';
 import { inboxWorld, msg, text } from './helpers2.js';
+import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
+import { packetHeader, sealPayload } from '../src/packet.js';
+import { decodePrekey } from '../src/prekey.js';
+
+/** A signed packet whose plaintext is `content` as is (`createPacket` refuses content its decoding would refuse). */
+async function packRaw(from: SoftwareIdentity, to: string, prekey: Prekey, content: unknown, timestamp: number) {
+  const { cipherText, sharedSecret } = ml_kem768_x25519.encapsulate(decodePrekey(prekey));
+  const messageId = crypto.randomUUID(), sender = from.getACEId(), seq = from.getSigningSeq();
+  const payload = await sealPayload(sharedSecret, packetHeader(sender, to, messageId, timestamp, prekey.id, cipherText), canonicalStateBytes(content));
+  const m = signingMessage(sender, timestamp, seq, encodePayload(to, messageId, prekey.id, cipherText, payload));
+  return {
+    ace: '1', messageId, from: sender, to, timestamp,
+    encryption: { prekey: prekey.id, kemCiphertext: toBase64(cipherText), payload: toBase64(payload) },
+    signature: { scheme: 'ml-dsa-65', seq, value: toBase64(await from.sign(m, 'packet')) },
+  };
+}
 
 const TEXT = 'ace:text:1';
 const enc = (v: unknown) => new TextEncoder().encode(JSON.stringify(v));
@@ -155,24 +172,28 @@ describe('05 § Admission recovery: a reinstalled endpoint', () => {
     await alice.client.close(); await bob2.client.close();
   });
 
-  it('our source never fails a retry: publish, else the last published one while unexpired, else no admission', async () => {
+  it('our source is local: the stored PublishedAgent while unexpired, else the retry goes without admission', async () => {
     const { clock, relay, alice, bob, b } = await pair();
     const published = await alice.client.publish();
-    const spy = vi.spyOn(alice.client, 'publish').mockRejectedValue(new ACEError('relay_unavailable', 'down'));
-    relay.inject.push({ path: '/v1/send', status: 503, code: 'internal_error' });
-    await alice.client.send(b, TEXT, { message: 'one' });
-    clock.advance(60);
-    expect((await alice.client.flush())[0]).toMatchObject({ attempts: 2, status: 'pending' });
-    expect((await sentContent(relay, relay.sent.length - 1, bob)).admission?.source).toEqual(published);
-
-    await alice.store.delete('network/self.json'); // nothing published to fall back to
-    relay.inject.push({ path: '/v1/send', status: 503, code: 'internal_error' });
-    await alice.client.send(b, TEXT, { message: 'two' });
-    clock.advance(60);
-    expect((await alice.client.flush())[0]).toMatchObject({ attempts: 2, status: 'pending' });
-    expect(await sentContent(relay, relay.sent.length - 1, bob)).not.toHaveProperty('admission');
-    expect(spy).toHaveBeenCalled();
-    expect((await bob.client.pull()).map((o) => o.kind)).toEqual(['delivered', 'delivered']);
+    const publish = vi.spyOn(alice.client, 'publish');
+    const retry = async (message: string) => {
+      relay.inject.push({ path: '/v1/send', status: 503, code: 'internal_error' });
+      const e = await alice.client.send(b, TEXT, { message });
+      clock.advance(60);
+      await alice.client.outbox.attempt(e.messageId);
+      expect(await alice.client.outbox.get(e.messageId)).toMatchObject({ attempts: 2, status: 'pending' });
+      return sentContent(relay, relay.sent.length - 1, bob);
+    };
+    expect((await retry('one')).admission?.source).toEqual(published);
+    // An expired stored descriptor is never sent (not re-verified, only its expiry checked).
+    const self = JSON.parse(new TextDecoder().decode((await alice.store.read('network/self.json'))!));
+    self.agent.descriptor.expiresAt = clock.t;
+    await alice.store.write('network/self.json', new TextEncoder().encode(JSON.stringify(self)));
+    expect(await retry('two')).not.toHaveProperty('admission');
+    await alice.store.delete('network/self.json');
+    expect(await retry('three')).not.toHaveProperty('admission');
+    expect(publish).not.toHaveBeenCalled(); // attempts never publish
+    expect((await bob.client.pull()).map((o) => o.kind)).toEqual(['delivered', 'delivered', 'delivered']);
     await alice.client.close(); await bob.client.close();
   });
 
@@ -180,6 +201,7 @@ describe('05 § Admission recovery: a reinstalled endpoint', () => {
     const { clock, relay, alice, bob, a, b } = await pair();
     clock.advance(16 * 86400); // alice's issued permit has less than PERMIT_RENEWAL_SECONDS left; bob's to alice is still valid
     await bob.client.publish();
+    await alice.client.publish(); // upkeep keeps our own source fresh
     const before = (await alice.client.admission.get(b))!.issued!;
     relay.inject.push({ path: '/v1/send', status: 503, code: 'internal_error' }, { path: '/v1/send', status: 503, code: 'internal_error' });
     const e = await alice.client.send(b, TEXT, { message: 'x' }); // attempt 1 fails at the relay
@@ -395,16 +417,19 @@ describe('06 § Recovery candidates: the receiver', () => {
     expect(w.delivered.map((m) => Object.keys(m).includes('admission'))).toEqual([false, false]);
   });
 
-  it('receipts and contact packets carrying admission are dropped invalid_body', async () => {
+  it('receipts and contact packets carrying admission are dropped invalid_body (decoding refuses them)', async () => {
     const w = await inboxWorld();
     const adm = { proof: {}, permit: {}, source: {} };
     const receipt = { ...receiptContent({ messageId: crypto.randomUUID(), outcome: 'delivered' }), admission: adm };
-    expect(await w.inbox.receive(await w.pack(w.sender, receipt))).toMatchObject({ kind: 'dropped', error: { code: 'invalid_body' } });
     const contact = { ...contactContent({ kind: 'rejected', profile: TEXT, note: '', source: {} as never }), admission: adm };
-    expect(await w.inbox.receive(await w.pack(w.sender, contact))).toMatchObject({ kind: 'dropped', error: { code: 'invalid_body' } });
-    // Unpinned: a contact candidate with admission is dropped too.
+    for (const c of [receipt, contact]) {
+      expect(() => encodePrivateContent(c as PrivateContent)).toThrow(expect.objectContaining({ code: 'invalid_body' }));
+      expect(() => decodePrivateContent(canonicalStateBytes(c))).toThrow(expect.objectContaining({ code: 'invalid_body' }));
+      expect(await w.inbox.receive(await packRaw(w.sender, w.me.getACEId(), w.prekey, c, w.clock.t))).toMatchObject({ kind: 'dropped', error: { code: 'invalid_body' } });
+    }
+    // Unpinned: a contact candidate with admission is dropped too, nothing pinned.
     const v = await world();
-    expect((await v.inbox.receive(await v.pack(v.sender, contact))).kind).toBe('dropped');
+    expect(await v.inbox.receive(await packRaw(v.sender, v.mine, v.prekey, contact, v.clock.t))).toMatchObject({ kind: 'dropped', error: { code: 'invalid_body' } });
     await untouched(v);
   });
 });

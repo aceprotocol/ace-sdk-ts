@@ -20,6 +20,7 @@ import {
 import { checkUsable, type ACEIdentity } from './identity.js';
 import { checkSignatureShape, verifyOperationalSignature, type KelState, type OperationalSignature } from './kel.js';
 import { KEM_CIPHERTEXT_SIZE, MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, OFFLINE_WINDOW_SECONDS, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import { CONTACT_TYPE, RECEIPT_TYPE } from './manifest.js';
 import { decodePrekey, type Prekey, type PrekeyVault } from './prekey.js';
 import { encodePayload, SIGNATURE_SIZE, signingMessage } from './signing.js';
 import { isMessageType, type Admission, type JSONObject, type PrivateContent } from './types.js';
@@ -178,6 +179,8 @@ function checkPrivateContent(c: unknown): asserts c is PrivateContent {
   if (a !== undefined && !(closedKeys(a, ['proof', 'permit', 'source']) && isObj(a.proof) && isObj(a.permit) && isObj(a.source))) {
     throw new ACEError('invalid_body', 'admission must be {proof, permit, source} of three JSON objects');
   }
+  // Receipts and contact packets never carry it (03 § Private content).
+  if (a !== undefined && (c.type === RECEIPT_TYPE || c.type === CONTACT_TYPE)) throw new ACEError('invalid_body', `${c.type} carries admission`);
   checkJsonValue(c); // 02 § JSON values: depth counted from the plaintext's top-level value
 }
 

@@ -16,9 +16,7 @@
  */
 import { AdmissionBook, type PeerRecord } from './admission.js';
 import { checkContactBody, checkReceiptBody, type ContactBody, type ReceiptBody } from './core-messages.js';
-import {
-  checkStrangerSource, delegationIssuers, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type PublishedAgent, type VerifiedAgent,
-} from './descriptor.js';
+import { checkStrangerSource, delegationIssuers, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent } from './descriptor.js';
 import type { Contact } from './card-record.js';
 import { ACEError, asACEError } from './errors.js';
 import { canonicalStateBytes, conversationKey, isACEId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
@@ -89,10 +87,10 @@ export interface InboxOptions {
   /** Fetch an admitted peer's current descriptor and adopt its KEL into `peers`. */
   refreshPeer?: (aceId: string) => Promise<void>;
   /**
-   * Pin a recovery candidate's verified `source` (05 § Admission recovery) and cache its descriptor, so a reply can
-   * reach a sender homed at another relay. Default: adopt its KEL into `peers` only.
+   * Internal (NetworkClient): pin a recovery candidate's `source`, already verified (05 § Admission recovery), and cache
+   * its descriptor, so a reply can reach a sender homed at another relay. Default: adopt its KEL into `peers` only.
    */
-  importSource?: (agent: PublishedAgent) => Promise<void>;
+  importSource?: (source: VerifiedAgent) => Promise<void>;
   capacity?: number;
   clock?: () => number;
   /** Development only: accept loopback `http://` relays in contact sources. */
@@ -289,7 +287,9 @@ export class Inbox {
     // 2. admission, before any lookup
     const record = await this.#admission.get(packet.from);
     if (record?.status === 'blocked') return drop(new ACEError('not_permitted', 'sender is blocked'));
-    if (record === null) return this.#stranger(packet);
+    // A stranger (05 § Receiver admission): decrypted without any lookup or pin write; only a recovery candidate or an
+    // `open` identity's contact request continues.
+    if (record === null) return this.#candidate(packet, true, true);
     // 3. pin. A peer in the table without a pin is authenticated by a contact packet's `source` or by admission recovery.
     let state: KelState | null;
     try {
@@ -325,8 +325,6 @@ export class Inbox {
       return settle(err);
     }
     const core = content.type === RECEIPT_TYPE || content.type === CONTACT_TYPE;
-    // 03 § Private content: receipts and contact packets never carry `admission`.
-    if (core && content.admission !== undefined) return drop(new ACEError('invalid_body', 'a core packet carries admission'));
     // 7-8. installed (type, schemaDigest), then body schema
     try {
       this.#o.profiles.validate(content.type, content.schemaDigest, content.body);
@@ -368,14 +366,6 @@ export class Inbox {
   }
 
   /**
-   * A sender outside the admission table (05 § Receiver admission): decrypted without any lookup or pin write, then only
-   * a recovery candidate or an `open` identity's contact request continues.
-   */
-  #stranger(packet: Packet): Promise<ReceiveOutcome> {
-    return this.#candidate(packet, true, true);
-  }
-
-  /**
    * A sender without a pin that authenticates the packet (06 § Contact candidates, § Recovery candidates): steps 1, 2,
    * 5, 6, 7, then an `ace:contact:1` packet takes the contact-candidate path and, with `recover` (no pin at all), any
    * other packet carrying `admission` the recovery path. Anything else is dropped `not_permitted`.
@@ -389,7 +379,7 @@ export class Inbox {
       return settle(asACEError(e, 'not_permitted'));
     }
     if (content.type === CONTACT_TYPE) return this.#contactCandidate(packet, content, stranger);
-    if (recover && content.type !== RECEIPT_TYPE && content.admission !== undefined) return this.#restore(packet, content, content.admission);
+    if (recover && content.admission !== undefined) return this.#restore(packet, content, content.admission);
     return drop(new ACEError('not_permitted', stranger ? 'sender is not admitted' : 'an unpinned sender may only send contact packets'));
   }
 
@@ -401,7 +391,6 @@ export class Inbox {
   async #contactCandidate(packet: Packet, content: PrivateContent, stranger: boolean): Promise<ReceiveOutcome> {
     try {
       if (stranger && ((await this.#o.contact?.()) ?? 'closed') !== 'open') throw new ACEError('not_permitted', 'sender is not admitted');
-      if (content.admission !== undefined) throw new ACEError('invalid_body', 'a contact packet carries admission');
       this.#o.profiles.validate(content.type, content.schemaDigest, content.body);
       if (stranger && content.body.kind !== 'request') throw new ACEError('not_permitted', 'a stranger may only send a contact request');
       if (stranger) checkStrangerSource(content.body.source);
@@ -430,28 +419,14 @@ export class Inbox {
     } catch {
       return drop(new ACEError('not_permitted', 'sender is not admitted'));
     }
-    // `source` as a contact's (no stranger bounds: the proof shows we admitted the sender), never older than a log
-    // already pinned (01 § Pinning); then step 4 and the reply permit under it.
+    // `source` as a contact's (no stranger bounds: the proof shows we admitted the sender), then step 4 and the reply
+    // permit under it.
     let source: VerifiedAgent, permit: DeliveryPermit;
     try {
-      const s = admission.source;
-      if (!isObj(s.descriptor) || s.descriptor.aceId !== from) throw new ACEError('invalid_authorization', 'admission source is not the sender');
-      const [pinned, delegationPins] = await Promise.all([this.#peers.get(from), this.#peers.pins(delegationIssuers(s))]);
-      source = verifyPublishedAgent(s, this.#now(), { allowLoopbackRelays: this.#o.allowLoopbackRelays, pinned, delegationPins });
+      ({ source, permit } = await this.#verifySource(packet, admission.source, admission.permit, this.#now()) as { source: VerifiedAgent; permit: DeliveryPermit });
     } catch (e) {
       return drop(asACEError(e, 'invalid_authorization'));
     }
-    try {
-      verifyPacketSignature(packet, source.state, this.#now());
-    } catch (e) {
-      return drop(asACEError(e, 'invalid_signature'));
-    }
-    try {
-      permit = verifyPermit(admission.permit, source.state, this.#me, this.#now());
-    } catch (e) {
-      return drop(asACEError(e, 'invalid_authorization'));
-    }
-    const state = source.state;
     try {
       // Recorded under lock `admission`, where a block decided meanwhile wins; only then is the source pinned (as a
       // contact's, after its checks), so a blocked sender changes no pin.
@@ -461,9 +436,9 @@ export class Inbox {
         // The proof is a permit we issued the sender: the newest one issued to it unless a newer one is recorded.
         return old?.issued !== undefined && old.issued.issuedAt >= proof.issuedAt ? base : { ...base, issued: proof };
       });
-      if (this.#o.importSource !== undefined) await this.#o.importSource(structuredClone(source.agent));
-      else await this.#peers.adopt(structuredClone(state.events));
-      await this.#hold(permit, state, (r) => r?.status === 'admitted');
+      if (this.#o.importSource !== undefined) await this.#o.importSource(source);
+      else await this.#peers.adopt(structuredClone(source.state.events));
+      await this.#hold(permit, source.state, (r) => r?.status === 'admitted');
     } catch (e) {
       return settle(asACEError(e, 'storage_failed'));
     }
@@ -476,20 +451,25 @@ export class Inbox {
     return this.#application(packet, content);
   }
 
+  /**
+   * Authenticate an embedded `source` (a contact's, or a recovery candidate's `admission.source`): a PublishedAgent naming
+   * the sender, never older than a log already pinned (01 § Pinning; a stranger may still have a pin, e.g. an imported
+   * descriptor: reading it is local, and it must bind the source too), the packet signature under it (step 4), and the
+   * sender's `permit` issued to us under it, when given. Pins nothing.
+   */
+  async #verifySource(packet: Packet, raw: unknown, permit: unknown, now: number): Promise<{ source: VerifiedAgent; permit?: DeliveryPermit }> {
+    if (!isObj(raw) || !isObj(raw.descriptor) || raw.descriptor.aceId !== packet.from) throw new ACEError('invalid_authorization', 'source is not the sender');
+    const [pinned, delegationPins] = await Promise.all([this.#peers.get(packet.from), this.#peers.pins(delegationIssuers(raw))]);
+    const source = verifyPublishedAgent(raw, now, { allowLoopbackRelays: this.#o.allowLoopbackRelays, pinned, delegationPins });
+    verifyPacketSignature(packet, source.state, now);
+    return { source, ...(permit !== undefined ? { permit: verifyPermit(permit, source.state, this.#me, now) } : {}) };
+  }
+
   /** A contact packet whose steps 1-8 passed: authenticate its `source`, then dedupe (9) and hand it over (10). */
   async #contact(packet: Packet, content: PrivateContent, stranger: boolean): Promise<ReceiveOutcome> {
     try {
       const body = checkContactBody(content.body);
-      const now = this.#now();
-      if (!isObj(body.source) || !isObj(body.source.descriptor) || body.source.descriptor.aceId !== packet.from) {
-        throw new ACEError('invalid_signature', 'contact source is not the sender');
-      }
-      // Never trust a log older than the one pinned (01 § Pinning). A stranger may still have a pin (an imported
-      // descriptor): reading it is local, and it must bind the source too.
-      const [pinned, delegationPins] = await Promise.all([this.#peers.get(packet.from), this.#peers.pins(delegationIssuers(body.source))]);
-      const source = verifyPublishedAgent(body.source, now, { allowLoopbackRelays: this.#o.allowLoopbackRelays, pinned, delegationPins });
-      verifyPacketSignature(packet, source.state, now);
-      const permit = body.kind === 'rejected' ? undefined : verifyPermit(body.permit, source.state, this.#me, now);
+      const { source, permit } = await this.#verifySource(packet, body.source, body.kind === 'rejected' ? undefined : body.permit, this.#now());
       // 9. a duplicate or beyond-horizon contact is dropped (contacts are never receipted)
       if (this.#replay.hasSeen(packet.messageId, packet.from)) throw new ACEError('invalid_packet', 'contact packet already processed');
       if (this.#replay.covers(packet.from, packet.timestamp)) throw new ACEError('replay_horizon', 'contact packet is beyond the replay horizon');
