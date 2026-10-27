@@ -15,26 +15,24 @@ export const MAX_TYPE_BYTES = 256;
 export const MAX_THREAD_ID_LENGTH = 256;
 export const MAX_KEL_EVENTS = 256;
 export const MAX_DESCRIPTOR_LIFETIME = 604_800;
-export const MAX_DELEGATION_LIFETIME = 604_800;
 /** Upper bound of `notAfter - ts` for a `dlg` signing key. */
 export const MAX_SIGNING_KEY_LIFETIME = 31_622_400;
 export const MAX_PERMIT_LIFETIME = 2_592_000;
 /** A receipt carries a fresh permit when the newest one issued to its recipient has less than this left. */
 export const PERMIT_RENEWAL_SECONDS = 1_296_000;
 export const MAX_RETAINED_PREKEYS = 16;
-export const MAX_EXT_BYTES = 4096;
+export const MAX_EXT_BYTES = 32_768;
 /** Entries of a card record `pay`. */
 export const MAX_PAY_ACCOUNTS = 8;
 export const MAX_NOTE_BYTES = 512;
+/** Maximum and default `limit` of inbox and directory pages. */
 export const MAX_INBOX_PAGE = 100;
-export const DEFAULT_PAGE_LIMIT = 20;
 export const MAX_PAGE_BYTES = 8_388_608;
 export const MAX_MANIFEST_BYTES = 65_536;
 export const MAX_PENDING_CONTACT_REQUESTS = 16;
 /** Lifetime of a held incoming contact request and of a relay's stranger entries. */
 export const CONTACT_REQUEST_TTL_SECONDS = 86_400;
 export const MAX_STRANGER_KEL_EVENTS = 32;
-export const MAX_STRANGER_DELEGATIONS = 1;
 export const STRANGER_ALLOWANCE = 16;
 export const STRANGER_NETWORK_ALLOWANCE = 2;
 export const MIN_BLOCK_CAP = 256;
@@ -45,8 +43,6 @@ export const MAX_FETCH_ATTEMPTS = 3;
 
 export const MAX_DESCRIPTOR_PROFILES = 32;
 export const MAX_DESCRIPTOR_RELAYS = 4;
-export const MAX_DESCRIPTOR_DELEGATIONS = 4;
-export const MAX_DESCRIPTOR_ERC8004 = 4;
 /** Reference descriptor lifetime (the default `ttl`; at most MAX_DESCRIPTOR_LIFETIME). */
 export const DEFAULT_DESCRIPTOR_LIFETIME = 86_400;
 /** Reference prekey rotation period. */

@@ -25,7 +25,8 @@ async function pair(o: { bob?: object } = {}) {
 
 describe('A4: beyond the replay horizon is dropped and never receipted', () => {
   it('two relays delivering out of order: the late old copy is dropped, a retry is delivered', async () => {
-    const w = await inboxWorld({ capacity: 16 }); // sender quota Q = 1
+    // sender quota Q = 1; the sender's log predates the back-dated packets (a signer signs at its log tail)
+    const w = await inboxWorld({ capacity: 16, sender: await identity(Object.assign(new Clock(), { t: NOW - 100 })) });
     const first = await w.pack(w.sender, msg('one'), w.clock.t - 20);
     const second = await w.pack(w.sender, msg('two'), w.clock.t - 10);
     expect((await w.inbox.receive(first)).kind).toBe('delivered');
@@ -283,6 +284,9 @@ describe('P2: deleted surface', () => {
       'decodePrivateContent', 'ReplayDetector', 'categoryOf', 'prekeyId', 'decodePrekey', 'MemoryPrekeyVault', 'isCaip19',
       'validateCommerceExt', 'decideCommerce', 'checkCommerceBody', 'checkContactBody', 'isUsable', 'createInception',
       'createRotation', 'createDelegation', 'isCaip10', 'isStreamId', 'validateNetworkRelay', 'verifyInvitation',
+      // descriptor delegations and ERC-8004 left the core (ace:delegation:1, card record); one page default
+      'verifyDelegation', 'delegationIssuers', 'MAX_DELEGATION_LIFETIME', 'MAX_STRANGER_DELEGATIONS', 'MAX_DESCRIPTOR_DELEGATIONS',
+      'MAX_DESCRIPTOR_ERC8004', 'DEFAULT_PAGE_LIMIT',
     ]) expect(names, gone).not.toContain(gone);
     expect(names).toEqual(expect.arrayContaining(['signingMessage', 'verifyAuthHeaders', 'verifyRegistrationRequest', 'parseIp', 'networkKey', 'STRANGER_ALLOWANCE']));
   });

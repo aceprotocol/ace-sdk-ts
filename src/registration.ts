@@ -3,7 +3,7 @@ import { ACEError } from './errors.js';
 import { assertFresh } from './auth.js';
 import { closedKeys, isACEId, nowOf, sha256Hex, wireInt } from './encoding.js';
 import { checkUsable, signOperational, type ACEIdentity } from './identity.js';
-import { checkSignatureShape, isUsable, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature } from './kel.js';
+import { atLogTail, checkSignatureShape, isUsable, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature } from './kel.js';
 import { isCanonicalRelayUrl, normalizeRelayUrl } from './relay-url.js';
 import { encodePayload, signingMessage } from './signing.js';
 
@@ -13,10 +13,14 @@ import { encodePayload, signingMessage } from './signing.js';
  */
 export interface RegistrationRequest { aceId: string; kel: KelEvent[]; timestamp: number; audience: string; signature: OperationalSignature }
 
-/** Sign a registration request for the relay whose base URL is `o.audience` (normalized to its canonical form). */
+/**
+ * Sign a registration request for the relay whose base URL is `o.audience` (normalized to its canonical form), at
+ * `max(o.timestamp or now, ts of the KEL's last event)`.
+ */
 export async function createRegistrationRequest(identity: ACEIdentity, o: { audience: string; timestamp?: number }): Promise<RegistrationRequest> {
-  const timestamp = o.timestamp ?? nowOf();
-  if (wireInt(timestamp) === null) throw new ACEError('invalid_argument', 'timestamp must be an integer in [0, 2^53-1]');
+  const given = o.timestamp ?? nowOf();
+  if (wireInt(given) === null) throw new ACEError('invalid_argument', 'timestamp must be an integer in [0, 2^53-1]');
+  const timestamp = atLogTail(identity.getKel(), given);
   const audience = normalizeRelayUrl(o.audience);
   const lastHash = checkUsable(identity, timestamp).lastHash;
   const signature = await signOperational(identity, timestamp, encodePayload(lastHash, audience), 'register-request');

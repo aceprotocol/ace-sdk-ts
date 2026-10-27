@@ -10,7 +10,7 @@
  */
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, handleAddress, isACEId, isMessageId, nowOf, toBase64 } from './encoding.js';
-import { delegationIssuers, verifyPublishedAgent, type PublishedAgent } from './descriptor.js';
+import type { PublishedAgent } from './descriptor.js';
 import type { VerifiedCard } from './card-record.js';
 import { MAX_INBOX_PAGE, MAX_NOTE_BYTES, MAX_THREAD_ID_LENGTH } from './limits.js';
 import { CORE_PROFILE_ID, messageDigest, profileDigest, TEXT_TYPE, type ProfileManifest } from './manifest.js';
@@ -120,37 +120,27 @@ export function requiredScope(tool: AgentTool, args: JSONObject): ToolScope | nu
 // --- views -----------------------------------------------------------------------------------
 
 /** Remote-authored parts of an agent view: self-asserted, signed but not true for being signed. */
-const AGENT_UNTRUSTED = ['relays', 'ext', 'delegations[].issuer', 'erc8004'];
+const AGENT_UNTRUSTED = ['relays', 'ext'];
 const under = (prefix: string, paths: readonly string[]) => paths.map((p) => `${prefix}.${p}`);
 
-/**
- * The agent-facing view of a verified PublishedAgent (the full signed document only comes from `publish`). Delegations
- * are reported only as they verify under the client's pins for their issuers (01 § Pinning).
- */
-export async function agentView(client: NetworkClient, a: PublishedAgent) {
+/** The agent-facing view of a verified PublishedAgent (the full signed document only comes from `publish`). */
+export async function agentView(_client: NetworkClient, a: PublishedAgent) {
   const d = a.descriptor;
-  const pins = await client.peers.pins(delegationIssuers(a));
-  const { delegations } = verifyPublishedAgent(a, nowOf(client.options.clock), { delegationPins: pins, allowLoopbackRelays: client.options.allowLoopbackRelays });
-  return {
-    aceId: d.aceId, profiles: d.profiles,
-    relays: d.relays, expiresAt: d.expiresAt, ...(d.ext ? { ext: d.ext } : {}),
-    ...(delegations.length ? { delegations: delegations.map((x) => ({ issuer: x.issuer, expiresAt: x.credential.expiresAt })) } : {}),
-    ...(d.erc8004 ? { erc8004: d.erc8004 } : {}),
-  };
+  return { aceId: d.aceId, profiles: d.profiles, relays: d.relays, expiresAt: d.expiresAt, ...(d.ext ? { ext: d.ext } : {}) };
 }
 
 /** Remote-authored parts of a card view (the handle is relay-bound; `address` is derived from it). */
-const CARD_UNTRUSTED = ['home', 'card', 'pay'];
+const CARD_UNTRUSTED = ['home', 'card', 'pay', 'erc8004'];
 
 /**
- * The agent-facing view of a verified card record (self-asserted: `pay` accounts are claimed, not proven), with its
- * `@handle@host` address when it has a handle.
+ * The agent-facing view of a verified card record (self-asserted: `pay` and `erc8004` accounts are claimed, not
+ * proven), with its `@handle@host` address when it has a handle.
  */
 export function cardView(v: VerifiedCard) {
   const r = v.record;
   return {
     aceId: r.aceId, home: r.home, ...(r.handle ? { handle: r.handle, address: handleAddress(r.handle, r.home) } : {}), card: r.card,
-    ...(r.pay ? { pay: r.pay } : {}), contact: r.contact, listed: r.listed,
+    ...(r.pay ? { pay: r.pay } : {}), ...(r.erc8004 ? { erc8004: r.erc8004 } : {}), contact: r.contact, listed: r.listed,
   };
 }
 

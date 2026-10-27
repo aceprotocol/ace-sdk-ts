@@ -253,8 +253,8 @@ export function checkSignatureShape(sig: unknown, code: ACEErrorCode): Operation
 /**
  * 01 § Operational signatures, in order, for a `{scheme, seq, value}` signature over `M(state.aceId, signedAt, seq,
  * payload)`: 1. the scheme is `ml-dsa-65` (shape failures are `code`); 2. `seq` names the current signing delegation;
- * 3. signed while live (`signedAt < notAfter`); 4. the signature verifies (`code`); 5. the signer is usable at `now`.
- * Failures of 2, 3 and 5 are `stale_peer_binding`. The one check for packets, descriptors, permits, credentials and
+ * 3. signed while live (the delegating `dlg`'s `ts` <= `signedAt` < `notAfter`); 4. the signature verifies (`code`);
+ * 5. the signer is usable at `now`. Failures of 2, 3 and 5 are `stale_peer_binding`. The one check for packets, descriptors, permits, credentials and
  * relay authentication.
  */
 export function verifyOperationalSignature(
@@ -263,22 +263,12 @@ export function verifyOperationalSignature(
   const s = checkSignatureShape(sig, code);
   const k = state.signing;
   if (k === null || s.seq !== k.seq) throw new ACEError('stale_peer_binding', 'signature.seq is not the current signing delegation');
+  if (signedAt < (state.events[k.seq].ts as number)) throw new ACEError('stale_peer_binding', 'signed before the delegating dlg\'s ts');
   if (k.notAfter !== null && signedAt >= k.notAfter) throw new ACEError('stale_peer_binding', 'signed at or after the delegation notAfter');
   if (!verifySignature(signingMessage(state.aceId, signedAt, k.seq, payload), action, decodeSignature(s.value, code), k.publicKey)) {
     throw new ACEError(code, `${action} signature does not verify`);
   }
   if (!isUsable(state, now)) throw new ACEError('stale_peer_binding', 'the signer is not usable now');
-}
-
-/**
- * 04 § Verification step 3: a descriptor or card record is signed no earlier than the `dlg` of the current signing
- * delegation, part of "signed while live" (`stale_peer_binding`): after a fork recovery that re-delegates the same key at the same `seq`, a document
- * signed on the abandoned branch never verifies under the new log.
- */
-export function checkSignedAfterDelegation(state: KelState, signedAt: number): void {
-  const k = state.signing;
-  const dlgTs = k === null ? null : wireInt(state.events[k.seq]?.ts);
-  if (dlgTs === null || signedAt < dlgTs) throw new ACEError('stale_peer_binding', 'signed before its signing delegation');
 }
 
 /**

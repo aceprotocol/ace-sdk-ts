@@ -11,7 +11,8 @@ import {
   conversationKey, createAuthHeaders, createPacket, decodePacket, decodePrivateContent, decryptPacket, encodePayload, eventBytes, extendKel,
   fromBase64, isACEId, isBlockedAddress, isCaip10, isCaip19, isHandle, isHex64, isHttpsUrl, isMessageId, isMessageType, isOutcomeCode,
   isStreamId, isThreadId, isUsable, messageDigest, normalizeRelayUrl, parseAuthHeaders, profileDigest, signingMessage, validateCommerceExt,
-  toBase64, validateErc8004Binding, validateProfileManifest, verifyAuthHeaders, verifyDelegation, verifyErc8004Registration, verifyKel,
+  toBase64, validateErc8004Binding, validateProfileManifest, verifyAuthHeaders, verifyErc8004Registration, verifyKel,
+  DELEGATION_TYPE, delegationRules, validateDelegationExt, verifyDelegationCredential,
   verifyCardBundle, verifyOperationalSignature, verifyPacketSignature, verifyPermit, verifyPublishedAgent, verifyRegistrationRequest, verifySignature,
   type KelState, type Packet, type PrekeyVault, type ReceiptBody, type ReceiveOutcome, type RelayAuthRequest,
 } from './sdk.js';
@@ -207,7 +208,7 @@ describe('vectors: packet', () => {
 describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
   const d = V.descriptor;
   it.each(d.valid.map((c: Any) => [c.name, c]))('valid: %s', (_n, c: Any) => {
-    expect(verifyPublishedAgent(c.publishedAgent, c.now).delegations.map((x) => x.issuer)).toEqual(c.delegations);
+    expect(verifyPublishedAgent(c.publishedAgent, c.now).state.aceId).toBe(c.publishedAgent.descriptor.aceId);
   });
   it.each(d.invalid.map((c: Any) => [c.name, c]))('invalid: %s', async (_n, c: Any) => {
     expect(await codeOf(() => verifyPublishedAgent(c.publishedAgent, c.now))).toBe(c.error);
@@ -226,33 +227,19 @@ describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
     if (c.error === null) expect((await client.agent(idOf(c.pinned))).descriptor.prekey.id).toBe(c.publishedAgent.descriptor.prekey.id);
     await client.close();
   });
-  it('delegations', async () => {
-    for (const c of V.delegation.cases) {
-      const run = () => (verifyDelegation(c.entry, c.subject, c.now) === null ? 'expired' : 'live');
-      if (c.result) expect(run(), c.name).toBe(c.result);
-      else expect(await codeOf(run), c.name).toBe(c.error);
-    }
-    for (const c of V.delegation.pinned) {
-      const run = () => (verifyDelegation(c.entry, c.subject, c.now, { pinned: stateOf(c.pinned, c.now) }) === null ? 'expired' : 'live');
-      if (c.result) expect(run(), c.name).toBe(c.result);
-      else expect(await codeOf(run), c.name).toBe(c.error);
-    }
+  it.each(V.delegation.credentials.map((c: Any) => [c.name, c]))('delegation credential: %s', async (_n, c: Any) => {
+    expect(await codeOf(() => verifyDelegationCredential(c.credential, stateOf(c.issuer, c.now), c.now))).toBe(c.error);
   });
-  it('delegations in descriptors', async () => {
-    for (const c of V.delegation.descriptors) {
-      const pins = new Map<string, KelState>(c.delegationPins.map((x: string) => [idOf(x), stateOf(x, c.now)]));
-      expect(await codeOf(() => verifyPublishedAgent(c.publishedAgent, c.now, { delegationPins: pins })), c.name).toBe(c.error);
-      expect(await codeOf(() => verifyPublishedAgent(c.publishedAgent, c.now))).toBeNull();
-      // a client holding the issuer pin refuses it on import
-      const client = await NetworkClient.open({
-        identity: SoftwareIdentity.fromExport(V.agents.carol.export, NOW), store: new MemoryStore(),
-        relay: new RelayClient('https://relay.example', { fetch: () => { throw new Error('offline'); } }),
-        receive: false, clock: () => c.now,
-      });
-      for (const x of c.delegationPins) await client.peers.adopt(kelOf(x));
-      expect(await codeOf(() => client.importAgent(c.publishedAgent)), c.name).toBe(c.error);
-      await client.close();
-    }
+  it.each(V.delegation.ext.map((c: Any) => [c.name, c]))('delegation ext: %s', async (_n, c: Any) => {
+    expect(await codeOf(() => validateDelegationExt(c.value, c.subject, c.now))).toBe(c.error);
+  });
+  it.each(V.delegation.messages.map((c: Any) => [c.name, c]))('delegation message: %s', async (_n, c: Any) => {
+    const peers = new PeerStore({ store: new MemoryStore(), clock: () => c.now });
+    if (c.senderPinned) await peers.adopt(kelOf(c.from));
+    const from = idOf(c.from), to = idOf(c.to);
+    const rules = delegationRules(peers, c.direction === 'receive' ? to : from);
+    const e = { direction: c.direction, from, to, messageId: '8a4f6a2e-3c0b-4d1e-9f7a-1b2c3d4e5f60', timestamp: c.now, type: DELEGATION_TYPE };
+    expect(await codeOf(() => rules.check(e, c.body))).toBe(c.error);
   });
   it('core rules: receipts and stranger sources', async () => {
     for (const c of V.coreRules.receipts) expect(await codeOf(() => checkReceiptBody(c.body)), c.name).toBe(c.error);
@@ -263,7 +250,7 @@ describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
   });
   it.each(V.cardRecords.valid.map((c: Any) => [c.name, c]))('card record valid: %s', (_n, c: Any) => {
     const { aceId, record: r } = verifyCardBundle(c.bundle, c.now);
-    expect({ aceId, home: r.home, handle: r.handle ?? null, pay: r.pay ?? null, contact: r.contact, listed: r.listed }).toEqual(c.expect);
+    expect({ aceId, home: r.home, handle: r.handle ?? null, pay: r.pay ?? null, erc8004: r.erc8004 ?? null, contact: r.contact, listed: r.listed }).toEqual(c.expect);
   });
   it.each(V.cardRecords.invalid.map((c: Any) => [c.name, c]))('card record invalid: %s', async (_n, c: Any) => {
     expect(await codeOf(() => verifyCardBundle(c.bundle, c.now))).toBe(c.error);

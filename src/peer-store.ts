@@ -9,9 +9,9 @@ const CACHE_SIZE = 256;
 export interface Adopted { state: KelState; outcome: ExtendOutcome }
 
 /**
- * `live`: a live descriptor served by a relay vouches for the KEL. A pin moved by anything else (a card bundle's KEL, an
- * imported or contact source, which a holder of a superseded key can sign) is not live until a relay's descriptor
- * confirms it (04 § Card record).
+ * `live`: a live descriptor served by a relay vouches for the KEL. A pin moved by anything else (an imported or contact
+ * source, which a holder of a superseded key can sign) is not live until a relay's descriptor confirms it (04 § Card
+ * record).
  */
 export interface AdoptOptions<T> { live?: boolean; then?: (r: Adopted) => Promise<T> }
 
@@ -32,6 +32,11 @@ export class PeerStore {
   constructor(opts: { store: ACEStore; clock?: () => number }) {
     this.#store = opts.store;
     this.#clock = opts.clock;
+  }
+
+  /** The store's clock reading. */
+  now(): number {
+    return nowOf(this.#clock);
   }
 
   async get(aceId: string): Promise<KelState | null> {
@@ -68,15 +73,6 @@ export class PeerStore {
     if (this.#verified.size >= CACHE_SIZE) this.#verified.clear();
     this.#verified.set(memo, pin);
     return pin;
-  }
-
-  /** The pinned states of those of `ids` that are pinned (e.g. delegation issuers, 01 § Pinning). */
-  async pins(ids: readonly string[]): Promise<Map<string, KelState>> {
-    const unique = [...new Set(ids.filter(isACEId))];
-    const states = await Promise.all(unique.map((id) => this.get(id)));
-    const out = new Map<string, KelState>();
-    unique.forEach((id, i) => { if (states[i] !== null) out.set(id, states[i]); });
-    return out;
   }
 
   /**

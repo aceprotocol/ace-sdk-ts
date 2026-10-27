@@ -6,6 +6,7 @@ import { verifyCardBundle, type CardBundle } from './card-record.js';
 import { documentDigest, verifyPermit, verifyPublishedAgent, type PublishedAgent } from './descriptor.js';
 import { parseAuthHeaders, verifyAuthHeaders, type RelayAuthRequest } from './auth.js';
 import { lastEventHash, type KelState } from './kel.js';
+import { MAX_INBOX_PAGE } from './limits.js';
 import { decodePacket } from './packet.js';
 import { verifyRegistrationRequest } from './registration.js';
 import { compareStreamIds, RelayClient } from './relay.js';
@@ -189,7 +190,7 @@ export class FakeRelay {
         const d = c.card.listed === true && c.card.home === this.baseUrl ? this.#live(id) : undefined;
         return d !== undefined && (!tag || (c.card.card.tags ?? []).includes(tag)) && (!profile || d.descriptor.profiles.some((p) => p.id === profile));
       }).map(([, c]) => c);
-      return { cards: cards.slice(0, Number(url.searchParams.get('limit') ?? 20)), cursor: null };
+      return { cards: cards.slice(0, Number(url.searchParams.get('limit') ?? MAX_INBOX_PAGE)), cursor: null };
     }
     if (method === 'POST' && path === '/v1/blocks') {
       const owner = this.#auth(headers, { action: 'block', peer: body.peer, blocked: body.blocked, revision: body.revision });

@@ -79,7 +79,7 @@ describe('AGENT_TOOLS', () => {
 
     const found = await run(bob, 'ace_network', { action: 'discover' });
     expect(found.cards).toEqual([{ aceId: A, home: RELAY, handle: 'alice', address: '@alice@relay.test', card: { description: 'translation', tags: ['nlp'] }, contact: 'open', listed: true }]);
-    expect(found.untrusted).toEqual(['cards[].home', 'cards[].card', 'cards[].pay']);
+    expect(found.untrusted).toEqual(['cards[].home', 'cards[].card', 'cards[].pay', 'cards[].erc8004']);
     expect((await run(bob, 'ace_network', { action: 'discover', tag: 'nlp' })).cards).toHaveLength(1);
     expect((await run(bob, 'ace_network', { action: 'discover', tag: 'absent' })).cards).toEqual([]);
     await expect(run(bob, 'ace_network', { action: 'discover', tag: 'NLP' })).rejects.toMatchObject({ code: 'invalid_argument' });

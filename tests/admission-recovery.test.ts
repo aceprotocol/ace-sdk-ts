@@ -324,7 +324,7 @@ describe('06 § Recovery candidates: the receiver', () => {
     ['issued by the sender', async (w: World) => createPermit(w.sender, w.mine, { now: w.clock.t })],
     ['issued to someone else', async (w: World) => createPermit(w.me, (await inboxWorld()).me.getACEId(), { now: w.clock.t })],
     ['with a forged expiry', async (w: World) => ({ ...w.proof, expiresAt: w.proof.expiresAt + 1 })],
-    ['expired', async (w: World) => createPermit(w.me, w.from, { now: w.clock.t - 100, ttl: 50 })],
+    ['expired', async (w: World) => { const p = await createPermit(w.me, w.from, { now: w.clock.t, ttl: 50 }); w.clock.advance(100); return p; }],
   ])('a proof %s is dropped, nothing admitted or pinned', async (_n, make) => {
     const w = await world();
     const out = await w.inbox.receive(await w.pack(w.sender, w.recovering({ proof: await make(w) })));

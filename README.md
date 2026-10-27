@@ -20,15 +20,17 @@ Spec: `ace-spec` chapters 00–08 (packet version `"1"`). Every signature is ML-
   with ML-DSA-65 (action `packet`). The recipient need not be online.
 - **Card record** — `createCardRecord` / `verifyCardBundle`: the durable identity record `{kel, card}` with its home
   relay, set-once handle (`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`, 3–32 characters), card (`description`, `image`, `tags`;
-  no name: a display name is application data), `pay` (CAIP-10 accounts), `contact` (`open` takes stranger contact
-  requests) and `listed` (directory). No expiry; re-signed after a new `dlg`. `NetworkClient.lookupCard` resolves an
-  ACE ID or `@name@host` (typed without the `@` or in any ASCII case is accepted); with no live descriptor it verifies
-  under the bundle's own KEL and says `kelLive: false`. `NetworkClient.discover` / `RelayClient.directory` read the
-  directory (`GET /v1/cards`, optional `tag`, `profile` hint): listed card records, each verified on its own.
-- **Descriptor** — `createDescriptor` / `verifyPublishedAgent`: relays, prekey, profiles, `ext`, Delegation credentials and ERC-8004 bindings
-  (`verifyErc8004Registration` checks the reverse direction against the registration file's `services`; the host
-  reads the chain). Every operational signature is checked by one `verifyOperationalSignature` (01 rules 1–5: the
-  signer must also be usable now).
+  no name: a display name is application data), `pay` (CAIP-10 accounts), `erc8004` (ERC-8004 registrations;
+  `verifyErc8004Registration` checks a claim against the registration file's `services`, the host reads the chain),
+  `contact` (`open` takes stranger contact requests) and `listed` (directory). No expiry; re-signed after a new `dlg`.
+  `NetworkClient.lookupCard` resolves an ACE ID or `@name@host` (typed without the `@` or in any ASCII case is
+  accepted); it looks the live descriptor up first and pins its KEL, and fails with the descriptor's error (no live
+  descriptor: `unknown_peer`). `NetworkClient.discover` / `RelayClient.directory` read the directory (`GET /v1/cards`,
+  optional `tag`, `profile` hint, `limit` 1–100, default 100): listed card records, each verified on its own.
+- **Descriptor** — `createDescriptor` / `verifyPublishedAgent`: relays, prekey, profiles and `ext` (official profiles'
+  values checked by their validators). Every operational signature is checked by one `verifyOperationalSignature` (01
+  rules 1–5: signed at or after the delegating `dlg`'s `ts` and before its notAfter, the signer usable now); every
+  signer signs at `max(now, ts of its last KEL event)`.
 - **Admission** — 30-day delivery permits, contact requests as `ace:contact:1` packets, blocks, and invitations for
   out-of-band pairing (`NetworkClient.createInvitation` admits the invitee; `importInvitation` verifies the invitation,
   pins the inviter and holds its permit, and never admits).
@@ -36,13 +38,17 @@ Spec: `ace-spec` chapters 00–08 (packet version `"1"`). Every signature is ML-
   window; only a receipt confirms delivery; `prune` keeps settled entries for the offline window), `Inbox` (admission
   before any lookup, schema and profile-rule checks, `rejected:<code>` receipts, beyond-horizon packets dropped without
   a receipt, poison quarantine), `RelayClient` for the relay HTTP binding.
-- **Profiles** — the official manifests (`ace:core:1`, `ace:text:1`, `ace:commerce:1`) are bundled from
-  `ace-spec/profiles/` (`npm run gen:profiles`); `ProfileSet` installs them or third-party manifests; `ProfileRules`
-  hooks carry profile semantics (`check` at enqueue, send-side `commit` on the `delivered` receipt; a thread with a
-  rule-governed message in flight is `thread_busy`). The optional commerce module provides `commerceRules()` and
-  `ThreadStore`.
+- **Profiles** — the official manifests (`ace:core:1`, `ace:text:1`, `ace:commerce:1`, `ace:delegation:1`) are
+  bundled from `ace-spec/profiles/` (`npm run gen:profiles`); `ProfileSet` installs them or third-party manifests;
+  `ProfileRules` hooks carry profile semantics (`check` at enqueue, send-side `commit` on the `delivered` receipt; a
+  thread with a rule-governed message in flight is `thread_busy`). The optional commerce module provides
+  `commerceRules()` and `ThreadStore`. The optional delegation module (`ace:delegation:1`) provides
+  `createDelegationCredential`, `validateDelegationExt` (the descriptor extension `ext['ace:delegation:1']`, shape
+  only), `verifyDelegationCredential` and `delegationRules()`; `NetworkClient.verifyDelegation` pins the issuer and
+  verifies a credential under that pin. A credential grants no execution, payment or communication right.
 - **Glue** — `NetworkClient.open(config)`: the store (an `ACEStore` or a directory), the home relay (`relayUrl` or a
-  `RelayClient`), installed profiles (names or manifests; `'commerce'` adds `commerceRules` and `client.threads`) and a
+  `RelayClient`), installed profiles (names or manifests; `'commerce'` adds `commerceRules` and `client.threads`,
+  `'delegation'` adds `delegationRules`) and a
   `MessageLog` (`client.messages`: indexed unread cap, ack, filters). Methods: `publish({force})` (registers on
   demand), `discover`, `importAgent`, `lookup`, `lookupWithCard`, `agent`, `connect`, `requests`, `accept`, `reject`, `block`, `unblock`,
   `createInvitation`, `importInvitation`, `send`, `flush`, `pull`, `follow`, `maintain`, `setWake`, `clearWake` (07 § Wake

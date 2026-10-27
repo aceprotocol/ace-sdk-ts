@@ -18,7 +18,7 @@ import {
   nowOf, parseJSONBytes, toBase64, wireInt,
 } from './encoding.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
-import { checkSignatureShape, verifyOperationalSignature, type KelState, type OperationalSignature } from './kel.js';
+import { atLogTail, checkSignatureShape, verifyOperationalSignature, type KelState, type OperationalSignature } from './kel.js';
 import { KEM_CIPHERTEXT_SIZE, MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, OFFLINE_WINDOW_SECONDS, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { CONTACT_TYPE, RECEIPT_TYPE } from './manifest.js';
 import { decodePrekey, decodePrekeyPublicKey, type Prekey, type PrekeyVault } from './prekey.js';
@@ -216,15 +216,20 @@ export interface CreatePacketInput {
   _deterministic?: { kemCiphertext: Uint8Array; sharedSecret: Uint8Array; nonce: Uint8Array };
 }
 
-/** Encrypt `content` to the recipient's prekey and sign the packet with the identity's delegated signing key. */
+/**
+ * Encrypt `content` to the recipient's prekey and sign the packet with the identity's delegated signing key, at
+ * `max(input.timestamp or now, ts of the identity's last KEL event)` (the signer's `t`, 01 § Operational signatures),
+ * which becomes the packet's `timestamp`.
+ */
 export async function createPacket(input: CreatePacketInput): Promise<Packet> {
   const { identity, to } = input;
   const from = identity.getACEId();
   if (!isACEId(to) || to === from) throw new ACEError('invalid_argument', 'to must be another ACE ID');
   const messageId = input.messageId ?? crypto.randomUUID();
   if (!isMessageId(messageId)) throw new ACEError('invalid_argument', 'messageId must be a lowercase UUIDv4');
-  const timestamp = input.timestamp ?? nowOf();
-  if (wireInt(timestamp) === null) throw new ACEError('invalid_argument', 'timestamp must be a wire integer');
+  const given = input.timestamp ?? nowOf();
+  if (wireInt(given) === null) throw new ACEError('invalid_argument', 'timestamp must be a wire integer');
+  const timestamp = atLogTail(identity.getKel(), given);
   const state = checkUsable(identity, timestamp);
   const pk = decodePrekey(input.prekey, 'invalid_argument');
   const plaintext = encodePrivateContent(input.content);

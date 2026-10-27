@@ -378,3 +378,27 @@ export const COMMERCE_MANIFEST: ProfileManifest = {
   ]
 };
 
+export const DELEGATION_MANIFEST: ProfileManifest = {
+  "id": "ace:delegation:1",
+  "messages": [
+    {
+      "type": "ace:delegation:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "credential": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "credential"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+};
+

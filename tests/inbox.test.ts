@@ -12,7 +12,8 @@ const msg = (message: string): PrivateContent => withPrekey({ type: 'ace:text:1'
 
 async function setup(o: Partial<InboxOptions> & { admit?: boolean } = {}) {
   const clock = new Clock();
-  const me = await identity(clock), sender = await identity(clock);
+  // the sender's log starts before every back-dated packet these tests sign (a signer signs at its log tail)
+  const me = await identity(clock), sender = await identity(Object.assign(new Clock(), { t: NOW - 700_000 }));
   const store = new MemoryStore(), vault = new StorePrekeyVault(new MemoryStore(), { clock: clock.now });
   const pk = await vault.rotate(NOW);
   const prekey = { id: pk.id, publicKey: pk.publicKey };

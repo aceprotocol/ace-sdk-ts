@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  MemoryStore, StorePrekeyVault, ProfileSet, createDelegationCredential, createDescriptor, createPermit, verifyErc8004Registration,
+  MemoryStore, StorePrekeyVault, ProfileSet, createDescriptor, createPermit, verifyErc8004Registration,
   verifyPermit, verifyPublishedAgent, MAX_PERMIT_LIFETIME, type DescriptorOptions, type SoftwareIdentity,
 } from './sdk.js';
 import { NOW, RELAY, identity, stateOf } from './helpers.js';
@@ -40,26 +40,13 @@ describe('descriptor', () => {
     expect(ok.descriptor.ext).toBeDefined();
   });
 
-  it('delegations: valid kept, expired dropped, forged rejected', async () => {
-    const issuer = await identity(), subject = await identity(), other = await identity();
-    const credential = await createDelegationCredential(issuer, subject.getACEId(), { now: NOW, ttl: 3600 });
-    const entry = { kel: issuer.getKel(), credential };
-    const agent = await createDescriptor(subject, await opts({ delegations: [entry] }));
-    expect(verifyPublishedAgent(agent, NOW).delegations.map((d) => d.issuer)).toEqual([issuer.getACEId()]);
-    const later = await createDescriptor(subject, await opts({ delegations: [entry], now: NOW + 4000 }));
-    expect(verifyPublishedAgent(later, NOW + 4000).delegations).toEqual([]);
-    await expect(createDescriptor(subject, await opts({ delegations: [{ kel: other.getKel(), credential }] }))).rejects.toThrow(code('invalid_authorization'));
-    const foreign = await createDelegationCredential(issuer, other.getACEId(), { now: NOW });
-    await expect(createDescriptor(subject, await opts({ delegations: [{ kel: issuer.getKel(), credential: foreign }] }))).rejects.toThrow(code('invalid_authorization'));
-    await expect(createDelegationCredential(issuer, subject.getACEId(), { now: NOW, ttl: 604_801 })).rejects.toThrow(code('invalid_argument'));
-  });
-
-  it('erc8004: shape in the descriptor, reverse binding via the registration file', async () => {
+  it('erc8004 and delegations are not descriptor members; reverse binding via the registration file', async () => {
     const a = await identity();
+    const agent = await createDescriptor(a, await opts());
     const binding = { agentRegistry: 'eip155:8453:0x8004a169fb4a3325136eb29fa0ceb6d2e539a432', agentId: '42' };
-    expect((await createDescriptor(a, await opts({ erc8004: [binding] }))).descriptor.erc8004).toEqual([binding]);
-    await expect(createDescriptor(a, await opts({ erc8004: [{ ...binding, agentId: '042' }] }))).rejects.toThrow(code('invalid_authorization'));
-    await expect(createDescriptor(a, await opts({ erc8004: [binding, binding] }))).rejects.toThrow(/distinct/);
+    for (const extra of [{ erc8004: [binding] }, { delegations: [] }]) {
+      expect(() => verifyPublishedAgent({ ...agent, descriptor: { ...agent.descriptor, ...extra } }, NOW)).toThrow(code('invalid_authorization'));
+    }
     const reg = { type: 'https://eips.ethereum.org/EIPS/eip-8004#registration-v1', services: [{ name: 'A2A', endpoint: 'https://x' }, { name: 'ACE', endpoint: a.getACEId() }] };
     expect(verifyErc8004Registration(reg, a.getACEId())).toBe(true);
     expect(verifyErc8004Registration(JSON.stringify({ services: [{ name: 'ACE', endpoint: a.getACEId() }] }), a.getACEId())).toBe(true);

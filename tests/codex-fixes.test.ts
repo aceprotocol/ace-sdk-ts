@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   AdmissionBook, Inbox, StorePrekeyVault, MemoryStore, OFFLINE_WINDOW_SECONDS, Outbox, PeerStore, ProfileSet, TIMESTAMP_WINDOW_SECONDS,
-  ThreadStore, commerceRules, createDelegationCredential, createDescriptor, createPermit, NetworkClient, createPacket, decodePacket,
+  ThreadStore, commerceRules, createDescriptor, createPermit, NetworkClient, createPacket, decodePacket,
   type ACEStore, type ParsedMessage, type ReceiptBody,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, identity } from './helpers.js';
@@ -134,47 +134,6 @@ describe('A: cached descriptors are bound to the current pins', () => {
     };
     await expect(alice.client.importAgent(old)).rejects.toMatchObject({ code: 'stale_peer_binding' });
     expect(await alice.client.store.list('network/agents/')).toEqual([]); // the stale descriptor was never cached
-  });
-
-  it('a delegation whose issuer pin advanced is no longer reported from the cache', async () => {
-    const clock = new Clock();
-    const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock);
-    const issuer = await agent(relay, clock, { contact: 'open', listed: true });
-    const subject = await agent(relay, clock, { contact: 'open', listed: true });
-    const I = issuer.id.getACEId(), S = subject.id.getACEId();
-    const credential = await createDelegationCredential(issuer.id, S, { now: clock.t });
-    subject.client.options.delegations = [{ kel: issuer.id.getKel(), credential }];
-    await subject.client.publish();
-    await alice.client.agent(I); // pins the issuer
-    expect((await alice.client.agent(S)).descriptor.delegations?.map((d) => d.credential.issuer)).toEqual([I]);
-    clock.advance(10);
-    await issuer.id.delegate({ now: clock.t });
-    await alice.client.peers.adopt(issuer.id.getKel());
-    // stale: the refresh fetches the same descriptor, which no longer verifies under the issuer's pin
-    await expect(alice.client.agent(S)).rejects.toMatchObject({ code: 'invalid_authorization' });
-    subject.client.options.delegations = undefined;
-    await subject.client.publish();
-    expect((await alice.client.agent(S)).descriptor.delegations).toBeUndefined();
-  });
-
-  it('a cached descriptor whose delegation expired is refreshed, never reported as delegated', async () => {
-    const clock = new Clock();
-    const relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock);
-    const issuer = await agent(relay, clock, { contact: 'open', listed: true });
-    const subject = await agent(relay, clock, { contact: 'open', listed: true });
-    const I = issuer.id.getACEId(), S = subject.id.getACEId();
-    const credential = await createDelegationCredential(issuer.id, S, { now: clock.t, ttl: 60 });
-    subject.client.options.delegations = [{ kel: issuer.id.getKel(), credential }];
-    await subject.client.publish();
-    expect((await alice.client.agent(S)).descriptor.delegations?.map((d) => d.credential.issuer)).toEqual([I]);
-    clock.advance(61);
-    subject.client.options.delegations = undefined;
-    const fresh = await subject.client.publish({ force: true });
-    const seen = await alice.client.agent(S);
-    expect(seen.descriptor.issuedAt).toBe(fresh.descriptor.issuedAt);
-    expect(seen.descriptor.delegations).toBeUndefined();
   });
 
   it('under an unchanged KEL an expired newer descriptor is never rolled back to an older, longer-lived one', async () => {

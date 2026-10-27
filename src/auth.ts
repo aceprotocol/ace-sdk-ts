@@ -10,7 +10,7 @@ import { decimal, isACEId, isHex64, isObj, isPlainObject, isStreamId, nowOf, wir
 import { MAX_INBOX_PAGE, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { encodePayload } from './signing.js';
 import { signOperational, type ACEIdentity } from './identity.js';
-import { isUsable, verifyOperationalSignature, type KelState } from './kel.js';
+import { atLogTail, isUsable, verifyOperationalSignature, type KelState } from './kel.js';
 
 /** Authenticated relay calls and their action payloads (02 § Signing actions). */
 export type RelayAuthRequest =
@@ -110,12 +110,16 @@ function headerPayload(req: RelayAuthRequest, audience: string, nonce: string): 
   return encodePayload(audience, nonce, authPayload(req));
 }
 
-/** The six `X-ACE-*` headers of one relay call; `identity_unavailable` when the identity cannot sign at `timestamp`. */
-export async function createAuthHeaders(identity: ACEIdentity, req: RelayAuthRequest, timestamp: number, options: { audience: string; nonce?: string }): Promise<AuthHeaders> {
+/**
+ * The six `X-ACE-*` headers of one relay call, signed at `max(timestamp, ts of the identity's last KEL event)` (the
+ * signer's `t`, sent as `X-ACE-Timestamp`); `identity_unavailable` when the identity cannot sign then.
+ */
+export async function createAuthHeaders(identity: ACEIdentity, req: RelayAuthRequest, given: number, options: { audience: string; nonce?: string }): Promise<AuthHeaders> {
   const nonce = options?.nonce ?? bytesToHex(randomBytes(32));
   const audience = options?.audience;
   const payload = headerPayload(req, audience, nonce);
-  if (wireInt(timestamp) === null) throw bad('timestamp must be an integer in [0, 2^53-1]');
+  if (wireInt(given) === null) throw bad('timestamp must be an integer in [0, 2^53-1]');
+  const timestamp = atLogTail(identity.getKel(), given);
   const sig = await signOperational(identity, timestamp, payload, req.action);
   return {
     'X-ACE-Audience': audience,

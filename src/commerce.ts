@@ -3,6 +3,7 @@
  * settlement shapes) and its `ThreadStore`. Outside the core pipeline: install it as a `ProfileRules` entry. A
  * commerce message never authorizes a payment; whether to pay is the application's decision.
  */
+import { DELEGATION_PROFILE_ID, validateDelegationExt } from './delegation.js';
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, closedKeys, conversationKey, isHttpsUrl, isThreadId, pairKey, parseStateBytes, sha256Hex } from './encoding.js';
 import type { ProfileRules, RuleEvent } from './rules.js';
@@ -70,8 +71,13 @@ export function validateCommerceExt(v: unknown): void {
   if (new Set(v.settlement.map((s) => sha256Hex(canonicalStateBytes(s)))).size !== v.settlement.length) throw bad();
 }
 
-/** Official profiles that define a descriptor `ext` value, with its schema check (04 § Extensions). */
-export const OFFICIAL_EXT: Readonly<Record<string, ((v: unknown) => void) | undefined>> = { [COMMERCE_PROFILE_ID]: validateCommerceExt };
+/**
+ * Official profiles that define a descriptor `ext` value, with its check (04 § Extensions), called with the value, the
+ * descriptor's `aceId` and the verification time.
+ */
+export const OFFICIAL_EXT: Readonly<Record<string, ((v: unknown, aceId: string, now: number) => unknown) | undefined>> = {
+  [COMMERCE_PROFILE_ID]: validateCommerceExt, [DELEGATION_PROFILE_ID]: validateDelegationExt,
+};
 
 const nonEmpty = (v: unknown) => typeof v === 'string' && v.length > 0;
 /** The thread opener (the first `rfq` sender) is the buyer. */

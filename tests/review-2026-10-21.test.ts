@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ACEError, AdmissionBook, FileStore, Inbox, MemoryStore, OFFLINE_WINDOW_SECONDS, ReplayDetector, SoftwareIdentity, SoftwareKey, StorePrekeyVault,
-  canonicalStateBytes, contactContent, createCardRecord, createDelegation, createDelegationCredential, createDescriptor, createPermit, createRotation, generateSoftwareKey, keyDigest,
+  DELEGATION_PROFILE_ID, canonicalStateBytes, contactContent, createCardRecord, createDelegation, createDelegationCredential, createDescriptor, createPermit, createRotation, generateSoftwareKey, keyDigest,
   receiptContent, relayErrorFor, validateNetworkRelay, verifiedCacheUsage, verifyCardBundle, verifyKel, verifyPublishedAgent,
   type ACEStore,
 } from './sdk.js';
@@ -129,7 +129,7 @@ describe('C6: signer refusals (01 § Rotation and recovery)', () => {
 });
 
 describe('C7: shape before KEL work (04 § Verification, § Card record)', () => {
-  it('a malformed signature or delegation entry is invalid_authorization even when the KEL is invalid too', async () => {
+  it('a malformed signature or an unknown member is invalid_authorization even when the KEL is invalid too', async () => {
     const clock = new Clock(), relay = new FakeRelay(clock.now);
     const alice = await agent(relay, clock, { handle: 'alice' });
     const published = await alice.client.publish();
@@ -141,17 +141,17 @@ describe('C7: shape before KEL work (04 § Verification, § Card record)', () =>
       .toThrow(code('invalid_authorization'));
   });
 
-  it('a delegation credential of the wrong shape is step 1 (invalid_authorization) even with kel = [] (py/swift parity)', async () => {
+  it('a delegation ext credential of the wrong shape is step 1 (invalid_authorization) even with kel = [] (py/swift parity)', async () => {
     const clock = new Clock(), relay = new FakeRelay(clock.now);
-    const alice = await agent(relay, clock, { handle: 'alice' }), dave = await agent(relay, clock, { handle: 'dave' });
+    const alice = await agent(relay, clock, { handle: 'alice', profiles: ['text', 'delegation'] }), dave = await agent(relay, clock, { handle: 'dave' });
     const credential = await createDelegationCredential(dave.id, alice.id.getACEId(), { now: clock.t });
     const d = (await alice.client.publish()).descriptor;
-    const withEntry = (c: object) => ({ kel: [], descriptor: { ...d, delegations: [{ kel: [], credential: c }] } });
+    const withEntry = (c: object) => ({ kel: [], descriptor: { ...d, ext: { [DELEGATION_PROFILE_ID]: { credentials: [c] } } } });
     const badIssuer = withEntry({ ...credential, issuer: 'x' });
     const shortSig = withEntry({ ...credential, signature: { ...credential.signature, value: 'AAAA' } });
     expect(() => verifyPublishedAgent(badIssuer, clock.t)).toThrow(code('invalid_authorization'));
     expect(() => verifyPublishedAgent(shortSig, clock.t)).toThrow(code('invalid_authorization'));
-    // A well-formed entry with kel = [] still reaches step 2: the descriptor's own kel = [] is invalid_kel.
+    // A well-formed entry still reaches step 2: the descriptor's own kel = [] is invalid_kel.
     expect(() => verifyPublishedAgent(withEntry(credential), clock.t)).toThrow(code('invalid_kel'));
   });
 });
@@ -236,7 +236,7 @@ describe('sdk-ts: admission request lock', () => {
   });
 });
 
-describe('SP12: a document is signed no earlier than its dlg (04)', () => {
+describe('SP12: signed while live starts at the delegating dlg\'s ts (01 rule 3, verifyOperationalSignature)', () => {
   async function prekey() {
     const pk = await new StorePrekeyVault(new MemoryStore(), { clock: () => NOW }).rotate(NOW);
     return { id: pk.id, publicKey: pk.publicKey };

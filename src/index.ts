@@ -25,13 +25,13 @@ export {
   type Packet, type CreatePacketInput,
 } from './packet.js';
 export {
-  createDescriptor, verifyPublishedAgent, validateCard, validateExt, createDelegationCredential, verifyDelegation,
-  validateErc8004Binding, verifyErc8004Registration, createPermit, verifyPermit, documentDigest, delegationIssuers,
+  createDescriptor, verifyPublishedAgent, validateCard, validateExt, createPermit, verifyPermit, documentDigest,
   type AgentDescriptor, type PublishedAgent, type VerifiedAgent, type DescriptorOptions, type VerifyOptions, type AgentCard,
-  type DelegationCredential, type DescriptorDelegation, type Erc8004Binding, type DeliveryPermit,
+  type DeliveryPermit,
 } from './descriptor.js';
 export {
-  createCardRecord, verifyCardBundle, isCaip10Account, type CardRecord, type CardBundle, type VerifiedCard, type Contact,
+  createCardRecord, verifyCardBundle, isCaip10Account, validateErc8004Binding, verifyErc8004Registration, MAX_CARD_ERC8004,
+  type CardRecord, type CardBundle, type VerifiedCard, type Contact, type Erc8004Binding,
 } from './card-record.js';
 export {
   ProfileSet, validateProfileManifest, profileDigest, messageDigest, BUNDLED_MANIFESTS,
@@ -61,6 +61,11 @@ export { isBlockedAddress, networkKey, parseIp, type ParsedIp } from './pinned-h
 export { createInvitation, type Invitation } from './invitation.js';
 export { NetworkClient, type NetworkClientOptions } from './network-client.js';
 
+// Optional delegation profile module.
+export {
+  createDelegationCredential, validateDelegationExt, verifyDelegationCredential, delegationRules, DELEGATION_PROFILE_ID, DELEGATION_TYPE,
+  MAX_DELEGATION_CREDENTIALS, MAX_DELEGATION_CREDENTIAL_LIFETIME, type DelegationCredential,
+} from './delegation.js';
 // Optional commerce profile module.
 export {
   commerceRules, ThreadStore, COMMERCE_PROFILE_ID, COMMERCE_TYPES,

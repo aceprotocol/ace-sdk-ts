@@ -7,7 +7,8 @@ import { createAuthHeaders, type AuthHeaders, type RelayAuthRequest } from './au
 import { verifyCardBundle, type CardBundle, type VerifiedCard } from './card-record.js';
 import { TAG_RE, verifyPublishedAgent, type DeliveryPermit, type PublishedAgent } from './descriptor.js';
 import type { ACEIdentity } from './identity.js';
-import { DEFAULT_PAGE_LIMIT, MAX_INBOX_PAGE, MAX_JSON_DEPTH, MAX_PACKET_BYTES, MAX_PAGE_BYTES } from './limits.js';
+import { atLogTail } from './kel.js';
+import { MAX_INBOX_PAGE, MAX_JSON_DEPTH, MAX_PACKET_BYTES, MAX_PAGE_BYTES } from './limits.js';
 import type { Packet } from './packet.js';
 import { readLimited } from './pinned-https.js';
 import { createRegistrationRequest } from './registration.js';
@@ -218,7 +219,7 @@ export class RelayClient {
   /** Run `send` with fresh auth headers; retried once with a fresh timestamp on 409 `replay`. */
   async #withFreshAuth<T>(identity: ACEIdentity, req: RelayAuthRequest, send: (headers: AuthHeaders) => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
-      const now = nowOf(this.#clock);
+      const now = atLogTail(identity.getKel(), nowOf(this.#clock));
       const ts = req.action === 'unregister' ? await this.#nextRegistrationTs(identity, now) : now;
       const headers = await createAuthHeaders(identity, req, ts, { audience: this.baseUrl });
       try {
@@ -257,7 +258,7 @@ export class RelayClient {
 
   async register(identity: ACEIdentity): Promise<{ status: 'registered' | 'idempotent' | 'refreshed' | 'rotated' }> {
     // Inbox/contact reads must not push publication ordering ahead of another local process.
-    const body = await createRegistrationRequest(identity, { audience: this.baseUrl, timestamp: await this.#nextRegistrationTs(identity, nowOf(this.#clock)) });
+    const body = await createRegistrationRequest(identity, { audience: this.baseUrl, timestamp: await this.#nextRegistrationTs(identity, atLogTail(identity.getKel(), nowOf(this.#clock))) });
     const res = await this.#request('POST', this.#url('/v1/register'), { body });
     const status = isObj(res) ? res.status : undefined;
     if (status !== 'registered' && status !== 'idempotent' && status !== 'refreshed' && status !== 'rotated') {
@@ -341,7 +342,7 @@ export class RelayClient {
    * what counts (07 § Descriptors and cards). Entries are verified, not pinned (`kelLive` false).
    */
   async directory(o: { tag?: string; profile?: string; cursor?: string; limit?: number } = {}): Promise<{ cards: VerifiedCard[]; cursor: string | null }> {
-    const limit = o.limit ?? DEFAULT_PAGE_LIMIT;
+    const limit = o.limit ?? MAX_INBOX_PAGE;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_INBOX_PAGE) throw new ACEError('invalid_argument', 'invalid page limit');
     if (o.tag !== undefined && !(typeof o.tag === 'string' && TAG_RE.test(o.tag))) throw new ACEError('invalid_argument', 'tag must match [a-z0-9-]{1,32}');
     const res = await this.#request('GET', this.#url('/v1/cards', { tag: o.tag, profile: o.profile, cursor: o.cursor, limit: String(limit) }));

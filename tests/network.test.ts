@@ -223,18 +223,16 @@ describe('NetworkClient', () => {
     expect(relay.descriptors.get(id.getACEId())).toEqual(after);
   });
 
-  it('verifyDelegation names this identity as subject; an expired credential is null', async () => {
+  it('verifyDelegation verifies a credential under the issuer\'s pin; an expired one is invalid_authorization', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const issuer = await agent(relay, clock, { contact: 'open', listed: true });
     const subject = await agent(relay, clock);
-    const S = subject.id.getACEId();
-    await subject.client.lookup(issuer.id.getACEId()); // pins the issuer
-    const entry = { kel: issuer.id.getKel(), credential: await createDelegationCredential(issuer.id, S, { now: clock.t, ttl: 60 }) };
-    expect((await subject.client.verifyDelegation(entry))!.issuer).toBe(issuer.id.getACEId());
-    await expect(issuer.client.verifyDelegation(entry)).rejects.toMatchObject({ code: 'invalid_authorization' });
-    clock.advance(61);
-    expect(await subject.client.verifyDelegation(entry)).toBeNull();
+    const credential = await createDelegationCredential(issuer.id, subject.id.getACEId(), { now: clock.t, ttl: 60 });
+    expect(await subject.client.verifyDelegation(credential)).toEqual(credential); // looks the issuer up and pins it
+    expect(await subject.client.peers.get(issuer.id.getACEId())).not.toBeNull();
+    clock.advance(60);
+    await expect(subject.client.verifyDelegation(credential)).rejects.toMatchObject({ code: 'invalid_authorization' });
   });
 
   it('the test relay streams catch-up and new packets over /v1/listen', async () => {
@@ -315,26 +313,6 @@ describe('NetworkClient', () => {
       const current = await alice.client.publish();
       expect(await bob.client.agent(A)).toEqual(current);
       expect(asked()).toHaveLength(1);
-    });
-
-    it('a cached descriptor whose delegation issuer\'s pin advanced is refreshed from its relays and the home relay', async () => {
-      const { clock, relay, alice, A, descriptor, paths, bob } = await setup();
-      const dave = await identity(clock);
-      const { prekey, profiles } = relay.descriptors.get(A)!.descriptor;
-      clock.advance(1);
-      const credential = await createDelegationCredential(dave, A, { now: clock.t, ttl: 86_400 });
-      const delegated = await createDescriptor(alice.id, { relays: [B], prekey, profiles, now: clock.t, delegations: [{ kel: dave.getKel(), credential }] });
-      await bob.client.peers.adopt(dave.getKel());
-      await bob.client.importAgent(delegated);
-      // Dave's key moves on: the entry no longer verifies under his pin, so the descriptor is no longer bound.
-      clock.advance(1);
-      await dave.delegate({ now: clock.t });
-      await bob.client.peers.adopt(dave.getKel());
-      const current = await descriptor([RELAY]);
-      await relay.client().publishDescriptor(current);
-      paths.length = 0;
-      expect(await bob.client.agent(A)).toEqual(current);
-      expect(paths.filter((p) => p.startsWith('/v1/descriptor/'))).toHaveLength(1);
     });
   });
 });

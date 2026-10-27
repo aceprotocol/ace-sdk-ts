@@ -16,7 +16,7 @@
  */
 import { AdmissionBook, type PeerRecord } from './admission.js';
 import { checkContactBody, checkReceiptBody, type ContactBody, type ReceiptBody } from './core-messages.js';
-import { checkStrangerSource, delegationIssuers, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent } from './descriptor.js';
+import { checkStrangerSource, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent } from './descriptor.js';
 import type { Contact } from './card-record.js';
 import { ACEError, asACEError } from './errors.js';
 import { canonicalStateBytes, conversationKey, fromBase64, isACEId, isMessageId, isObj, nowOf, pairKey, parseJSONBytes, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
@@ -522,8 +522,8 @@ export class Inbox {
    */
   async #verifySource(packet: Packet, raw: unknown, permit: unknown, now: number): Promise<{ source: VerifiedAgent; permit?: DeliveryPermit }> {
     if (!isObj(raw) || !isObj(raw.descriptor) || raw.descriptor.aceId !== packet.from) throw new ACEError('invalid_authorization', 'source is not the sender');
-    const [pinned, delegationPins] = await Promise.all([this.#peers.get(packet.from), this.#peers.pins(delegationIssuers(raw))]);
-    const source = verifyPublishedAgent(raw, now, { allowLoopbackRelays: this.#o.allowLoopbackRelays, pinned, delegationPins });
+    const pinned = await this.#peers.get(packet.from);
+    const source = verifyPublishedAgent(raw, now, { allowLoopbackRelays: this.#o.allowLoopbackRelays, pinned });
     verifyPacketSignature(packet, source.state, now);
     return { source, ...(permit !== undefined ? { permit: verifyPermit(permit, source.state, this.#me, now) } : {}) };
   }

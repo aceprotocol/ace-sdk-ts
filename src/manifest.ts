@@ -4,14 +4,14 @@
  *   profile digest = SHA-256(canonical(manifest))
  *   message digest = SHA-256(canonical({type, schema}))
  *
- * The official manifests (`ace:core:1`, `ace:text:1`, `ace:commerce:1`) are bundled; `ace:core:1` is always installed
- * and never listed in a descriptor. Third-party manifests may not use the reserved `ace:` prefix.
+ * The official manifests (`ace:core:1`, `ace:text:1`, `ace:commerce:1`, `ace:delegation:1`) are bundled; `ace:core:1`
+ * is always installed and never listed in a descriptor. Third-party manifests may not use the reserved `ace:` prefix.
  * Installing a profile is local policy: it never grants authority.
  */
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, closedKeys, codePointLength, isHex64, isObj, sha256Hex, stringifySorted } from './encoding.js';
 import { MAX_MANIFEST_BYTES } from './limits.js';
-import { COMMERCE_MANIFEST, CORE_MANIFEST, TEXT_MANIFEST } from './profiles.generated.js';
+import { COMMERCE_MANIFEST, CORE_MANIFEST, DELEGATION_MANIFEST, TEXT_MANIFEST } from './profiles.generated.js';
 import { isMessageType, type JSONObject } from './types.js';
 
 export interface ProfileManifest { id: string; messages: Array<{ type: string; schema: Record<string, unknown> }> }
@@ -23,8 +23,8 @@ export const RECEIPT_TYPE = 'ace:receipt:1';
 export const CONTACT_TYPE = 'ace:contact:1';
 export const TEXT_TYPE = 'ace:text:1';
 
-export const BUNDLED_MANIFESTS: Readonly<Record<'core' | 'text' | 'commerce', ProfileManifest>> = Object.freeze({
-  core: CORE_MANIFEST, text: TEXT_MANIFEST, commerce: COMMERCE_MANIFEST,
+export const BUNDLED_MANIFESTS: Readonly<Record<'core' | 'text' | 'commerce' | 'delegation', ProfileManifest>> = Object.freeze({
+  core: CORE_MANIFEST, text: TEXT_MANIFEST, commerce: COMMERCE_MANIFEST, delegation: DELEGATION_MANIFEST,
 });
 
 const fail = (message: string): never => { throw new ACEError('invalid_argument', message); };
@@ -115,8 +115,8 @@ export class ProfileSet {
   readonly #byDigest = new Map<string, Installed>();
   readonly #byType = new Map<string, Installed>();
 
-  /** `profiles`: bundled names (`'text'`, `'commerce'`) or manifests. */
-  constructor(profiles: ReadonlyArray<'text' | 'commerce' | ProfileManifest> = []) {
+  /** `profiles`: bundled names (`'text'`, `'commerce'`, `'delegation'`) or manifests. */
+  constructor(profiles: ReadonlyArray<'text' | 'commerce' | 'delegation' | ProfileManifest> = []) {
     for (const p of [BUNDLED_MANIFESTS.core, ...profiles]) {
       const m = validateProfileManifest(typeof p === 'string' ? BUNDLED_MANIFESTS[p] : p);
       const digest = profileDigest(m);

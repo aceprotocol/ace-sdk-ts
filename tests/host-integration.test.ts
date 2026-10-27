@@ -1,6 +1,6 @@
-// Host-facing knobs used by the hosted MCP: transport address, live delegations, the presented permit, public fetch.
+// Host-facing knobs used by the hosted MCP: transport address, delegation credentials in ext, the presented permit, public fetch.
 import { describe, expect, it } from 'vitest';
-import { RelayClient, createDelegationCredential, publicHttpsFetch } from './sdk.js';
+import { DELEGATION_PROFILE_ID, RelayClient, createDelegationCredential, publicHttpsFetch } from './sdk.js';
 import { Clock, FakeRelay, RELAY, agent } from './helpers.js';
 
 describe('host integration', () => {
@@ -16,16 +16,16 @@ describe('host integration', () => {
     expect(seen).toEqual(['http://relay-internal:8080/v1/cards?limit=5']);
   });
 
-  it('an expired configured delegation drops out of the next descriptor', async () => {
+  it('an expired delegation credential in ext still publishes (the extension is checked for shape only)', async () => {
     const clock = new Clock();
     const relay = new FakeRelay(clock.now);
     const issuer = await agent(relay, clock, { contact: 'open', listed: true });
-    const subject = await agent(relay, clock, { contact: 'open', listed: true });
+    const subject = await agent(relay, clock, { contact: 'open', listed: true, profiles: ['text', 'delegation'] });
     const credential = await createDelegationCredential(issuer.id, subject.id.getACEId(), { now: clock.t, ttl: 60 });
-    subject.client.options.delegations = [{ kel: issuer.id.getKel(), credential }];
-    expect((await subject.client.publish()).descriptor.delegations).toHaveLength(1);
     clock.advance(61);
-    expect((await subject.client.publish()).descriptor.delegations).toBeUndefined();
+    const ext = { [DELEGATION_PROFILE_ID]: { credentials: [credential] } };
+    (subject.client.options as { ext?: object }).ext = ext;
+    expect((await subject.client.publish()).descriptor.ext).toEqual(ext);
   });
 
   it('permitFrom is the permit send presents: held and live, else undefined', async () => {

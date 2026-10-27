@@ -5,12 +5,13 @@
  * Inbox. Local configuration, never a remote message, controls admission.
  */
 import { AdmissionBook, type ContactRequest, type PeerRecord } from './admission.js';
-import { createCardRecord, verifyCardBundle, type CardBundle, type CardRecord, type Contact, type VerifiedCard } from './card-record.js';
+import { createCardRecord, verifyCardBundle, type CardBundle, type CardRecord, type Contact, type Erc8004Binding, type VerifiedCard } from './card-record.js';
 import { commerceRules, ThreadStore } from './commerce.js';
 import { contactContent, receiptContent, type ContactBody, type ReceiptBody } from './core-messages.js';
+import { checkCredential, DELEGATION_PROFILE_ID, DELEGATION_TYPE, delegationRules, verifyDelegationCredential, type DelegationCredential } from './delegation.js';
 import {
-  createDescriptor, createPermit, delegationIssuers, documentDigest, isBoundTo, isBoundToPins, isCachedUsable, verifyDelegation, verifyPermit, verifyPublishedAgent,
-  type AgentCard, type DelegationCredential, type DeliveryPermit, type DescriptorDelegation, type Erc8004Binding, type PublishedAgent, type VerifiedAgent,
+  createDescriptor, createPermit, documentDigest, isBoundTo, isCachedUsable, verifyPermit, verifyPublishedAgent,
+  type AgentCard, type DeliveryPermit, type PublishedAgent, type VerifiedAgent,
 } from './descriptor.js';
 import { ACEError, isUnknownPeer } from './errors.js';
 import { canonicalStateBytes, isACEId, isHandle, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
@@ -40,8 +41,11 @@ export interface NetworkClientOptions {
   relayUrl?: string;
   /** Or a ready home RelayClient (e.g. one routing through a proxy); takes precedence over `relayUrl`. */
   relay?: RelayClient;
-  /** Installed profiles: bundled names or manifests (default `['text']`). `'commerce'` also installs `commerceRules` and `threads`. */
-  profiles?: Array<'text' | 'commerce' | ProfileManifest>;
+  /**
+   * Installed profiles: bundled names or manifests (default `['text']`). `'commerce'` also installs `commerceRules` and
+   * `threads`; `'delegation'` installs `delegationRules` (hosts publish credentials in `ext['ace:delegation:1']`).
+   */
+  profiles?: Array<'text' | 'commerce' | 'delegation' | ProfileManifest>;
   /** Further profile rules (third-party profiles). */
   rules?: ProfileRules[];
   /** Prekey vault (default: a StorePrekeyVault in `store`). */
@@ -60,9 +64,9 @@ export interface NetworkClientOptions {
   contact?: Contact;
   /** Whether the home relay's directory lists this identity (default false). */
   listed?: boolean;
+  /** The descriptor's `ext`, keyed by installed profile ID. */
   ext?: Record<string, JSONObject>;
-  /** Delegation entries naming this identity; only the live ones are published. */
-  delegations?: DescriptorDelegation[];
+  /** The card record's ERC-8004 registrations: 1..MAX_CARD_ERC8004 distinct entries (claimed, not proven). */
   erc8004?: Erc8004Binding[];
   /** Profiles whose contact requests are accepted without an explicit `accept` (equal digest required). */
   acceptProfiles?: string[];
@@ -205,7 +209,14 @@ export class NetworkClient {
   }
 
   #rules(): ProfileRules[] {
-    return [...(this.threads ? [commerceRules(this.threads)] : []), ...(this.options.rules ?? [])];
+    const own = this.options.rules ?? [];
+    // an installed ace:delegation:1 runs its message rule over our peer pins, unless the host supplies one
+    const delegation = this.profiles.has(DELEGATION_PROFILE_ID) && !own.some((r) => r.types.includes(DELEGATION_TYPE));
+    return [
+      ...(this.threads ? [commerceRules(this.threads)] : []),
+      ...(delegation ? [delegationRules(this.peers, this.identity.getACEId())] : []),
+      ...own,
+    ];
   }
 
   /** Build the client from configuration and open its Inbox (one receiver per store) unless `receive: false`. */
@@ -268,8 +279,7 @@ export class NetworkClient {
       const opts = this.options;
       const params = {
         relays: [this.relay.baseUrl], prekey: { id: prekey.id, publicKey: prekey.publicKey }, profiles: this.profiles.descriptors(),
-        ...(opts.ext ? { ext: opts.ext } : {}), ...(opts.erc8004 ? { erc8004: opts.erc8004 } : {}),
-        ...await this.#liveDelegations(now),
+        ...(opts.ext ? { ext: opts.ext } : {}),
       };
       const lastHash = checkUsable(this.identity, now).lastHash;
       const digest = sha256Hex(canonicalStateBytes({ params, lastHash }));
@@ -277,6 +287,7 @@ export class NetworkClient {
       const cardParams = {
         home: this.relay.baseUrl, card: opts.card ?? {}, contact: opts.contact ?? 'closed', listed: opts.listed ?? false,
         ...(opts.handle !== undefined ? { handle: opts.handle } : {}), ...(opts.pay !== undefined ? { pay: opts.pay } : {}),
+        ...(opts.erc8004 !== undefined ? { erc8004: opts.erc8004 } : {}),
       } as const;
       const cardDigest = sha256Hex(canonicalStateBytes({ cardParams, lastHash }));
       let { card, cardParams: cardState } = old ?? {};
@@ -301,28 +312,17 @@ export class NetworkClient {
   }
 
   /**
-   * The configured delegations that verify at `now`. One that expired (the issuer stopped renewing) or whose issuer KEL
-   * is no longer usable drops out of the next descriptor instead of making it unverifiable.
+   * A copy of the `ace:delegation:1` credential `value` once it verifies under our pin of its issuer
+   * (profiles/delegation.md § Verifying a credential): the issuer's descriptor (cached while usable, else looked up and
+   * pinned), then `now < expiresAt` and the signature. A lookup or pin failure propagates as itself, never as "not
+   * delegated".
    */
-  async #liveDelegations(now: number): Promise<{ delegations?: DescriptorDelegation[] }> {
-    const all = this.options.delegations ?? [];
-    const ok = await Promise.all(all.map((d) => this.#checkDelegation(d, now).then((v) => v !== null, () => false)));
-    const live = all.filter((_, i) => ok[i]);
-    return live.length ? { delegations: live } : {};
-  }
-
-  /**
-   * Verify a delegation entry naming this identity as subject, reconciling its issuer KEL with our pin for the issuer
-   * (01 § Pinning). Null when expired; `invalid_authorization` when it does not verify.
-   */
-  verifyDelegation(entry: unknown): Promise<{ issuer: string; credential: DelegationCredential } | null> {
-    return this.#checkDelegation(entry, this.#now());
-  }
-
-  async #checkDelegation(entry: unknown, now: number): Promise<{ issuer: string; credential: DelegationCredential } | null> {
-    const issuer = isObj(entry) && isObj(entry.credential) ? entry.credential.issuer : undefined;
-    const pinned = isACEId(issuer) ? await this.peers.get(issuer) : null;
-    return verifyDelegation(entry, this.identity.getACEId(), now, { pinned });
+  async verifyDelegation(value: unknown): Promise<DelegationCredential> {
+    const { issuer } = checkCredential(value, this.#now());
+    await this.agent(issuer);
+    const pinned = await this.peers.get(issuer);
+    if (pinned === null) throw new ACEError('unknown_peer', 'the issuer is not pinned');
+    return verifyDelegationCredential(value, pinned, this.#now());
   }
 
   /** Post `agent` to the home relay, registering the current KEL first when the relay lacks it. */
@@ -370,8 +370,8 @@ export class NetworkClient {
     const id = d.aceId;
     // 01 § Pinning: the descriptor must verify under the KEL state that ends up pinned, never under an older prefix.
     const now = this.#now();
-    const [pinned, delegationPins] = await Promise.all([this.peers.get(id), this.peers.pins(delegationIssuers(value))]);
-    return this.#adoptVerified(verifyPublishedAgent(value, now, { ...this.#verifyOpts(), pinned, delegationPins }), live, now);
+    const pinned = await this.peers.get(id);
+    return this.#adoptVerified(verifyPublishedAgent(value, now, { ...this.#verifyOpts(), pinned }), live, now);
   }
 
   /**
@@ -389,8 +389,7 @@ export class NetworkClient {
       // entry is returned only while usable: an older candidate never stands in for it, and a stale one is never returned.
       if (old && isBoundTo(old, pin) && (old.descriptor.issuedAt > agent.descriptor.issuedAt
         || (old.descriptor.issuedAt === agent.descriptor.issuedAt && documentDigest(old.descriptor) !== documentDigest(agent.descriptor)))) {
-        const oldPins = await this.peers.pins(delegationIssuers(old));
-        if (isCachedUsable(old, now, { pinned: pin, delegationPins: oldPins })) return old;
+        if (isCachedUsable(old, now, pin)) return old;
         throw new ACEError('stale_peer_binding', 'an older descriptor revision cannot replace the cached one');
       }
       const stored: PublishedAgent = { kel: structuredClone(state.events) as KelEvent[], descriptor: agent.descriptor };
@@ -431,50 +430,21 @@ export class NetworkClient {
    * `home` is the queried relay and whose `handle` is the queried one (`unknown_peer`). A handle is set once per home:
    * after a record with a handle was seen for an identity, a record of it naming the same home with another or no handle
    * is `invalid_authorization`. A handle's first resolution pins its ACE ID; a later resolution to another one is
-   * `invalid_authorization`. Without a KEL pin for the identity, its descriptor is looked up first and its KEL pinned, so
-   * the card is verified under the current KEL, never one a relay chose. When every route answers `unknown_peer` (no
-   * live descriptor: offline past its lifetime), the card is verified under the bundle's own KEL instead, that KEL is
-   * pinned as a descriptor's would be, and the result says `kelLive: false` (04 § Card record). That pin is recorded as
-   * not confirmed live: later lookups look the descriptor up again and say `kelLive: false` until one confirms it.
+   * `invalid_authorization`. The identity's descriptor is looked up first, at a relay (never a cached one), and its KEL
+   * pinned, so the card verifies under a KEL a live descriptor confirmed, never one a relay chose; a descriptor failure
+   * (`unknown_peer` included: no live descriptor) is the lookup's failure and pins nothing (04 § Card record).
+   * `kelLive` is the pin's own flag after the lookup: false only when the pin had moved past the served descriptor's
+   * KEL by another path.
    */
   async lookupCard(target: string): Promise<VerifiedCard> {
     if (isACEId(target)) {
-      const kel = await this.#cardKel(target, () => this.agent(target, { refresh: true }), () => this.#fetchCard(target));
-      return this.#checkCard(kel.bundle ?? await this.#fetchCard(target), undefined, kel.kelLive);
+      await this.agent(target, { refresh: true });
+      return this.#checkCard(await this.#fetchCard(target), undefined, await this.peers.kelLive(target));
     }
     const { bundle, relay, handle } = await this.#cardByHandle(target);
     const id = bundle.card.aceId;
-    const kel = await this.#cardKel(id, () => this.#fetchAgent(id, [relay.baseUrl]), async () => bundle);
-    return this.#checkCard(bundle, { home: relay.baseUrl, handle }, kel.kelLive);
-  }
-
-  /**
-   * The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A pin confirmed live is used as is.
-   * Otherwise the descriptor is looked up at a relay through `fetch` (never a cached one) and the result is the pin's
-   * `kelLive` after it: a relay's descriptor bound to the pin confirms it, a replayed or older one does not. When every
-   * route answers `unknown_peer` (no live descriptor), an unconfirmed pin stays unconfirmed, and without a pin the card's own bundle (`card`) pins the KEL: the bundle is verified, its KEL adopted
-   * under the fork rules and recorded as not confirmed live, and the bundle returned. Every other failure propagates.
-   */
-  async #cardKel(id: string, fetch: () => Promise<PublishedAgent>, card: () => Promise<CardBundle>): Promise<{ kelLive: boolean; bundle?: CardBundle }> {
-    const [pinned, kelLive] = await Promise.all([this.peers.get(id), this.peers.kelLive(id)]);
-    if (pinned !== null && kelLive) return { kelLive: true };
-    try {
-      await fetch();
-    } catch (e) {
-      if (!isUnknownPeer(e)) throw e;
-      return pinned !== null ? { kelLive: false } : this.#pinBundleKel(id, await card());
-    }
-    return { kelLive: await this.peers.kelLive(id) };
-  }
-
-  /** Pin the verified KEL of `bundle` (no live descriptor: not live). */
-  async #pinBundleKel(id: string, bundle: CardBundle): Promise<{ kelLive: false; bundle: CardBundle }> {
-    const v = verifyCardBundle(bundle, this.#now(), { ...this.#verifyOpts(), pinned: await this.peers.get(id) });
-    if (v.aceId !== id) throw new ACEError('invalid_authorization', 'the card record names another identity');
-    const { state: pin } = await this.peers.adopt(structuredClone(v.kelState.events));
-    // As for a descriptor: another path advanced the pin past the state the card verified under (left as it was).
-    if (pin.lastHash !== v.kelState.lastHash) throw new ACEError('stale_peer_binding', 'the pin advanced past the card record');
-    return { kelLive: false, bundle };
+    await this.#fetchAgent(id, [relay.baseUrl]);
+    return this.#checkCard(bundle, { home: relay.baseUrl, handle }, await this.peers.kelLive(id));
   }
 
   /**
@@ -554,11 +524,11 @@ export class NetworkClient {
    */
   async agent(aceId: string, o: { refresh?: boolean } = {}): Promise<PublishedAgent> {
     const cached = await this.#read<PublishedAgent>(agentKey(aceId));
-    const [pinned, delegationPins] = await Promise.all([this.peers.get(aceId), cached ? this.peers.pins(delegationIssuers(cached)) : new Map<string, KelState>()]);
-    if (cached && !o.refresh && isCachedUsable(cached, this.#now(), { pinned, delegationPins })) return cached;
-    // A descriptor no longer bound to the pins (signed under a superseded, possibly compromised key, its own or a
-    // delegation issuer's) may name attacker relays: the home relay is asked too, as when nothing is cached.
-    if (cached !== null && isBoundToPins(cached, { pinned, delegationPins })) return this.#fetchAgent(aceId, cached.descriptor.relays);
+    const pinned = await this.peers.get(aceId);
+    if (cached && !o.refresh && isCachedUsable(cached, this.#now(), pinned)) return cached;
+    // A descriptor no longer bound to the pin (signed under a superseded, possibly compromised key) may name attacker
+    // relays: the home relay is asked too, as when nothing is cached.
+    if (cached !== null && isBoundTo(cached, pinned)) return this.#fetchAgent(aceId, cached.descriptor.relays);
     return this.#fetchAgent(aceId, this.#routesOf(cached));
   }
 
@@ -921,8 +891,8 @@ export class NetworkClient {
     } else {
       // The held request outlived its source descriptor: pin the source's KEL (05 § Flow step 3) and refresh the
       // descriptor, from the source's routes while the source is bound to the pin.
-      // A KEL pinned (or advanced) from the source alone is not confirmed live, as a card bundle's own KEL is not,
-      // until the refreshed descriptor confirms it (04 § Card record).
+      // A KEL pinned (or advanced) from the source alone is not confirmed live until the refreshed descriptor confirms
+      // it (04 § Card record).
       const { state } = await this.peers.adopt(structuredClone(req.source.kel));
       if (isBoundTo(req.source, state)) await this.#fetchAgent(req.from, req.source.descriptor.relays);
       else await this.agent(req.from, { refresh: true });
