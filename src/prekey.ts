@@ -48,7 +48,7 @@ export interface PrekeyVault {
    * A packet from `peer` opened under `prekeyId`: when that is the offered key it becomes the in-use key (replacing the
    * previous one) and the next `offer` is fresh. Any other ID changes nothing.
    */
-  used(peer: string, prekeyId: string, now: number): Promise<void>;
+  used(peer: string, prekeyId: string): Promise<void>;
   /**
    * Record the prekey `peer` offered in a packet dated `timestamp`, authenticated under pin `pin` (the last pinned KEL
    * event digest), unless the held key came from a packet at least as new.
@@ -298,11 +298,10 @@ export class StorePrekeyVault implements PrekeyVault {
     });
   }
 
-  async used(peer: string, prekeyId: string, now: number): Promise<void> {
+  async used(peer: string, prekeyId: string): Promise<void> {
     checkPeer(peer);
-    checkInt(now, 'now');
-    // `now` is intentionally unused (beyond its check): the in-use key keeps the offeredAt of its last offer (04 § Peer
-    // prekeys: a seed's window runs from the last packet that carried it as the offered key).
+    // The in-use key keeps the offeredAt of its last offer (04 § Peer prekeys: a seed's window runs from the last packet
+    // that carried it as the offered key).
     return this.#update((s) => {
       const p = s.peers[peer];
       if (p?.offered?.id !== prekeyId) return { result: undefined };

@@ -19,13 +19,13 @@ import { checkContactBody, checkReceiptBody, type ContactBody, type ReceiptBody 
 import { checkStrangerSource, delegationIssuers, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent } from './descriptor.js';
 import type { Contact } from './card-record.js';
 import { ACEError, asACEError } from './errors.js';
-import { canonicalStateBytes, conversationKey, fromBase64, isACEId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
+import { canonicalStateBytes, conversationKey, fromBase64, isACEId, isMessageId, isObj, nowOf, pairKey, parseJSONBytes, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
 import type { KelState } from './kel.js';
 import { DEFAULT_REPLAY_CAPACITY, MAX_FETCH_ATTEMPTS, OFFLINE_WINDOW_SECONDS, PIN_REFRESH_INTERVAL_SECONDS } from './limits.js';
 import { CONTACT_TYPE, RECEIPT_TYPE, type ProfileSet } from './manifest.js';
 import {
-  checkPacketTime, decodePacket, decodePrivateContent, decryptPacket, openPacketPlaintext, parsePacket, verifyPacketSignature, type Packet,
+  checkPacketTime, decodePacket, decodePrivateContent, openPacketPlaintext, parsePacket, verifyPacketSignature, type Packet,
 } from './packet.js';
 import { PeerStore } from './peer-store.js';
 import { prekeyId, type PrekeyVault } from './prekey.js';
@@ -138,18 +138,28 @@ const defer = (error: ACEError): ReceiveOutcome => ({ kind: 'deferred', error })
 /** A transient failure is retried later; anything else is dropped. */
 const settle = (error: ACEError): ReceiveOutcome => error.isTransient ? defer(error) : drop(error);
 /**
- * Whether content bytes that failed step 7 name a receipt or contact type (peeked from the raw JSON before validation):
- * such packets are never receipted, only dropped (06 § Receive pipeline).
+ * Whether content bytes that failed step 7 name a receipt or contact type (peeked with the strict JSON parser before
+ * validation): such packets are never receipted, only dropped (06 § Receive pipeline). Bytes the strict parser refuses
+ * (duplicate keys, excess depth, ...) are not core content, so they are rejected.
  */
 function isCoreContent(plaintext: Uint8Array): boolean {
   let c: unknown;
-  try { c = JSON.parse(new TextDecoder().decode(plaintext)); } catch { return false; }
+  try { c = parseJSONBytes(plaintext, 'invalid_body', 'plaintext'); } catch { return false; }
   return isObj(c) && (c.type === RECEIPT_TYPE || c.type === CONTACT_TYPE);
 }
 /**
  * Deferrals of a packet already delivered (or a duplicate) whose `delivered` receipt failed to send, mapped to the
  * outcome it had: past the fetch budget it is acknowledged as that, without a quarantine record (06 § Acknowledgement).
  */
+/**
+ * Strip the carried `prekey` from decoded `content` (it is never validated as part of the body nor handed over) and
+ * return it.
+ */
+function takeOffer(content: PrivateContent): string {
+  const offered = content.prekey!; // decodePrivateContent checked it
+  delete content.prekey;
+  return offered;
+}
 const RECEIPT_ONLY = new WeakMap<ReceiveOutcome, ReceiveOutcome>();
 
 /** A persisted journal entry, validated: anything malformed is `storage_failed`, never read as done. */
@@ -335,6 +345,7 @@ export class Inbox {
       if (err.code === 'unknown_prekey') return this.#reject(packet, err, packet.encryption.prekey);
       return settle(err);
     }
+    try { await this.#used(packet); } catch (e) { return settle(asACEError(e, 'storage_failed')); }
     // 7. content shape (a missing or malformed `prekey` included): rejected `invalid_body`, except that receipts and
     // contact packets are never receipted, only dropped
     let content: PrivateContent;
@@ -347,7 +358,7 @@ export class Inbox {
     // 06 § Receive pipeline, peer prekeys: the sender is pinned at step 3, so its offer is held under that pin (contact
     // packets excepted), whatever the disposition from step 7 on (duplicates and rejections included).
     try {
-      const offered = await this.#opened(packet, content);
+      const offered = takeOffer(content);
       if (content.type !== CONTACT_TYPE) await this.#holdOffer(packet, offered, state);
     } catch (e) {
       return settle(asACEError(e, 'storage_failed'));
@@ -382,15 +393,11 @@ export class Inbox {
   }
 
   /**
-   * After step 6 on every path (04 § Peer prekeys, issuer rule): the packet opened under the key referenced, which
-   * becomes the in-use key when it is the one offered to the sender. Strips the carried `prekey` from `content` (it is
-   * never validated as part of the body nor handed over) and returns it.
+   * Right after step 6 on every path (04 § Peer prekeys, issuer rule): the packet opened under the key referenced,
+   * which becomes the in-use key when it is the one offered to the sender, whatever the disposition from step 7 on.
    */
-  async #opened(packet: Packet, content: PrivateContent): Promise<string> {
-    const offered = content.prekey!; // decryptPacket checked it
-    delete content.prekey;
-    await this.#o.vault.used(packet.from, packet.encryption.prekey, this.#now());
-    return offered;
+  async #used(packet: Packet): Promise<void> {
+    await this.#o.vault.used(packet.from, packet.encryption.prekey);
   }
 
   /** The holder rule: hold the key a pinned sender offered, bound to its pin `state` (newer timestamps win). */
@@ -417,19 +424,21 @@ export class Inbox {
    * other packet carrying `admission` the recovery path. Anything else is dropped `not_permitted`.
    */
   async #candidate(packet: Packet, stranger: boolean, recover = false): Promise<ReceiveOutcome> {
-    let content: PrivateContent;
+    let plaintext: Uint8Array;
     try {
       checkPacketTime(packet, this.#now());
-      content = await decryptPacket(packet, this.#o.vault);
+      plaintext = await openPacketPlaintext(packet, this.#o.vault);
     } catch (e) {
       return settle(asACEError(e, 'not_permitted'));
     }
-    let offered: string;
+    try { await this.#used(packet); } catch (e) { return settle(asACEError(e, 'storage_failed')); }
+    let content: PrivateContent;
     try {
-      offered = await this.#opened(packet, content); // held only once the recovery path pins the sender
+      content = decodePrivateContent(plaintext);
     } catch (e) {
-      return settle(asACEError(e, 'storage_failed'));
+      return settle(asACEError(e, 'not_permitted'));
     }
+    const offered = takeOffer(content); // held only once the recovery path pins the sender
     if (content.type === CONTACT_TYPE) return this.#contactCandidate(packet, content, stranger);
     if (recover && content.admission !== undefined) return this.#restore(packet, content, content.admission, offered);
     return drop(new ACEError('not_permitted', stranger ? 'sender is not admitted' : 'an unpinned sender may only send contact packets'));

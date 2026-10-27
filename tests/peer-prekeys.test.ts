@@ -284,16 +284,16 @@ describe('06 § Receive pipeline: peer prekeys at step 6', () => {
 });
 
 /**
- * A correctly signed packet whose private content is `content` verbatim (createPacket would refuse a malformed one):
- * what a faulty or hostile sender can put on the wire.
+ * A correctly signed packet whose private content is `content` verbatim, or exactly the bytes given (createPacket would
+ * refuse a malformed one): what a faulty or hostile sender can put on the wire.
  */
 async function forgedPacket(
-  from: SoftwareIdentity, to: string, prekey: Prekey, content: object, timestamp: number,
+  from: SoftwareIdentity, to: string, prekey: Prekey, content: object | Uint8Array, timestamp: number,
 ): Promise<Packet> {
   const messageId = crypto.randomUUID(), seq = checkUsable(from, timestamp).signing!.seq;
   const { cipherText, sharedSecret } = ml_kem768_x25519.encapsulate(fromBase64(prekey.publicKey));
   const header = packetHeader(from.getACEId(), to, messageId, timestamp, prekey.id, cipherText);
-  const payload = await sealPayload(sharedSecret, header, canonicalStateBytes(content));
+  const payload = await sealPayload(sharedSecret, header, content instanceof Uint8Array ? content : canonicalStateBytes(content));
   const packet: Packet = {
     ace: '1', messageId, from: from.getACEId(), to, timestamp,
     encryption: { prekey: prekey.id, kemCiphertext: toBase64(cipherText), payload: toBase64(payload) },
@@ -322,5 +322,30 @@ describe('06 § Receive pipeline: step 7 (content shape) rejects non-core packet
     expect(await w.inbox.receive(p)).toMatchObject({ kind: 'dropped', error: { code: 'invalid_body' } });
     expect(w.receipts).toEqual([]);
     expect(await w.vault.held(peer, pin, w.clock.t)).toBeNull();
+  });
+
+  it('receipt-typed content the strict parser refuses (invalid UTF-8) is not core: rejected with a receipt', async () => {
+    const w = await inboxWorld();
+    const peer = w.sender.getACEId();
+    const json = new TextEncoder().encode(
+      `{"type":"${RECEIPT}","schemaDigest":"${'0'.repeat(64)}","body":{"messageId":"${crypto.randomUUID()}","status":"delivered","x":"?"}}`,
+    );
+    const raw = json.map((c, i) => (c === 0x3f && i === json.length - 4 ? 0xff : c)); // the '?' becomes a lone 0xFF byte
+    expect(JSON.parse(new TextDecoder().decode(raw)).type).toBe(RECEIPT); // a lenient peek would call it a receipt
+    const p = await forgedPacket(w.sender, w.me.getACEId(), w.prekey, raw, w.clock.t);
+    expect(await w.inbox.receive(p)).toMatchObject({ kind: 'rejected', error: { code: 'invalid_body' } });
+    expect(w.receipts).toEqual([[peer, expect.objectContaining({ messageId: p.messageId, outcome: 'rejected', code: 'invalid_body' })]]);
+  });
+
+  it('a pinned peer\'s packet to the offered key with malformed content is rejected, and that key is now in use', async () => {
+    const w = await inboxWorld();
+    const peer = w.sender.getACEId();
+    const offered = await w.vault.offer(peer, w.clock.t);
+    const p = await forgedPacket(w.sender, w.me.getACEId(), offered, { ...msg('x'), prekey: 'not base64!' }, w.clock.t);
+    expect(await w.inbox.receive(p)).toMatchObject({ kind: 'rejected', error: { code: 'invalid_body' } });
+    expect(w.receipts).toEqual([[peer, expect.objectContaining({ messageId: p.messageId, outcome: 'rejected', code: 'invalid_body' })]]);
+    // used() ran right after step 6: the key opens as the in-use key and the next offer is fresh
+    expect((await w.vault.open(offered.id, peer))?.id).toBe(offered.id);
+    expect((await w.vault.offer(peer, w.clock.t)).id).not.toBe(offered.id);
   });
 });

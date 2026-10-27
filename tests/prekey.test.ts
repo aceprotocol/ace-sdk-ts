@@ -90,7 +90,7 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     expect(await v.offer(B, NOW + 5)).toEqual(k1);
     expect(k1.id).toBe(prekeyId(Uint8Array.from(atob(k1.publicKey), (c) => c.charCodeAt(0))));
     expect(await v.open(k1.id, B)).not.toBeNull();
-    await v.used(B, k1.id, NOW + 5);
+    await v.used(B, k1.id);
     const k2 = await v.offer(B, NOW + 6);
     expect(k2.id).not.toBe(k1.id);
     expect((await v.open(k1.id, B))!.id).toBe(k1.id);
@@ -102,9 +102,9 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
   it('a newer key in use deletes the previous one', async () => {
     const { v } = vaultAt();
     const k1 = await v.offer(B, NOW);
-    await v.used(B, k1.id, NOW);
+    await v.used(B, k1.id);
     const k2 = await v.offer(B, NOW);
-    await v.used(B, k2.id, NOW);
+    await v.used(B, k2.id);
     expect(await v.open(k1.id, B)).toBeNull();
     expect(await v.open(k2.id, B)).not.toBeNull();
   });
@@ -112,11 +112,11 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
   it('using the in-use key again, or an unknown ID, changes nothing', async () => {
     const { v } = vaultAt();
     const k1 = await v.offer(B, NOW);
-    await v.used(B, k1.id, NOW);
+    await v.used(B, k1.id);
     const k2 = await v.offer(B, NOW);
-    await v.used(B, k1.id, NOW + 1);
-    await v.used(B, 'f'.repeat(64), NOW + 1);
-    await v.used(C, k2.id, NOW + 1);
+    await v.used(B, k1.id);
+    await v.used(B, 'f'.repeat(64));
+    await v.used(C, k2.id);
     expect(await v.open(k1.id, B)).not.toBeNull();
     expect(await v.offer(B, NOW + 2)).toEqual(k2);
   });
@@ -131,7 +131,7 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     expect(await v.open(k1.id, B)).toBeNull();
     const k2 = await v.offer(B, NOW + 2 * W - 1);
     expect(k2.id).not.toBe(k1.id);
-    await v.used(B, k2.id, NOW + 2 * W - 1);
+    await v.used(B, k2.id);
     t.now = NOW + 3 * W - 1;
     expect(await v.open(k2.id, B)).toBeNull(); // in use: same window from its last offer
   });
@@ -176,7 +176,7 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     const { store, v } = vaultAt();
     await v.rotate(NOW);
     const k = await v.offer(A, NOW);
-    await v.used(A, k.id, NOW);
+    await v.used(A, k.id);
     await v.offer(A, NOW + 10);
     await v.hold(B, somePeerKey(), NOW + 20, PIN);
     await v.prune(NOW + W);
@@ -192,7 +192,7 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
   it('stores the version 2 document of 04 § Peer prekeys', async () => {
     const { store, v } = vaultAt();
     const k = await v.offer(A, NOW);
-    await v.used(A, k.id, NOW);
+    await v.used(A, k.id);
     await v.offer(A, NOW + 1);
     const p = somePeerKey();
     await v.hold(A, p, NOW + 2, PIN);
@@ -247,7 +247,7 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     const p = somePeerKey();
     await expect(v.offer('bob', NOW)).rejects.toMatchObject({ code: 'invalid_argument' });
     await expect(v.offer(A, -1)).rejects.toMatchObject({ code: 'invalid_argument' });
-    await expect(v.used(A, 'f'.repeat(64), 1.5)).rejects.toMatchObject({ code: 'invalid_argument' });
+    await expect(v.used('bob', 'f'.repeat(64))).rejects.toMatchObject({ code: 'invalid_argument' });
     await expect(v.hold(A, p, NOW, 'PIN')).rejects.toMatchObject({ code: 'invalid_argument' });
     await expect(v.hold(A, { ...p, id: 'f'.repeat(64) }, NOW, PIN)).rejects.toMatchObject({ code: 'invalid_argument' });
     await expect(v.hold(A, p, -1, PIN)).rejects.toMatchObject({ code: 'invalid_argument' });
