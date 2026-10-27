@@ -24,7 +24,9 @@ import { checkUsable, type ACEIdentity } from './identity.js';
 import type { KelState } from './kel.js';
 import { DEFAULT_REPLAY_CAPACITY, MAX_FETCH_ATTEMPTS, OFFLINE_WINDOW_SECONDS, PIN_REFRESH_INTERVAL_SECONDS } from './limits.js';
 import { CONTACT_TYPE, RECEIPT_TYPE, type ProfileSet } from './manifest.js';
-import { checkPacketTime, decodePacket, decryptPacket, parsePacket, verifyPacketSignature, type Packet } from './packet.js';
+import {
+  checkPacketTime, decodePacket, decodePrivateContent, decryptPacket, openPacketPlaintext, parsePacket, verifyPacketSignature, type Packet,
+} from './packet.js';
 import { PeerStore } from './peer-store.js';
 import { prekeyId, type PrekeyVault } from './prekey.js';
 import type { RelayClient } from './relay.js';
@@ -135,6 +137,15 @@ const drop = (error: ACEError): ReceiveOutcome => ({ kind: 'dropped', error });
 const defer = (error: ACEError): ReceiveOutcome => ({ kind: 'deferred', error });
 /** A transient failure is retried later; anything else is dropped. */
 const settle = (error: ACEError): ReceiveOutcome => error.isTransient ? defer(error) : drop(error);
+/**
+ * Whether content bytes that failed step 7 name a receipt or contact type (peeked from the raw JSON before validation):
+ * such packets are never receipted, only dropped (06 § Receive pipeline).
+ */
+function isCoreContent(plaintext: Uint8Array): boolean {
+  let c: unknown;
+  try { c = JSON.parse(new TextDecoder().decode(plaintext)); } catch { return false; }
+  return isObj(c) && (c.type === RECEIPT_TYPE || c.type === CONTACT_TYPE);
+}
 /**
  * Deferrals of a packet already delivered (or a duplicate) whose `delivered` receipt failed to send, mapped to the
  * outcome it had: past the fetch budget it is acknowledged as that, without a quarantine record (06 § Acknowledgement).
@@ -315,14 +326,23 @@ export class Inbox {
     }
     // 5. time window
     try { checkPacketTime(packet, this.#now()); } catch (e) { return drop(asACEError(e)); }
-    // 6. decrypt
-    let content: PrivateContent;
+    // 6. decrypt and unpad: a failure (bad padding included) is a drop
+    let plaintext: Uint8Array;
     try {
-      content = await decryptPacket(packet, this.#o.vault);
+      plaintext = await openPacketPlaintext(packet, this.#o.vault);
     } catch (e) {
       const err = asACEError(e, 'decryption_failed');
       if (err.code === 'unknown_prekey') return this.#reject(packet, err, packet.encryption.prekey);
       return settle(err);
+    }
+    // 7. content shape (a missing or malformed `prekey` included): rejected `invalid_body`, except that receipts and
+    // contact packets are never receipted, only dropped
+    let content: PrivateContent;
+    try {
+      content = decodePrivateContent(plaintext);
+    } catch (e) {
+      const err = asACEError(e, 'invalid_body');
+      return isCoreContent(plaintext) ? drop(err) : this.#reject(packet, err);
     }
     // 06 § Receive pipeline, peer prekeys: the sender is pinned at step 3, so its offer is held under that pin (contact
     // packets excepted), whatever the disposition from step 7 on (duplicates and rejections included).

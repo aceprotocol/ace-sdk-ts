@@ -314,19 +314,28 @@ export function checkPacketTime(packet: Packet, now: number): void {
 }
 
 /**
- * Decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`), unpad and decode:
- * `unknown_prekey` when the vault does not hold it for this sender,
- * `decryption_failed` on AEAD/KEM failure, `invalid_body` on bad padding or content.
+ * 06 step 6: decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`) and unpad,
+ * returning the content bytes: `unknown_prekey` when the vault does not hold it for this sender, `decryption_failed` on
+ * AEAD/KEM failure, `invalid_body` on bad padding. The content is not decoded (step 7, `decodePrivateContent`).
  */
-export async function decryptPacket(packet: Packet, vault: PrekeyVault): Promise<PrivateContent> {
+export async function openPacketPlaintext(packet: Packet, vault: PrekeyVault): Promise<Uint8Array> {
   const secret = await vault.open(packet.encryption.prekey, packet.from);
   if (secret === null) throw new ACEError('unknown_prekey', 'the referenced prekey is unknown or deleted');
   const { kem, payload } = encryptionBytes(packet);
   const ss = secret.decapsulate(kem);
   try {
     const header = packetHeader(packet.from, packet.to, packet.messageId, packet.timestamp, packet.encryption.prekey, kem);
-    return decodePrivateContent(unpadPlaintext(await openPayload(ss, header, payload)));
+    return unpadPlaintext(await openPayload(ss, header, payload));
   } finally {
     ss.fill(0);
   }
+}
+
+/**
+ * Decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`), unpad and decode:
+ * `unknown_prekey` when the vault does not hold it for this sender,
+ * `decryption_failed` on AEAD/KEM failure, `invalid_body` on bad padding or content.
+ */
+export async function decryptPacket(packet: Packet, vault: PrekeyVault): Promise<PrivateContent> {
+  return decodePrivateContent(await openPacketPlaintext(packet, vault));
 }
