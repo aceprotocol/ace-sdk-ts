@@ -668,7 +668,8 @@ export class NetworkClient {
       agent = await this.agent(to, { refresh: o.refresh });
     }
     const now = this.#now();
-    let prekey: Prekey = agent.descriptor.prekey;
+    const publishedPrekey: Prekey = agent.descriptor.prekey;
+    let prekey = publishedPrekey;
     if (o.needPermit) { // an Outbox attempt
       const pin = (await this.peers.get(to))?.lastHash;
       const held = pin === undefined ? null : await this.vault.held(to, pin, now);
@@ -677,7 +678,20 @@ export class NetworkClient {
     }
     if (o.avoidPrekey !== undefined && prekey.id === o.avoidPrekey) throw new ACEError('unknown_prekey', 'the peer still publishes the rejected prekey');
     content = { ...content, prekey: (await this.vault.offer(to, now)).publicKey };
-    const pack = (c: PrivateContent) => createPacket({ identity: this.identity, to, prekey, content: c, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: now });
+    const create = (c: PrivateContent) => createPacket({ identity: this.identity, to, prekey, content: c, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: now });
+    // A held key is only checked as an X-Wing key (its ML-KEM half), so noble may still refuse to encapsulate to it (a
+    // low-order X25519 half; noble throws a plain Error, createPacket's own checks throw ACEError). Drop it and encrypt
+    // to the published prekey in the same attempt; a failure with the published prekey is unchanged.
+    const pack = async (c: PrivateContent): Promise<Packet> => {
+      try {
+        return await create(c);
+      } catch (e) {
+        if (prekey === publishedPrekey || e instanceof ACEError) throw e;
+        await this.vault.dropHeld(to);
+        prekey = publishedPrekey;
+        return await create(c);
+      }
+    };
     let packet: Packet, permit: DeliveryPermit | undefined, reply: { permit: DeliveryPermit; fresh: boolean } | undefined, sent = content;
     if (!o.recover) {
       [packet, permit] = await Promise.all([pack(content), this.#theirPermit(to, o.permit)]);

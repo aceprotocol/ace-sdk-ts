@@ -4,7 +4,7 @@
 import {
   MemoryStore, NetworkClient, ACEError, canonicalStateBytes, createPacket, decodePacket, decryptPacket, prekeyId,
   prekeyPublicKey, toBase64, fromBase64, type PrivateContent, type Packet,
-  checkUsable, padPlaintext, packetHeader, packetSignPayload, sealPayload, signingMessage, type Prekey, type SoftwareIdentity,
+  checkUsable, checkXWingPublicKey, padPlaintext, packetHeader, packetSignPayload, sealPayload, signingMessage, type Prekey, type SoftwareIdentity,
 } from './sdk.js';
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
 import { Clock, FakeRelay, agent, type TestAgent } from './helpers.js';
@@ -193,6 +193,30 @@ describe('04 § Peer prekeys end to end', () => {
     const [retry2] = since(relay, n, alice, bob);
     expect(retry2.encryption.prekey).toBe(await published(bob));
     expect(await alice.client.vault.held(b, await pinOf(alice, b), clock.t)).toBeNull();
+  });
+
+  it('a held key noble cannot encapsulate to (all-zero X25519 half) is dropped; the same attempt goes to the published prekey', async () => {
+    const w = await pair();
+    await ratchet(w);
+    const { clock, relay, alice, bob, b } = w;
+    const pin = await pinOf(alice, b);
+    const real = fromBase64((await alice.client.vault.held(b, pin, clock.t))!.publicKey);
+    const lowOrder = real.slice();
+    lowOrder.fill(0, 1184); // valid ML-KEM-768 half, all-zero X25519 half
+    expect(() => checkXWingPublicKey(lowOrder)).not.toThrow(); // receivers accept it (03 § X-Wing)
+    expect(() => ml_kem768_x25519.encapsulate(lowOrder)).toThrow(); // noble refuses to encapsulate to it
+    await alice.client.vault.dropHeld(b);
+    await alice.client.vault.hold(b, { id: prekeyId(lowOrder), publicKey: toBase64(lowOrder) }, clock.t, pin);
+    expect((await alice.client.vault.held(b, pin, clock.t))?.id).toBe(prekeyId(lowOrder));
+    const n = relay.sent.length;
+    const m = await alice.client.send(b, TEXT, { message: 'm3' });
+    expect(m).toMatchObject({ status: 'pending', attempts: 1, lastPrekey: await published(bob) });
+    const [first] = since(relay, n, alice, bob);
+    expect(first.encryption.prekey).toBe(await published(bob));
+    expect(await alice.client.vault.held(b, pin, clock.t)).toBeNull();
+    expect(await bob.client.pull()).toMatchObject([{ kind: 'delivered' }]);
+    await alice.client.pull();
+    expect((await alice.client.outbox.get(m.messageId))!.status).toBe('delivered');
   });
 
   it('block drops the held key', async () => {
