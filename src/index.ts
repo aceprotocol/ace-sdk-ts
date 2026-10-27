@@ -17,11 +17,11 @@ export {
 } from './kel.js';
 export { SoftwareIdentity, type ACEIdentity, type SoftwareIdentityExport } from './identity.js';
 export {
-  StorePrekeyVault,
+  StorePrekeyVault, prekeyPublicKey,
   type PrekeyVault, type Prekey, type PrekeyInfo, type PrekeySecret, type SecretProtector,
 } from './prekey.js';
 export {
-  createPacket, decodePacket, parsePacket, verifyPacketSignature, checkPacketTime, decryptPacket,
+  createPacket, decodePacket, parsePacket, verifyPacketSignature, checkPacketTime, decryptPacket, padPlaintext, unpadPlaintext, plaintextBucket,
   type Packet, type CreatePacketInput,
 } from './packet.js';
 export {

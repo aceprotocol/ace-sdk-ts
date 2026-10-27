@@ -5,7 +5,7 @@ import {
   type CardBundle, type PublishedAgent,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, identity } from './helpers.js';
-import { inboxWorld, text } from './helpers2.js';
+import { inboxWorld, text, withPrekey } from './helpers2.js';
 
 describe('security fixes', () => {
   it('a permit sent to a relay must authorize that packet', async () => {
@@ -17,7 +17,7 @@ describe('security fixes', () => {
     const permit = await createPermit(carol, bob.id.getACEId(), { now: NOW });
     const pre = (await alice.client.publish()).descriptor.prekey;
     const { createPacket } = await import('./sdk.js');
-    const packet = await createPacket({ identity: bob.id, to: alice.id.getACEId(), prekey: pre, content: { type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message: 'x' } }, timestamp: NOW });
+    const packet = await createPacket({ identity: bob.id, to: alice.id.getACEId(), prekey: pre, content: withPrekey({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message: 'x' } }), timestamp: NOW });
     await expect(relay.client().send(packet, permit)).rejects.toMatchObject({ code: 'invalid_argument' });
   });
 

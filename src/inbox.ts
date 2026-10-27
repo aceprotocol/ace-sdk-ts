@@ -319,6 +319,7 @@ export class Inbox {
     let content: PrivateContent;
     try {
       content = await decryptPacket(packet, this.#o.vault);
+      delete content.prekey; // Task 9: recorded by vault.used() / hold()
     } catch (e) {
       const err = asACEError(e, 'decryption_failed');
       if (err.code === 'unknown_prekey') return this.#reject(packet, err, packet.encryption.prekey);
@@ -375,6 +376,7 @@ export class Inbox {
     try {
       checkPacketTime(packet, this.#now());
       content = await decryptPacket(packet, this.#o.vault);
+      delete content.prekey; // Task 9: recorded by vault.used() / hold()
     } catch (e) {
       return settle(asACEError(e, 'not_permitted'));
     }

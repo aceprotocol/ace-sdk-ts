@@ -4,6 +4,7 @@ import {
   createDescriptor, sha256Hex, type CardBundle,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, identity, stateOf } from './helpers.js';
+import { withPrekey } from './helpers2.js';
 
 const code = (c: string) => expect.objectContaining({ code: c });
 const SOL = 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
@@ -505,7 +506,7 @@ describe('card record over the relay', () => {
     const source = await alice.client.publish();
     const packet = await createPacket({
       identity: alice.id, to: bobId.getACEId(), prekey: desc.descriptor.prekey, timestamp: clock.t,
-      content: contactContent({ kind: 'request', profile: 'ace:text:1', note: '', source, permit: await (await import('./sdk.js')).createPermit(alice.id, bobId.getACEId(), { now: clock.t }) }),
+      content: withPrekey(contactContent({ kind: 'request', profile: 'ace:text:1', note: '', source, permit: await (await import('./sdk.js')).createPermit(alice.id, bobId.getACEId(), { now: clock.t }) })),
     });
     relay.queues.set(bobId.getACEId(), [{ streamId: `${clock.t * 1000}-0`, packet, raw: JSON.stringify(packet) }]);
     const [outcome] = await bob.pull();

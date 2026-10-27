@@ -1,14 +1,26 @@
 import { describe, expect, it } from 'vitest';
 import {
-  MemoryStore, ProfileSet, StorePrekeyVault, createPacket, decodePacket, decryptPacket,
-  signingMessage, toBase64, parsePacket, MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, OFFLINE_WINDOW_SECONDS, type PrivateContent,
+  MemoryStore, PLAINTEXT_BUCKETS, ProfileSet, StorePrekeyVault, canonicalStateBytes, createPacket, decodePacket, decodePrivateContent, decryptPacket,
+  encodePrivateContent, padPlaintext, plaintextBucket, signingMessage, toBase64, parsePacket, unpadPlaintext,
+  MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, MIN_PLAINTEXT_BUCKET, OFFLINE_WINDOW_SECONDS, type PrivateContent,
 } from './sdk.js';
 import { packetSignPayload } from '../src/packet.js';
 import { NOW, identity, stateOf } from './helpers.js';
-import { openPacket } from './helpers2.js';
+import { openPacket, somePrekey } from './helpers2.js';
 
 const text = new ProfileSet(['text']);
-const content = (message: string): PrivateContent => ({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message } });
+const PEER_PREKEY = somePrekey();
+const content = (message: string): PrivateContent => ({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message }, prekey: PEER_PREKEY });
+const code = (fn: () => unknown): string | null => {
+  try { fn(); } catch (e) { return (e as { code?: string }).code ?? String(e); }
+  return null;
+};
+/** A padded plaintext of `size` bytes whose length prefix is `n`, `fill` bytes after the prefix. */
+const framed = (size: number, n: number, fill = 0): Uint8Array => {
+  const out = new Uint8Array(size).fill(fill, 4);
+  new DataView(out.buffer).setUint32(0, n);
+  return out;
+};
 
 async function setup() {
   const alice = await identity(), bob = await identity(), mallory = await identity();
@@ -56,6 +68,78 @@ describe('packet', () => {
     const { alice, bob, prekey } = await setup();
     const p = await createPacket({ identity: alice, to: bob.getACEId(), prekey, content: content('x'), timestamp: NOW });
     await expect(decryptPacket(p, new StorePrekeyVault(new MemoryStore(), { clock: () => NOW }))).rejects.toMatchObject({ code: 'unknown_prekey' });
+  });
+});
+
+describe('padding (03 § Encryption)', () => {
+  it.each([[0, 4096], [4092, 4096], [4093, 8192], [2 ** 20 - 4, 2 ** 20], [2 ** 20 - 3, 1_179_652], [MAX_PLAINTEXT_BYTES, 1_179_652]])(
+    'bucket of %i content bytes is %i', (n, b) => { expect(plaintextBucket(n)).toBe(b); },
+  );
+
+  it('the buckets are the powers of two from MIN_PLAINTEXT_BUCKET to 2^20, then MAX_PLAINTEXT_BYTES + 4', () => {
+    expect(MIN_PLAINTEXT_BUCKET).toBe(4096);
+    expect([...PLAINTEXT_BUCKETS].sort((a, b) => a - b)).toEqual([4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 1179652]);
+  });
+
+  it('pads u32be(len) ‖ content ‖ zeros and unpads back', () => {
+    const c = new Uint8Array(5000).fill(0x78);
+    const p = padPlaintext(c);
+    expect(p.length).toBe(8192);
+    expect([...p.subarray(0, 4)]).toEqual([0, 0, 0x13, 0x88]);
+    expect(p.subarray(5004).every((x) => x === 0)).toBe(true);
+    expect(unpadPlaintext(p)).toEqual(c);
+  });
+
+  it.each([
+    ['a length that is not a bucket', framed(4095, 5)],
+    ['a prefix past the plaintext', framed(4096, 4093)],
+    ['a prefix of 5000 inside 4096 bytes', framed(4096, 5000)],
+    ['a prefix above MAX_PLAINTEXT_BYTES', framed(1_179_652, 0xffffffff)],
+    ['a bucket the prefix does not imply', framed(8192, 10)],
+    ['a non-zero padding byte', (() => { const p = padPlaintext(new Uint8Array(5)); p[4095] = 1; return p; })()],
+  ])('unpadding %s is invalid_body', (_n, pt) => {
+    expect(code(() => unpadPlaintext(pt))).toBe('invalid_body');
+  });
+
+  it('a decoded payload must be nonce + tag + a bucket (invalid_packet)', async () => {
+    const { alice, bob, prekey } = await setup();
+    const p = await createPacket({ identity: alice, to: bob.getACEId(), prekey, content: content('x'), timestamp: NOW });
+    expect(decodePacket(JSON.parse(JSON.stringify(p))).encryption.payload).toBe(p.encryption.payload);
+    const withPayload = (n: number) => ({ ...p, encryption: { ...p.encryption, payload: toBase64(new Uint8Array(n)) } });
+    expect(code(() => decodePacket(withPayload(27)))).toBe('invalid_packet');
+    expect(code(() => decodePacket(withPayload(4096 + 27)))).toBe('invalid_packet');
+    expect(code(() => decodePacket(withPayload(4096 + 28)))).toBeNull();
+  });
+
+  it('a packet in the top bucket fits MAX_PACKET_BYTES', async () => {
+    const { alice, bob, vault, prekey } = await setup();
+    const base = content('');
+    const c = content('x'.repeat(MAX_PLAINTEXT_BYTES - canonicalStateBytes(base).length));
+    expect(encodePrivateContent(c).length).toBe(MAX_PLAINTEXT_BYTES);
+    const p = await createPacket({ identity: alice, to: bob.getACEId(), prekey, content: c, timestamp: NOW });
+    expect(canonicalStateBytes(p).length).toBeLessThanOrEqual(MAX_PACKET_BYTES);
+    expect(await decryptPacket(decodePacket(JSON.parse(JSON.stringify(p))), vault)).toEqual(c);
+  });
+});
+
+describe('private content prekey (04 § Peer prekeys)', () => {
+  const { prekey: _p, ...without } = content('x');
+  it('round-trips the offered prekey', () => {
+    expect(decodePrivateContent(encodePrivateContent(content('x')))).toEqual(content('x'));
+  });
+  it('encoding content without a prekey, or with a malformed one, is invalid_argument', () => {
+    expect(code(() => encodePrivateContent(without as PrivateContent))).toBe('invalid_argument');
+    expect(code(() => encodePrivateContent({ ...without, prekey: 'QQ==' }))).toBe('invalid_argument');
+    expect(code(() => encodePrivateContent({ ...without, prekey: toBase64(new Uint8Array(1215)) }))).toBe('invalid_argument');
+  });
+  it('createPacket refuses content without a prekey (invalid_argument)', async () => {
+    const { alice, bob, prekey } = await setup();
+    await expect(createPacket({ identity: alice, to: bob.getACEId(), prekey, content: without as PrivateContent, timestamp: NOW })).rejects.toMatchObject({ code: 'invalid_argument' });
+  });
+  it('decoding content without a prekey, or with a malformed one, is invalid_body', () => {
+    expect(code(() => decodePrivateContent(canonicalStateBytes(without)))).toBe('invalid_body');
+    expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: 'QQ==' })))).toBe('invalid_body');
+    expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: null })))).toBe('invalid_body');
   });
 });
 

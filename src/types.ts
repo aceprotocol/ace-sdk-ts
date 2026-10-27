@@ -31,6 +31,12 @@ export interface PrivateContent {
   schemaDigest: string;
   threadId?: string;
   body: JSONObject;
+  /**
+   * The peer prekey the sender offers the receiver for its replies (04 § Peer prekeys): canonical Base64 of a 1216-byte
+   * X-Wing public key. Required on the wire (`encodePrivateContent` / `decodePrivateContent`); absent from content
+   * stored before sending (the transport adds it per packet) and stripped by the receiver before hand-over.
+   */
+  prekey?: string;
   /** Only on an application message's Outbox retry (03 § Private content); never on receipts or contact packets. */
   admission?: Admission;
 }

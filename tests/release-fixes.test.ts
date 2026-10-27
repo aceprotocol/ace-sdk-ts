@@ -7,7 +7,7 @@ import {
   ACEError, CONTACT_REQUEST_TTL_SECONDS, encodePrivateContent, FileStore, Inbox, createDescriptor, type PublishedAgent, OFFLINE_WINDOW_SECONDS, sha256Hex, decodePacket, MAX_SIGNING_KEY_LIFETIME, MemoryStore, SoftwareIdentity, isBlockedAddress, Outbox, ProfileSet, RelayClient, StorePrekeyVault, verifyPublishedAgent, type OutboxTransport,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, identity } from './helpers.js';
-import { inboxWorld, msg } from './helpers2.js';
+import { inboxWorld, msg, withPrekey } from './helpers2.js';
 
 const deep = (n: number) => '['.repeat(n) + ']'.repeat(n);
 const json = (body: string, type = 'application/json') => new Response(body, { status: 200, headers: { 'content-type': type } });
@@ -47,7 +47,7 @@ describe('received JSON depth (02 § JSON values: MAX_JSON_DEPTH)', () => {
 describe('sent body depth: counted from the private content root (02 § JSON values)', () => {
   /** A body object whose deepest container is at depth `n` from the body (its root at 0): at `n + 1` in the content. */
   const bodyAt = (n: number) => { let v: unknown = []; for (let i = 1; i < n; i++) v = [v]; return { x: v }; };
-  const content = (n: number) => ({ type: 'ace:text:1', schemaDigest: '0'.repeat(64), body: bodyAt(n) }) as never;
+  const content = (n: number) => withPrekey({ type: 'ace:text:1', schemaDigest: '0'.repeat(64), body: bodyAt(n) }) as never;
 
   it('a body at depth 31 is sent; 32 (content depth 33) is invalid_body at encode', () => {
     expect(() => encodePrivateContent(content(31))).not.toThrow();

@@ -6,6 +6,7 @@ import {
   type ACEStore, type ParsedMessage, type ReceiptBody,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, identity } from './helpers.js';
+import { withPrekey } from './helpers2.js';
 
 const lastPrekey = (relay: FakeRelay) => decodePacket(relay.sent.at(-1)!.packet).encryption.prekey;
 /** Queue and attempt a message without `send`'s permit gate (these tests exercise the transport, not admission). */
@@ -229,7 +230,7 @@ describe('B: inbox recovery re-commits profile rules', () => {
     });
     const packet = await createPacket({
       identity: sender, to: me.getACEId(), prekey: { id: pk.id, publicKey: pk.publicKey }, timestamp: clock.t,
-      content: { type: 'ace:commerce:rfq:1', schemaDigest: commerce.digestOf('ace:commerce:rfq:1')!, threadId: 'job', body: { need: 'logo' } },
+      content: withPrekey({ type: 'ace:commerce:rfq:1', schemaDigest: commerce.digestOf('ace:commerce:rfq:1')!, threadId: 'job', body: { need: 'logo' } }),
     });
     /** The redelivered packet is a duplicate answered `delivered`; the host and the thread hold the message once. */
     const check = async (inbox: Inbox) => {

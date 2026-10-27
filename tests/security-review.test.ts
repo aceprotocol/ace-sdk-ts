@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { NetworkClient, ReplayDetector, canonicalStateBytes, contactContent, createCardRecord, createPacket, createPermit, sha256Hex } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent } from './helpers.js';
+import { withPrekey } from './helpers2.js';
 
 // Insert a local block at the await between a network operation's admission read and its locked update.
 async function blockBeforeNextUpdate(client: NetworkClient, peer: string) {
@@ -19,8 +20,8 @@ describe('security review regressions', () => {
     try {
       const packet = await createPacket({ identity: alice.id, to: B, timestamp: clock.t,
         prekey: (await bob.client.publish()).descriptor.prekey,
-        content: contactContent({ kind: 'request', profile: 'ace:text:1', note: '', source: await alice.client.publish(),
-          permit: await createPermit(alice.id, B, { now: clock.t }) }) });
+        content: withPrekey(contactContent({ kind: 'request', profile: 'ace:text:1', note: '', source: await alice.client.publish(),
+          permit: await createPermit(alice.id, B, { now: clock.t }) })) });
       const save = bob.client.admission.saveRequest.bind(bob.client.admission);
       vi.spyOn(bob.client.admission, 'saveRequest').mockImplementationOnce(async (request) => {
         await bob.client.block(A);
@@ -69,7 +70,7 @@ describe('security review regressions', () => {
       const permit = kind === 'accepted' ? await createPermit(alice.id, B, { now: clock.t }) : undefined;
       const packet = await createPacket({ identity: alice.id, to: B, timestamp: clock.t,
         prekey: (await bob.client.publish()).descriptor.prekey,
-        content: contactContent({ kind, profile: 'ace:text:1', note: '', source, ...(permit ? { permit } : {}) }) });
+        content: withPrekey(contactContent({ kind, profile: 'ace:text:1', note: '', source, ...(permit ? { permit } : {}) })) });
       await blockBeforeNextUpdate(bob.client, A);
       await bob.client.inbox.receive(packet);
       expect((await bob.client.admission.get(A))?.status).toBe('blocked');

@@ -3,7 +3,7 @@
  * kept for OFFLINE_WINDOW_SECONDS after it was superseded (at most MAX_RETAINED_PREKEYS), then deleted.
  */
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
-import { ACEError } from './errors.js';
+import { ACEError, type ACEErrorCode } from './errors.js';
 import { canonicalStateBytes, closedKeys, decodeB64, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import { KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_SEED_SIZE, MAX_RETAINED_PREKEYS, OFFLINE_WINDOW_SECONDS } from './limits.js';
 import { MemoryStore, withLock, type ACEStore } from './store.js';
@@ -54,6 +54,13 @@ export function decodePrekey(value: unknown, code: 'invalid_authorization' | 'in
   const pk = decodeB64(value.publicKey, code, 'prekey.publicKey', KEM_PUBLIC_KEY_SIZE);
   if (pk.length !== KEM_PUBLIC_KEY_SIZE) throw new ACEError(code, `prekey.publicKey must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
   if (prekeyId(pk) !== value.id) throw new ACEError(code, 'prekey.id is not SHA-256(publicKey)');
+  return pk;
+}
+
+/** A content `prekey` member (04 § Peer prekeys): canonical Base64 of a 1216-byte X-Wing public key, else `code`. */
+export function decodePrekeyPublicKey(b64: unknown, code: ACEErrorCode): Uint8Array {
+  const pk = decodeB64(b64, code, 'prekey', KEM_PUBLIC_KEY_SIZE);
+  if (pk.length !== KEM_PUBLIC_KEY_SIZE) throw new ACEError(code, `prekey must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
   return pk;
 }
 

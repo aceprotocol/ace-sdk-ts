@@ -9,16 +9,16 @@ import {
   type DeliveryPermit, type InboxOptions, type JSONObject, type NetworkClientOptions, type PrivateContent, type ProfileManifest,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, type TestAgent } from './helpers.js';
-import { inboxWorld, msg, text } from './helpers2.js';
+import { inboxWorld, msg, text, withPrekey } from './helpers2.js';
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
-import { packetHeader, sealPayload } from '../src/packet.js';
+import { packetHeader, padPlaintext, sealPayload } from '../src/packet.js';
 import { decodePrekey } from '../src/prekey.js';
 
 /** A signed packet whose plaintext is `content` as is (`createPacket` refuses content its decoding would refuse). */
 async function packRaw(from: SoftwareIdentity, to: string, prekey: Prekey, content: unknown, timestamp: number) {
   const { cipherText, sharedSecret } = ml_kem768_x25519.encapsulate(decodePrekey(prekey));
   const messageId = crypto.randomUUID(), sender = from.getACEId(), seq = from.getSigningSeq();
-  const payload = await sealPayload(sharedSecret, packetHeader(sender, to, messageId, timestamp, prekey.id, cipherText), canonicalStateBytes(content));
+  const payload = await sealPayload(sharedSecret, packetHeader(sender, to, messageId, timestamp, prekey.id, cipherText), padPlaintext(canonicalStateBytes(content)));
   const m = signingMessage(sender, timestamp, seq, encodePayload(to, messageId, prekey.id, cipherText, payload));
   return {
     ace: '1', messageId, from: sender, to, timestamp,
@@ -234,7 +234,7 @@ describe('05 § Admission recovery: a reinstalled endpoint', () => {
     const profiles: Array<'text' | ProfileManifest> = ['text', BIG];
     const { clock, relay, alice, bob, b } = await pair({ profiles });
     const digest = alice.client.profiles.digestOf('test:big:1')!;
-    const small = canonicalStateBytes({ type: 'test:big:1', schemaDigest: digest, body: { a: '' } }).length;
+    const small = canonicalStateBytes(withPrekey({ type: 'test:big:1', schemaDigest: digest, body: { a: '' } })).length;
     let left = MAX_PLAINTEXT_BYTES - 200 - small;
     const body: Record<string, string> = {};
     for (const k of ['a', 'b', 'c', 'd', 'e']) { const n = Math.min(left, 262144); body[k] = 'x'.repeat(n); left -= n + 8; }
@@ -420,8 +420,8 @@ describe('06 § Recovery candidates: the receiver', () => {
   it('receipts and contact packets carrying admission are dropped invalid_body (decoding refuses them)', async () => {
     const w = await inboxWorld();
     const adm = { proof: {}, permit: {}, source: {} };
-    const receipt = { ...receiptContent({ messageId: crypto.randomUUID(), outcome: 'delivered' }), admission: adm };
-    const contact = { ...contactContent({ kind: 'rejected', profile: TEXT, note: '', source: {} as never }), admission: adm };
+    const receipt = withPrekey({ ...receiptContent({ messageId: crypto.randomUUID(), outcome: 'delivered' }), admission: adm });
+    const contact = withPrekey({ ...contactContent({ kind: 'rejected', profile: TEXT, note: '', source: {} as never }), admission: adm });
     for (const c of [receipt, contact]) {
       expect(() => encodePrivateContent(c as PrivateContent)).toThrow(expect.objectContaining({ code: 'invalid_body' }));
       expect(() => decodePrivateContent(canonicalStateBytes(c))).toThrow(expect.objectContaining({ code: 'invalid_body' }));

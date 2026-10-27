@@ -6,14 +6,15 @@ import {
 } from './sdk.js';
 import { CONTACT_REQUEST_TTL_SECONDS, MAX_PENDING_CONTACT_REQUESTS } from '../src/limits.js';
 import { Clock, FakeRelay, NOW, agent, type TestAgent } from './helpers.js';
+import { withPrekey } from './helpers2.js';
 
 const text = new ProfileSet(['text']);
-const msg = (message: string): PrivateContent => ({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message } });
+const msg = (message: string): PrivateContent => withPrekey({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message } });
 
 /** A packet from `from` to `to`, encrypted to `to`'s current published prekey (bypasses relays and the Outbox). */
 async function direct(from: TestAgent, to: TestAgent, content: PrivateContent, clock: Clock) {
   const prekey = (await to.client.publish()).descriptor.prekey;
-  return createPacket({ identity: from.id, to: to.id.getACEId(), prekey, content, timestamp: clock.t });
+  return createPacket({ identity: from.id, to: to.id.getACEId(), prekey, content: withPrekey(content), timestamp: clock.t });
 }
 
 async function contact(from: TestAgent, to: TestAgent, kind: 'request' | 'accepted' | 'rejected', profile: string, clock: Clock) {

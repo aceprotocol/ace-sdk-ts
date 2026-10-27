@@ -13,7 +13,7 @@ import {
   type AgentCard, type DelegationCredential, type DeliveryPermit, type DescriptorDelegation, type Erc8004Binding, type PublishedAgent, type VerifiedAgent,
 } from './descriptor.js';
 import { ACEError, isUnknownPeer } from './errors.js';
-import { canonicalStateBytes, isACEId, isHandle, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
+import { canonicalStateBytes, isACEId, isHandle, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import type { KelEvent, KelState } from './kel.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
 import { Inbox, type ContactEvent, type ReceiveOutcome } from './inbox.js';
@@ -25,7 +25,7 @@ import { FileStore, publicRelay } from './node.js';
 import { Outbox, type OutboxEntry } from './outbox.js';
 import { createPacket, encodePrivateContent, type Packet } from './packet.js';
 import { PeerStore, type Adopted } from './peer-store.js';
-import { StorePrekeyVault, type PrekeyVault } from './prekey.js';
+import { StorePrekeyVault, prekeyPublicKey, type PrekeyVault } from './prekey.js';
 import { RelayClient } from './relay.js';
 import { isCanonicalRelayUrl } from './relay-url.js';
 import type { ProfileRules } from './rules.js';
@@ -655,6 +655,7 @@ export class NetworkClient {
       : await this.agent(to, { refresh: o.refresh });
     const prekey = agent.descriptor.prekey;
     if (o.avoidPrekey !== undefined && prekey.id === o.avoidPrekey) throw new ACEError('unknown_prekey', 'the peer still publishes the rejected prekey');
+    content = { ...content, prekey: toBase64(prekeyPublicKey(crypto.getRandomValues(new Uint8Array(32)))) }; // Task 9: vault.offer(to, now)
     const pack = (c: PrivateContent) => createPacket({ identity: this.identity, to, prekey, content: c, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: this.#now() });
     let packet: Packet, permit: DeliveryPermit | undefined, reply: { permit: DeliveryPermit; fresh: boolean } | undefined, sent = content;
     if (!o.recover) {

@@ -4,10 +4,11 @@ import {
   type InboxOptions, type ParsedMessage, type PrivateContent, type ReceiptBody, type SoftwareIdentity,
 } from './sdk.js';
 import { Clock, FakeRelay, NOW, identity } from './helpers.js';
+import { withPrekey } from './helpers2.js';
 
 const text = new ProfileSet(['text']);
 const commerce = new ProfileSet(['commerce']);
-const msg = (message: string): PrivateContent => ({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message } });
+const msg = (message: string): PrivateContent => withPrekey({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message } });
 
 async function setup(o: Partial<InboxOptions> & { admit?: boolean } = {}) {
   const clock = new Clock();
@@ -28,7 +29,7 @@ async function setup(o: Partial<InboxOptions> & { admit?: boolean } = {}) {
     onMessage: (m) => { delivered.push(m); }, sendReceipt: async (to, b) => { receipts.push([to, b]); }, ...o,
   });
   const pack = (from: SoftwareIdentity, content: PrivateContent, ts = clock.t, messageId?: string) =>
-    createPacket({ identity: from, to: me.getACEId(), prekey, content, timestamp: ts, ...(messageId ? { messageId } : {}) });
+    createPacket({ identity: from, to: me.getACEId(), prekey, content: withPrekey(content), timestamp: ts, ...(messageId ? { messageId } : {}) });
   return { clock, me, sender, store, inbox, receipts, delivered, refreshPeer, pack, peers };
 }
 

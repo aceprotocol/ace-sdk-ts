@@ -13,14 +13,17 @@
  */
 import type { ReceiptBody } from './core-messages.js';
 import { ACEError, asACEError } from './errors.js';
-import { canonicalStateBytes, isACEId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
+import { canonicalStateBytes, isACEId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import type { ACEIdentity } from './identity.js';
-import { OFFLINE_WINDOW_SECONDS, OUTBOX_FIRST_RETRY_SECONDS, OUTBOX_MAX_RETRY_SECONDS } from './limits.js';
+import { KEM_PUBLIC_KEY_SIZE, OFFLINE_WINDOW_SECONDS, OUTBOX_FIRST_RETRY_SECONDS, OUTBOX_MAX_RETRY_SECONDS } from './limits.js';
 import { CONTACT_TYPE, RECEIPT_TYPE, type ProfileSet } from './manifest.js';
 import { encodePrivateContent } from './packet.js';
 import { checkRules, commitRules, ruleEvent, rulesFor, type ProfileRules } from './rules.js';
 import { withLock, type ACEStore } from './store.js';
 import type { JSONObject, PrivateContent } from './types.js';
+
+/** Stands in for the peer prekey every packet carries (added per attempt) when sizing content before it is stored. */
+const SIZING_PREKEY = toBase64(new Uint8Array(KEM_PUBLIC_KEY_SIZE));
 
 export type OutboxStatus = 'pending' | 'delivered' | 'rejected' | 'expired';
 
@@ -175,7 +178,7 @@ export class Outbox {
     const schemaDigest = this.#o.profiles.digestOf(m.type);
     if (schemaDigest === undefined) throw new ACEError('unsupported_schema', `${m.type.slice(0, 64)} is not installed`);
     const content: PrivateContent = { type: m.type, schemaDigest, ...(m.threadId !== undefined ? { threadId: m.threadId } : {}), body: structuredClone(m.body) };
-    encodePrivateContent(content);
+    encodePrivateContent({ ...content, prekey: SIZING_PREKEY }); // size check before anything is stored
     this.#o.profiles.validate(content.type, schemaDigest, content.body);
     const now = this.#now();
     const event = ruleEvent('send', { from, to: m.to, messageId, timestamp: now, type: m.type, threadId: m.threadId });

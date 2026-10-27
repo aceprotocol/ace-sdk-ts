@@ -4,6 +4,8 @@ export const TIMESTAMP_WINDOW_SECONDS = 300;
 export const OFFLINE_WINDOW_SECONDS = 604_800;
 /** 1 MiB + 128 KiB: room for a full PublishedAgent in a contact request. */
 export const MAX_PLAINTEXT_BYTES = 1_179_648;
+/** The smallest padded plaintext (03 § Encryption): buckets are powers of two from here to 2^20, then MAX_PLAINTEXT_BYTES + 4. */
+export const MIN_PLAINTEXT_BUCKET = 4096;
 export const MAX_PACKET_BYTES = 2_097_152;
 /** `POST /v1/send` body: a packet plus room for a permit. */
 export const MAX_SEND_BODY_BYTES = MAX_PACKET_BYTES + 65_536;
