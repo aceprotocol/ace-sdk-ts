@@ -143,6 +143,15 @@ describe('private content prekey (04 § Peer prekeys)', () => {
     expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: 'QQ==' })))).toBe('invalid_body');
     expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: null })))).toBe('invalid_body');
   });
+  it('a prekey in non-canonical Base64 is invalid_body', () => {
+    // 1216 bytes leave one byte in the last quantum: its second character carries 4 zero bits.
+    const pk = new Uint8Array(1216).fill(0x41), b64 = toBase64(pk);
+    expect(b64.endsWith('QQ==')).toBe(true);
+    for (const bad of [`${b64.slice(0, -4)}QR==`, b64.slice(0, -2), `${b64.slice(0, -4)}QQ=`, `${b64.slice(0, -4)}Q Q==`]) {
+      expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: bad })))).toBe('invalid_body');
+    }
+    expect(decodePrivateContent(canonicalStateBytes({ ...without, prekey: b64 })).prekey).toBe(b64);
+  });
 });
 
 describe('PrekeyVault', () => {

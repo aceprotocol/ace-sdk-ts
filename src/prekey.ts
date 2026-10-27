@@ -301,6 +301,8 @@ export class StorePrekeyVault implements PrekeyVault {
   async used(peer: string, prekeyId: string, now: number): Promise<void> {
     checkPeer(peer);
     checkInt(now, 'now');
+    // `now` is intentionally unused (beyond its check): the in-use key keeps the offeredAt of its last offer (04 § Peer
+    // prekeys: a seed's window runs from the last packet that carried it as the offered key).
     return this.#update((s) => {
       const p = s.peers[peer];
       if (p?.offered?.id !== prekeyId) return { result: undefined };

@@ -409,8 +409,8 @@ describe('vectors: receive pipeline', () => {
     return { vault, vaultStore, t };
   };
   it.each(V.pipeline.cases.map((c: Any) => [c.name, c]))('%s', async (_n, c: Any) => { await run(c); });
-  // Task 9: the Inbox records used() / hold() after step 6.
-  it.skip.each(V.pipeline.cases.filter((c: Any) => c.vaultAfter !== undefined).map((c: Any) => [c.name, c]))('vault after: %s', async (_n, c: Any) => {
+  // The Inbox records used() / hold() after step 6; held.timestamp is read from the vault document in the store.
+  it.each(V.pipeline.cases.filter((c: Any) => c.vaultAfter !== undefined).map((c: Any) => [c.name, c]))('vault after: %s', async (_n, c: Any) => {
     const { vault, vaultStore, t } = await run(c);
     {
       const after = c.vaultAfter;

@@ -218,7 +218,9 @@ export function encodePrivateContent(content: PrivateContent): Uint8Array {
 /** `prekeyCode`: the error for a missing or malformed `prekey` (the sender's `invalid_argument`, else `invalid_body`). */
 function checkPrivateContent(c: unknown, prekeyCode: ACEErrorCode = 'invalid_body'): asserts c is PrivateContent & { prekey: string } {
   if (!isObj(c)) throw new ACEError('invalid_body', 'private content must be a JSON object');
-  // 04 § Peer prekeys: every packet (receipts and contact packets too) offers the receiver a peer prekey.
+  // 04 § Peer prekeys: every packet (receipts and contact packets too) offers the receiver a peer prekey. Checked before
+  // the closed key set on purpose: a missing or malformed `prekey` is the sender's `invalid_argument` (`prekeyCode`),
+  // which an unknown member reported first as `invalid_body` would mask.
   if (!('prekey' in c)) throw new ACEError(prekeyCode, 'private content must carry prekey');
   decodePrekeyPublicKey(c.prekey, prekeyCode);
   if (!closedKeys(c, ['type', 'schemaDigest', 'body', 'prekey'], ['threadId', 'admission'])) throw new ACEError('invalid_body', 'private content must be {type, schemaDigest, threadId?, body, prekey, admission?}');

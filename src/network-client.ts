@@ -13,7 +13,7 @@ import {
   type AgentCard, type DelegationCredential, type DeliveryPermit, type DescriptorDelegation, type Erc8004Binding, type PublishedAgent, type VerifiedAgent,
 } from './descriptor.js';
 import { ACEError, isUnknownPeer } from './errors.js';
-import { canonicalStateBytes, isACEId, isHandle, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
+import { canonicalStateBytes, isACEId, isHandle, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
 import type { KelEvent, KelState } from './kel.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
 import { Inbox, type ContactEvent, type ReceiveOutcome } from './inbox.js';
@@ -25,7 +25,7 @@ import { FileStore, publicRelay } from './node.js';
 import { Outbox, type OutboxEntry } from './outbox.js';
 import { createPacket, encodePrivateContent, type Packet } from './packet.js';
 import { PeerStore, type Adopted } from './peer-store.js';
-import { StorePrekeyVault, prekeyPublicKey, type PrekeyVault } from './prekey.js';
+import { StorePrekeyVault, type Prekey, type PrekeyVault } from './prekey.js';
 import { RelayClient } from './relay.js';
 import { isCanonicalRelayUrl } from './relay-url.js';
 import type { ProfileRules } from './rules.js';
@@ -646,17 +646,38 @@ export class NetworkClient {
    * Outbox attempt, 06 § Outbox step 3): without a permit valid under the peer's current pin the attempt fails
    * `not_permitted` and nothing is posted; it never falls back to the stranger path. `recover` (an Outbox retry): the
    * content carries `admission`, with our current PublishedAgent, for this attempt only (05 § Admission recovery).
+   *
+   * Key choice (04 § Peer prekeys, 06 § Outbox step 2): an Outbox first attempt encrypts to the peer prekey held for `to`
+   * under its current pin, else (retries, receipts, contact packets) to the published prekey. An `unknown_prekey`
+   * rejection (`avoidPrekey`) naming the held key drops it; one naming the published prekey still current is final.
+   * Every packet offers `to` our peer prekey for it.
    */
   async #post(to: string, content: PrivateContent, o: { messageId?: string; refresh: boolean; avoidPrekey?: string; permit?: DeliveryPermit; needPermit?: boolean; recover?: boolean }): Promise<{ prekey: string }> {
     // A retry's refresh (the peer may have lost its prekeys) falls back to a cached descriptor still unexpired and bound to
-    // the pins; a refresh asked by `unknown_prekey` (`avoidPrekey`) does not (06 § Outbox step 1).
-    const agent = o.recover && o.avoidPrekey === undefined
-      ? await this.agent(to, { refresh: true }).catch(() => this.agent(to))
-      : await this.agent(to, { refresh: o.refresh });
-    const prekey = agent.descriptor.prekey;
+    // the pins (06 § Outbox step 1), except one still publishing the prekey an `unknown_prekey` rejection named: whether
+    // that rejection is final is decided only by a fresh descriptor.
+    let agent: PublishedAgent;
+    if (o.recover) {
+      try {
+        agent = await this.agent(to, { refresh: true });
+      } catch (e) {
+        agent = await this.agent(to);
+        if (o.avoidPrekey !== undefined && agent.descriptor.prekey.id === o.avoidPrekey) throw e;
+      }
+    } else {
+      agent = await this.agent(to, { refresh: o.refresh });
+    }
+    const now = this.#now();
+    let prekey: Prekey = agent.descriptor.prekey;
+    if (o.needPermit) { // an Outbox attempt
+      const pin = (await this.peers.get(to))?.lastHash;
+      const held = pin === undefined ? null : await this.vault.held(to, pin, now);
+      if (held !== null && held.id === o.avoidPrekey) await this.vault.dropHeld(to); // the retry goes to the published prekey
+      else if (held !== null && !o.recover) prekey = held;
+    }
     if (o.avoidPrekey !== undefined && prekey.id === o.avoidPrekey) throw new ACEError('unknown_prekey', 'the peer still publishes the rejected prekey');
-    content = { ...content, prekey: toBase64(prekeyPublicKey(crypto.getRandomValues(new Uint8Array(32)))) }; // Task 9: vault.offer(to, now)
-    const pack = (c: PrivateContent) => createPacket({ identity: this.identity, to, prekey, content: c, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: this.#now() });
+    content = { ...content, prekey: (await this.vault.offer(to, now)).publicKey };
+    const pack = (c: PrivateContent) => createPacket({ identity: this.identity, to, prekey, content: c, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: now });
     let packet: Packet, permit: DeliveryPermit | undefined, reply: { permit: DeliveryPermit; fresh: boolean } | undefined, sent = content;
     if (!o.recover) {
       [packet, permit] = await Promise.all([pack(content), this.#theirPermit(to, o.permit)]);
@@ -922,6 +943,7 @@ export class NetworkClient {
   async block(aceId: string): Promise<void> {
     if (!isACEId(aceId) || aceId === this.identity.getACEId()) throw new ACEError('invalid_argument', 'peer must be another ACE ID');
     const revision = await this.admission.block(aceId, this.#now());
+    await this.vault.dropHeld(aceId); // 04 § Peer prekeys
     await this.#syncBlock(aceId, revision);
   }
 

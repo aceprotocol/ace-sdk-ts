@@ -26,7 +26,7 @@ import { DEFAULT_REPLAY_CAPACITY, MAX_FETCH_ATTEMPTS, OFFLINE_WINDOW_SECONDS, PI
 import { CONTACT_TYPE, RECEIPT_TYPE, type ProfileSet } from './manifest.js';
 import { checkPacketTime, decodePacket, decryptPacket, parsePacket, verifyPacketSignature, type Packet } from './packet.js';
 import { PeerStore } from './peer-store.js';
-import type { PrekeyVault } from './prekey.js';
+import { decodePrekeyPublicKey, prekeyId, type PrekeyVault } from './prekey.js';
 import type { RelayClient } from './relay.js';
 import { ReplayDetector, SEEN_FLOOR_SECONDS, type ReplayState } from './replay.js';
 import { checkRules, commitRules, ruleEvent, rulesFor, type ProfileRules, type RuleEvent } from './rules.js';
@@ -319,11 +319,18 @@ export class Inbox {
     let content: PrivateContent;
     try {
       content = await decryptPacket(packet, this.#o.vault);
-      delete content.prekey; // Task 9: recorded by vault.used() / hold()
     } catch (e) {
       const err = asACEError(e, 'decryption_failed');
       if (err.code === 'unknown_prekey') return this.#reject(packet, err, packet.encryption.prekey);
       return settle(err);
+    }
+    // 06 § Receive pipeline, peer prekeys: the sender is pinned at step 3, so its offer is held under that pin (contact
+    // packets excepted), whatever the disposition from step 7 on (duplicates and rejections included).
+    try {
+      const offered = await this.#opened(packet, content);
+      if (content.type !== CONTACT_TYPE) await this.#holdOffer(packet, offered, state);
+    } catch (e) {
+      return settle(asACEError(e, 'storage_failed'));
     }
     const core = content.type === RECEIPT_TYPE || content.type === CONTACT_TYPE;
     // 7-8. installed (type, schemaDigest), then body schema
@@ -354,6 +361,24 @@ export class Inbox {
     await this.#admission.holdPermit(permit, { when, keep: (held) => held.issuedAt > permit.issuedAt && live(held) });
   }
 
+  /**
+   * After step 6 on every path (04 § Peer prekeys, issuer rule): the packet opened under the key referenced, which
+   * becomes the in-use key when it is the one offered to the sender. Strips the carried `prekey` from `content` (it is
+   * never validated as part of the body nor handed over) and returns it.
+   */
+  async #opened(packet: Packet, content: PrivateContent): Promise<string> {
+    const offered = content.prekey!; // decryptPacket checked it
+    delete content.prekey;
+    await this.#o.vault.used(packet.from, packet.encryption.prekey, this.#now());
+    return offered;
+  }
+
+  /** The holder rule: hold the key a pinned sender offered, bound to its pin `state` (newer timestamps win). */
+  async #holdOffer(packet: Packet, offered: string, state: KelState): Promise<void> {
+    const id = prekeyId(decodePrekeyPublicKey(offered, 'invalid_body'));
+    await this.#o.vault.hold(packet.from, { id, publicKey: offered }, packet.timestamp, state.lastHash);
+  }
+
   /** Refresh a sender at most once per PIN_REFRESH_INTERVAL_SECONDS (06 step 3), a failed attempt included. */
   async #refresh(aceId: string): Promise<KelState | null> {
     if (this.#o.refreshPeer === undefined) return null;
@@ -376,12 +401,17 @@ export class Inbox {
     try {
       checkPacketTime(packet, this.#now());
       content = await decryptPacket(packet, this.#o.vault);
-      delete content.prekey; // Task 9: recorded by vault.used() / hold()
     } catch (e) {
       return settle(asACEError(e, 'not_permitted'));
     }
+    let offered: string;
+    try {
+      offered = await this.#opened(packet, content); // held only once the recovery path pins the sender
+    } catch (e) {
+      return settle(asACEError(e, 'storage_failed'));
+    }
     if (content.type === CONTACT_TYPE) return this.#contactCandidate(packet, content, stranger);
-    if (recover && content.admission !== undefined) return this.#restore(packet, content, content.admission);
+    if (recover && content.admission !== undefined) return this.#restore(packet, content, content.admission, offered);
     return drop(new ACEError('not_permitted', stranger ? 'sender is not admitted' : 'an unpinned sender may only send contact packets'));
   }
 
@@ -410,7 +440,7 @@ export class Inbox {
    * block) with `proof` as the newest permit issued to it, and its permit held; then steps 8-11 as for any admitted
    * sender. Every failure before the sender is recorded is a drop, and nothing is pinned.
    */
-  async #restore(packet: Packet, content: PrivateContent, admission: Admission): Promise<ReceiveOutcome> {
+  async #restore(packet: Packet, content: PrivateContent, admission: Admission, offered: string): Promise<ReceiveOutcome> {
     const from = packet.from;
     // 7. installed (type, schemaDigest); a body schema failure (8) is answered once the sender is admitted
     if (this.#o.profiles.digestOf(content.type) !== content.schemaDigest) return drop(new ACEError('unsupported_schema', 'message type is not installed'));
@@ -441,6 +471,8 @@ export class Inbox {
       if (this.#o.importSource !== undefined) await this.#o.importSource(source);
       else await this.#peers.adopt(structuredClone(source.state.events));
       await this.#hold(permit, source.state, (r) => r?.status === 'admitted');
+      // Pinned by this path: the sender's offer is held under the adopted pin (04 § Peer prekeys).
+      await this.#holdOffer(packet, offered, source.state);
     } catch (e) {
       return settle(asACEError(e, 'storage_failed'));
     }
