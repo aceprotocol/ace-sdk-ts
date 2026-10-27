@@ -1,6 +1,6 @@
 // PrekeyVault lifecycle (ace-spec/04 § Prekey), mirroring sdk-py tests/test_packet.py prekey cases.
 import { describe, expect, it } from 'vitest';
-import { MemoryStore, OFFLINE_WINDOW_SECONDS, StorePrekeyVault, MAX_RETAINED_PREKEYS, prekeyId, prekeyPublicKey, toBase64, type Prekey } from './sdk.js';
+import { MemoryStore, OFFLINE_WINDOW_SECONDS, StorePrekeyVault, MAX_RETAINED_PREKEYS, checkXWingPublicKey, prekeyId, prekeyPublicKey, toBase64, type Prekey } from './sdk.js';
 import { NOW } from './helpers.js';
 
 const enc = new TextEncoder();
@@ -220,6 +220,24 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     await expect(v.offer(A, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
     await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [], peers: { [A]: { offered: null, inUse: null, held: { publicKey: 'QQ==', timestamp: NOW, pin: PIN } } } })));
     await expect(v.held(A, PIN, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
+  });
+
+  it('a held.publicKey that is not an X-Wing public key is storage_failed', async () => {
+    const { store, v } = vaultAt();
+    const notXWing = toBase64(new Uint8Array(1216).fill(0xff));
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [], peers: { [A]: { offered: null, inUse: null, held: { publicKey: notXWing, timestamp: NOW, pin: PIN } } } })));
+    await expect(v.held(A, PIN, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
+    await expect(v.current()).rejects.toMatchObject({ code: 'storage_failed' });
+  });
+
+  it('checkXWingPublicKey: a real key passes; a bad ML-KEM half or a wrong length fails; any X25519 half is accepted', () => {
+    const pk = prekeyPublicKey(crypto.getRandomValues(new Uint8Array(32)));
+    expect(() => checkXWingPublicKey(pk)).not.toThrow();
+    const lowOrder = pk.slice(); lowOrder.fill(0, 1184); // all-zero X25519 half: any 32 bytes are an X25519 key
+    expect(() => checkXWingPublicKey(lowOrder)).not.toThrow();
+    expect(() => checkXWingPublicKey(new Uint8Array(1216).fill(0xff))).toThrow(expect.objectContaining({ code: 'invalid_argument' }));
+    expect(() => checkXWingPublicKey(new Uint8Array(1216).fill(0xff), 'invalid_body')).toThrow(expect.objectContaining({ code: 'invalid_body' }));
+    expect(() => checkXWingPublicKey(pk.subarray(0, 1215))).toThrow(expect.objectContaining({ code: 'invalid_argument' }));
   });
 
   it('protect seals the whole document, peer state included', async () => {

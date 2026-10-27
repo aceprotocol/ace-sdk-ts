@@ -4,7 +4,9 @@
 import {
   MemoryStore, NetworkClient, ACEError, canonicalStateBytes, createPacket, decodePacket, decryptPacket, prekeyId,
   prekeyPublicKey, toBase64, fromBase64, type PrivateContent, type Packet,
+  checkUsable, padPlaintext, packetHeader, packetSignPayload, sealPayload, signingMessage, type Prekey, type SoftwareIdentity,
 } from './sdk.js';
+import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
 import { Clock, FakeRelay, agent, type TestAgent } from './helpers.js';
 import { inboxWorld, msg } from './helpers2.js';
 import { vi } from 'vitest';
@@ -255,5 +257,41 @@ describe('06 § Receive pipeline: peer prekeys at step 6', () => {
     await w.vault.dropHeld(w.sender.getACEId());
     expect(await w.inbox.receive(ok)).toMatchObject({ kind: 'duplicate' });
     expect(await w.vault.held(w.sender.getACEId(), pin, w.clock.t)).not.toBeNull();
+  });
+});
+
+/**
+ * A correctly signed packet whose private content is `content` verbatim (createPacket would refuse a malformed one):
+ * what a faulty or hostile sender can put on the wire.
+ */
+async function forgedPacket(from: SoftwareIdentity, to: string, prekey: Prekey, content: object, timestamp: number): Promise<Packet> {
+  const messageId = crypto.randomUUID(), seq = checkUsable(from, timestamp).signing!.seq;
+  const { cipherText, sharedSecret } = ml_kem768_x25519.encapsulate(fromBase64(prekey.publicKey));
+  const header = packetHeader(from.getACEId(), to, messageId, timestamp, prekey.id, cipherText);
+  const payload = await sealPayload(sharedSecret, header, padPlaintext(canonicalStateBytes(content)));
+  const packet: Packet = {
+    ace: '1', messageId, from: from.getACEId(), to, timestamp,
+    encryption: { prekey: prekey.id, kemCiphertext: toBase64(cipherText), payload: toBase64(payload) },
+    signature: { scheme: 'ml-dsa-65', seq, value: '' },
+  };
+  packet.signature.value = toBase64(await from.sign(signingMessage(from.getACEId(), timestamp, seq, packetSignPayload(packet)), 'packet'));
+  return decodePacket(JSON.parse(JSON.stringify(packet)));
+}
+
+describe('03 § Private content: a prekey that is not an X-Wing public key', () => {
+  it('a pinned sender\'s packet offering one fails with invalid_body and nothing is held', async () => {
+    const w = await inboxWorld();
+    const peer = w.sender.getACEId(), pin = (await w.peers.get(peer))!.lastHash;
+    const notXWing = toBase64(new Uint8Array(1216).fill(0xff));
+    const p = await forgedPacket(w.sender, w.me.getACEId(), w.prekey, { ...msg('x'), prekey: notXWing }, w.clock.t);
+    const out = await w.inbox.receive(p);
+    expect(out).toMatchObject({ error: { code: 'invalid_body' } });
+    expect(out.kind).toBe('dropped'); // step 6 content decode: a permanent failure is dropped, never delivered
+    expect(w.delivered).toEqual([]);
+    expect(await w.vault.held(peer, pin, w.clock.t)).toBeNull();
+    // the same forgery with a real key is delivered and held: the check is what kept the dead key out
+    const ok = await forgedPacket(w.sender, w.me.getACEId(), w.prekey, msg('y'), w.clock.t);
+    expect(await w.inbox.receive(ok)).toMatchObject({ kind: 'delivered' });
+    expect(await w.vault.held(peer, pin, w.clock.t)).not.toBeNull();
   });
 });

@@ -7,6 +7,7 @@
  * after it was last offered, and one *held* public key the peer offered us, bound to the pin it was authenticated under.
  */
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
+import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
 import { ACEError, type ACEErrorCode } from './errors.js';
 import { canonicalStateBytes, closedKeys, decodeB64, isACEId, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import { KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_SEED_SIZE, MAX_RETAINED_PREKEYS, OFFLINE_WINDOW_SECONDS } from './limits.js';
@@ -84,10 +85,30 @@ export function decodePrekey(value: unknown, code: 'invalid_authorization' | 'in
   return pk;
 }
 
-/** A content `prekey` member (04 § Peer prekeys): canonical Base64 of a 1216-byte X-Wing public key, else `code`. */
+const MLKEM_PUBLIC_KEY_SIZE = 1184;
+
+/**
+ * Throw `code` unless `publicKey` is an X-Wing public key: 1216 bytes whose ML-KEM-768 half passes the FIPS 203 modulus
+ * check (any 32 bytes are an X25519 public key). noble parses lazily (the check runs inside `encapsulate`), so this is a
+ * trial encapsulation of the ML-KEM half; its result is discarded.
+ */
+export function checkXWingPublicKey(publicKey: Uint8Array, code: ACEErrorCode = 'invalid_argument'): void {
+  if (!(publicKey instanceof Uint8Array) || publicKey.length !== KEM_PUBLIC_KEY_SIZE) throw new ACEError(code, `X-Wing public key must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
+  try {
+    ml_kem768.encapsulate(publicKey.subarray(0, MLKEM_PUBLIC_KEY_SIZE));
+  } catch {
+    throw new ACEError(code, 'X-Wing public key is not a valid ML-KEM-768 key');
+  }
+}
+
+/**
+ * A content `prekey` member (04 § Peer prekeys): canonical Base64 of an X-Wing public key, else `code`. Checked here, at
+ * decode, so a key that cannot be encapsulated to is never held (03 § Private content).
+ */
 export function decodePrekeyPublicKey(b64: unknown, code: ACEErrorCode): Uint8Array {
   const pk = decodeB64(b64, code, 'prekey', KEM_PUBLIC_KEY_SIZE);
   if (pk.length !== KEM_PUBLIC_KEY_SIZE) throw new ACEError(code, `prekey must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
+  checkXWingPublicKey(pk, code);
   return pk;
 }
 

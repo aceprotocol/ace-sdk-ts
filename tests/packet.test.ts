@@ -143,6 +143,12 @@ describe('private content prekey (04 § Peer prekeys)', () => {
     expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: 'QQ==' })))).toBe('invalid_body');
     expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: null })))).toBe('invalid_body');
   });
+  it('a 1216-byte prekey that is not an X-Wing public key is invalid_body (03 § Private content)', () => {
+    // 0xFF everywhere: the ML-KEM-768 half fails the FIPS 203 modulus check, so nothing can be encapsulated to it.
+    const bad = toBase64(new Uint8Array(1216).fill(0xff));
+    expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: bad })))).toBe('invalid_body');
+    expect(code(() => encodePrivateContent({ ...without, prekey: bad }))).toBe('invalid_argument');
+  });
   it('a prekey in non-canonical Base64 is invalid_body', () => {
     // 1216 bytes leave one byte in the last quantum: its second character carries 4 zero bits.
     const pk = new Uint8Array(1216).fill(0x41), b64 = toBase64(pk);
