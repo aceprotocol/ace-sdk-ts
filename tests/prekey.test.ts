@@ -210,9 +210,25 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     expect(await again.held(A, PIN, NOW)).toEqual(p);
   });
 
-  it('a version 1 or malformed document is storage_failed', async () => {
+  it('a version 1 document is read as version 2 with no peers', async () => {
+    const { t, store, v } = vaultAt();
+    const first = await v.rotate(NOW);
+    const second = await v.rotate(NOW + 10);
+    const doc = await docOf(store);
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: doc.current, retained: doc.retained })));
+    t.now = NOW + 20;
+    const again = new StorePrekeyVault(store, { clock: () => t.now });
+    expect((await again.current())?.id).toBe(second.id);
+    expect(await again.open(first.id, A)).not.toBeNull();
+    await again.offer(A, NOW + 20);
+    expect((await docOf(store)).version).toBe(2);
+  });
+
+  it('another version or a malformed document is storage_failed', async () => {
     const { store, v } = vaultAt();
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: null, retained: [] })));
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 3, current: null, retained: [], peers: {} })));
+    await expect(v.current()).rejects.toMatchObject({ code: 'storage_failed' });
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: null, retained: [], peers: {} })));
     await expect(v.current()).rejects.toMatchObject({ code: 'storage_failed' });
     await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [] })));
     await expect(v.offer(A, NOW)).rejects.toMatchObject({ code: 'storage_failed' });

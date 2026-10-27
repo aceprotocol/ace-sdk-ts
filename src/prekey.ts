@@ -196,13 +196,16 @@ export class StorePrekeyVault implements PrekeyVault {
       const publicKey = decodePrekeyPublicKey(v.publicKey, 'storage_failed');
       return { id: prekeyId(publicKey), publicKey, timestamp: v.timestamp as number, pin: v.pin };
     };
-    if (!closedKeys(d, ['version', 'current', 'retained', 'peers']) || d.version !== VERSION || !Array.isArray(d.retained) || !isObj(d.peers)) throw bad();
+    // Version 1 (0.6.0 and earlier) is version 2 without peers: read it as such, and the next save writes version 2.
+    // Refusing it would cut every upgraded agent off its own published prekey.
+    const doc = closedKeys(d, ['version', 'current', 'retained']) && d.version === 1 ? { ...d, version: VERSION, peers: {} } : d;
+    if (!closedKeys(doc, ['version', 'current', 'retained', 'peers']) || doc.version !== VERSION || !Array.isArray(doc.retained) || !isObj(doc.peers)) throw bad();
     const peers: Record<string, PeerState> = {};
-    for (const [aceId, v] of Object.entries(d.peers)) {
+    for (const [aceId, v] of Object.entries(doc.peers)) {
       if (!isACEId(aceId) || !closedKeys(v, ['offered', 'inUse', 'held'])) throw bad();
       peers[aceId] = { offered: peerSeed(v.offered), inUse: peerSeed(v.inUse), held: held(v.held) };
     }
-    const out = { current: d.current === null ? null : entry(d.current, false), retained: d.retained.map((r) => entry(r, true)), peers };
+    const out = { current: doc.current === null ? null : entry(doc.current, false), retained: doc.retained.map((r) => entry(r, true)), peers };
     this.#publicKeys = publicKeys;
     return out;
   }
