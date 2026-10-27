@@ -4,11 +4,10 @@
  *   header  = encodePayload("ace.v1.packet", from, to, messageId, decimal(timestamp), prekeyId, kemCiphertext)
  *   (ss, kemCiphertext) = XWing.Encapsulate(prekey.publicKey)
  *   key     = HKDF-SHA256(ikm = ss, salt = "", info = header, L = 32)
- *   payload = nonce[12] ‖ AES-256-GCM(key, nonce, pad(plaintext), aad = header)
+ *   payload = nonce[12] ‖ AES-256-GCM(key, nonce, plaintext, aad = header)
  *   signature (action "packet") over M(from, timestamp, seq, encodePayload(to, messageId, prekeyId, kemCiphertext, payload))
  *
- * The plaintext is the canonical JSON of the private content `{type, schemaDigest, threadId?, body, prekey, admission?}`;
- * `pad` hides its length up to a bucket: u32be(len) ‖ content ‖ zeros (03 § Encryption).
+ * The plaintext is the canonical JSON of the private content `{type, schemaDigest, threadId?, body, prekey, admission?}`.
  */
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
@@ -20,7 +19,7 @@ import {
 } from './encoding.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
 import { checkSignatureShape, verifyOperationalSignature, type KelState, type OperationalSignature } from './kel.js';
-import { KEM_CIPHERTEXT_SIZE, MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, MIN_PLAINTEXT_BUCKET, OFFLINE_WINDOW_SECONDS, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import { KEM_CIPHERTEXT_SIZE, MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, OFFLINE_WINDOW_SECONDS, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { CONTACT_TYPE, RECEIPT_TYPE } from './manifest.js';
 import { decodePrekey, decodePrekeyPublicKey, type Prekey, type PrekeyVault } from './prekey.js';
 import { encodePayload, SIGNATURE_SIZE, signingMessage } from './signing.js';
@@ -31,51 +30,8 @@ const DOMAIN = 'ace.v1.packet';
 const SALT = new Uint8Array(0);
 const NONCE_LEN = 12;
 /** nonce (12) + tag (16). */
-const AEAD_OVERHEAD = 28;
-const LENGTH_PREFIX = 4;
-const LARGEST_BUCKET = MAX_PLAINTEXT_BYTES + LENGTH_PREFIX;
-const MAX_PAYLOAD_BYTES = LARGEST_BUCKET + AEAD_OVERHEAD;
-
-/**
- * The padded plaintext length for `contentLen` content bytes (03 § Encryption): the smallest power of two at least
- * MIN_PLAINTEXT_BUCKET holding `contentLen + 4`; above 2^20, MAX_PLAINTEXT_BYTES + 4.
- */
-export function plaintextBucket(contentLen: number): number {
-  const n = contentLen + LENGTH_PREFIX;
-  if (n > 2 ** 20) return LARGEST_BUCKET;
-  let b = MIN_PLAINTEXT_BUCKET;
-  while (b < n) b *= 2;
-  return b;
-}
-
-/** Every padded plaintext length: MIN_PLAINTEXT_BUCKET, 2·MIN_PLAINTEXT_BUCKET, …, 2^20, MAX_PLAINTEXT_BYTES + 4. */
-export const PLAINTEXT_BUCKETS: ReadonlySet<number> = (() => {
-  const out = new Set<number>([LARGEST_BUCKET]);
-  for (let b = MIN_PLAINTEXT_BUCKET; b <= 2 ** 20; b *= 2) out.add(b);
-  return out;
-})();
-
-/** `u32be(len(content)) ‖ content ‖ zeros` up to `plaintextBucket(len(content))`. */
-export function padPlaintext(content: Uint8Array): Uint8Array {
-  const out = new Uint8Array(plaintextBucket(content.length));
-  new DataView(out.buffer).setUint32(0, content.length);
-  out.set(content, LENGTH_PREFIX);
-  return out;
-}
-
-/**
- * The content inside a padded plaintext, or `invalid_body` unless its length is a bucket, the length prefix is at most
- * MAX_PLAINTEXT_BYTES and fits, the bucket is the one the prefix implies and the padding is all zero.
- */
-export function unpadPlaintext(plaintext: Uint8Array): Uint8Array {
-  const size = plaintext.length;
-  const n = size >= LENGTH_PREFIX ? new DataView(plaintext.buffer, plaintext.byteOffset, size).getUint32(0) : 0;
-  if (
-    !PLAINTEXT_BUCKETS.has(size) || n > MAX_PLAINTEXT_BYTES || LENGTH_PREFIX + n > size || plaintextBucket(n) !== size
-    || !plaintext.subarray(LENGTH_PREFIX + n).every((x) => x === 0)
-  ) throw new ACEError('invalid_body', 'plaintext padding is invalid');
-  return plaintext.slice(LENGTH_PREFIX, LENGTH_PREFIX + n);
-}
+const MIN_PAYLOAD_BYTES = 28;
+const MAX_PAYLOAD_BYTES = MAX_PLAINTEXT_BYTES + 28;
 
 export interface Packet {
   ace: '1';
@@ -152,7 +108,7 @@ function decodeKem(text: unknown): Uint8Array {
 
 function decodePayloadBytes(text: unknown): Uint8Array {
   const raw = decodeB64(text, 'invalid_packet', 'encryption.payload', MAX_PAYLOAD_BYTES);
-  if (!PLAINTEXT_BUCKETS.has(raw.length - AEAD_OVERHEAD)) throw bad('encryption.payload is not a padded bucket');
+  if (raw.length < MIN_PAYLOAD_BYTES) throw bad(`encryption.payload must be at least ${MIN_PAYLOAD_BYTES} bytes`);
   return raw;
 }
 
@@ -206,7 +162,7 @@ export async function openPayload(ss: Uint8Array, header: Uint8Array, payload: U
 
 /**
  * Validate private content (`invalid_body`; a missing or malformed `prekey` is `invalid_argument`; an oversize plaintext
- * is `limit_exceeded`) and return its canonical bytes (unpadded).
+ * is `limit_exceeded`) and return its canonical bytes.
  */
 export function encodePrivateContent(content: PrivateContent): Uint8Array {
   checkPrivateContent(content, 'invalid_argument');
@@ -238,7 +194,7 @@ function checkPrivateContent(c: unknown, prekeyCode: ACEErrorCode = 'invalid_bod
   checkJsonValue(c); // 02 § JSON values: depth counted from the plaintext's top-level value
 }
 
-/** Decode unpadded plaintext into private content (`invalid_body`), `prekey` included (the receiver strips it). */
+/** Decode plaintext into private content (`invalid_body`), `prekey` included (the receiver strips it). */
 export function decodePrivateContent(raw: Uint8Array): PrivateContent {
   const c = parseJSONBytes(raw, 'invalid_body', 'plaintext');
   checkPrivateContent(c);
@@ -271,7 +227,7 @@ export async function createPacket(input: CreatePacketInput): Promise<Packet> {
   if (wireInt(timestamp) === null) throw new ACEError('invalid_argument', 'timestamp must be a wire integer');
   const state = checkUsable(identity, timestamp);
   const pk = decodePrekey(input.prekey, 'invalid_argument');
-  const plaintext = padPlaintext(encodePrivateContent(input.content));
+  const plaintext = encodePrivateContent(input.content);
   let kemCiphertext: Uint8Array, ss: Uint8Array, nonce: Uint8Array | undefined;
   if (input._deterministic) {
     ({ kemCiphertext, sharedSecret: ss, nonce } = input._deterministic);
@@ -314,9 +270,9 @@ export function checkPacketTime(packet: Packet, now: number): void {
 }
 
 /**
- * 06 step 6: decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`) and unpad,
- * returning the content bytes: `unknown_prekey` when the vault does not hold it for this sender, `decryption_failed` on
- * AEAD/KEM failure, `invalid_body` on bad padding. The content is not decoded (step 7, `decodePrivateContent`).
+ * 06 step 6: decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`), returning the
+ * plaintext: `unknown_prekey` when the vault does not hold it for this sender, `decryption_failed` on AEAD/KEM failure.
+ * The content is not decoded (step 7, `decodePrivateContent`).
  */
 export async function openPacketPlaintext(packet: Packet, vault: PrekeyVault): Promise<Uint8Array> {
   const secret = await vault.open(packet.encryption.prekey, packet.from);
@@ -325,16 +281,16 @@ export async function openPacketPlaintext(packet: Packet, vault: PrekeyVault): P
   const ss = secret.decapsulate(kem);
   try {
     const header = packetHeader(packet.from, packet.to, packet.messageId, packet.timestamp, packet.encryption.prekey, kem);
-    return unpadPlaintext(await openPayload(ss, header, payload));
+    return await openPayload(ss, header, payload);
   } finally {
     ss.fill(0);
   }
 }
 
 /**
- * Decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`), unpad and decode:
+ * Decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`) and decode:
  * `unknown_prekey` when the vault does not hold it for this sender,
- * `decryption_failed` on AEAD/KEM failure, `invalid_body` on bad padding or content.
+ * `decryption_failed` on AEAD/KEM failure, `invalid_body` on bad content.
  */
 export async function decryptPacket(packet: Packet, vault: PrekeyVault): Promise<PrivateContent> {
   return decodePrivateContent(await openPacketPlaintext(packet, vault));

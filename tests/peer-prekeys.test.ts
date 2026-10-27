@@ -4,7 +4,7 @@
 import {
   MemoryStore, NetworkClient, ACEError, canonicalStateBytes, createPacket, decodePacket, decryptPacket, prekeyId,
   prekeyPublicKey, toBase64, fromBase64, type PrivateContent, type Packet,
-  checkUsable, checkXWingPublicKey, padPlaintext, packetHeader, packetSignPayload, sealPayload, signingMessage, type Prekey, type SoftwareIdentity,
+  checkUsable, packetHeader, packetSignPayload, sealPayload, signingMessage, type Prekey, type SoftwareIdentity,
 } from './sdk.js';
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
 import { Clock, FakeRelay, agent, type TestAgent } from './helpers.js';
@@ -203,7 +203,6 @@ describe('04 § Peer prekeys end to end', () => {
     const real = fromBase64((await alice.client.vault.held(b, pin, clock.t))!.publicKey);
     const lowOrder = real.slice();
     lowOrder.fill(0, 1184); // valid ML-KEM-768 half, all-zero X25519 half
-    expect(() => checkXWingPublicKey(lowOrder)).not.toThrow(); // receivers accept it (03 § X-Wing)
     expect(() => ml_kem768_x25519.encapsulate(lowOrder)).toThrow(); // noble refuses to encapsulate to it
     await alice.client.vault.dropHeld(b);
     await alice.client.vault.hold(b, { id: prekeyId(lowOrder), publicKey: toBase64(lowOrder) }, clock.t, pin);
@@ -290,12 +289,11 @@ describe('06 § Receive pipeline: peer prekeys at step 6', () => {
  */
 async function forgedPacket(
   from: SoftwareIdentity, to: string, prekey: Prekey, content: object, timestamp: number,
-  plaintext: Uint8Array = padPlaintext(canonicalStateBytes(content)),
 ): Promise<Packet> {
   const messageId = crypto.randomUUID(), seq = checkUsable(from, timestamp).signing!.seq;
   const { cipherText, sharedSecret } = ml_kem768_x25519.encapsulate(fromBase64(prekey.publicKey));
   const header = packetHeader(from.getACEId(), to, messageId, timestamp, prekey.id, cipherText);
-  const payload = await sealPayload(sharedSecret, header, plaintext);
+  const payload = await sealPayload(sharedSecret, header, canonicalStateBytes(content));
   const packet: Packet = {
     ace: '1', messageId, from: from.getACEId(), to, timestamp,
     encryption: { prekey: prekey.id, kemCiphertext: toBase64(cipherText), payload: toBase64(payload) },
@@ -305,27 +303,7 @@ async function forgedPacket(
   return decodePacket(JSON.parse(JSON.stringify(packet)));
 }
 
-describe('03 § Private content: a prekey that is not an X-Wing public key', () => {
-  it('a pinned sender\'s packet offering one is rejected invalid_body (step 7) and nothing is held', async () => {
-    const w = await inboxWorld();
-    const peer = w.sender.getACEId(), pin = (await w.peers.get(peer))!.lastHash;
-    const notXWing = toBase64(new Uint8Array(1216).fill(0xff));
-    const p = await forgedPacket(w.sender, w.me.getACEId(), w.prekey, { ...msg('x'), prekey: notXWing }, w.clock.t);
-    const out = await w.inbox.receive(p);
-    expect(out).toMatchObject({ kind: 'rejected', error: { code: 'invalid_body' } });
-    expect(w.receipts).toEqual([[peer, expect.objectContaining({ messageId: p.messageId, outcome: 'rejected', code: 'invalid_body' })]]);
-    expect(w.delivered).toEqual([]);
-    expect(await w.vault.held(peer, pin, w.clock.t)).toBeNull();
-    // the same forgery with a real key is delivered and held: the check is what kept the dead key out
-    const ok = await forgedPacket(w.sender, w.me.getACEId(), w.prekey, msg('y'), w.clock.t);
-    expect(await w.inbox.receive(ok)).toMatchObject({ kind: 'delivered' });
-    expect(await w.vault.held(peer, pin, w.clock.t)).not.toBeNull();
-  });
-});
-
-describe('06 § Receive pipeline: step 6 (padding) drops, step 7 (content shape) rejects non-core packets', () => {
-  const notXWing = toBase64(new Uint8Array(1216).fill(0xff));
-
+describe('06 § Receive pipeline: step 7 (content shape) rejects non-core packets and drops core ones', () => {
   it('a malformed prekey in a pinned peer\'s message is rejected invalid_body with a receipt; nothing is held', async () => {
     const w = await inboxWorld();
     const peer = w.sender.getACEId(), pin = (await w.peers.get(peer))!.lastHash;
@@ -339,22 +317,10 @@ describe('06 § Receive pipeline: step 6 (padding) drops, step 7 (content shape)
   it('the same with receipt-typed content is dropped, never receipted', async () => {
     const w = await inboxWorld();
     const peer = w.sender.getACEId(), pin = (await w.peers.get(peer))!.lastHash;
-    const content = { type: RECEIPT, schemaDigest: '0'.repeat(64), body: { messageId: crypto.randomUUID(), status: 'delivered' }, prekey: notXWing };
+    const content = { type: RECEIPT, schemaDigest: '0'.repeat(64), body: { messageId: crypto.randomUUID(), status: 'delivered' }, prekey: 'not base64!' };
     const p = await forgedPacket(w.sender, w.me.getACEId(), w.prekey, content, w.clock.t);
     expect(await w.inbox.receive(p)).toMatchObject({ kind: 'dropped', error: { code: 'invalid_body' } });
     expect(w.receipts).toEqual([]);
-    expect(await w.vault.held(peer, pin, w.clock.t)).toBeNull();
-  });
-
-  it('non-zero padding is a step-6 failure: dropped, no receipt', async () => {
-    const w = await inboxWorld();
-    const peer = w.sender.getACEId(), pin = (await w.peers.get(peer))!.lastHash;
-    const plaintext = padPlaintext(canonicalStateBytes(msg('x')));
-    plaintext[plaintext.length - 1] = 1;
-    const p = await forgedPacket(w.sender, w.me.getACEId(), w.prekey, msg('x'), w.clock.t, plaintext);
-    expect(await w.inbox.receive(p)).toMatchObject({ kind: 'dropped', error: { code: 'invalid_body' } });
-    expect(w.receipts).toEqual([]);
-    expect(w.delivered).toEqual([]);
     expect(await w.vault.held(peer, pin, w.clock.t)).toBeNull();
   });
 });

@@ -7,7 +7,6 @@
  * after it was last offered, and one *held* public key the peer offered us, bound to the pin it was authenticated under.
  */
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
-import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
 import { ACEError, type ACEErrorCode } from './errors.js';
 import { canonicalStateBytes, closedKeys, decodeB64, isACEId, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, toBase64, wireInt } from './encoding.js';
 import { KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE, KEM_SEED_SIZE, MAX_RETAINED_PREKEYS, OFFLINE_WINDOW_SECONDS } from './limits.js';
@@ -85,30 +84,10 @@ export function decodePrekey(value: unknown, code: 'invalid_authorization' | 'in
   return pk;
 }
 
-const MLKEM_PUBLIC_KEY_SIZE = 1184;
-
-/**
- * Throw `code` unless `publicKey` is an X-Wing public key: 1216 bytes whose ML-KEM-768 half passes the FIPS 203 modulus
- * check (any 32 bytes are an X25519 public key). noble parses lazily (the check runs inside `encapsulate`), so this is a
- * trial encapsulation of the ML-KEM half; its result is discarded.
- */
-export function checkXWingPublicKey(publicKey: Uint8Array, code: ACEErrorCode = 'invalid_argument'): void {
-  if (!(publicKey instanceof Uint8Array) || publicKey.length !== KEM_PUBLIC_KEY_SIZE) throw new ACEError(code, `X-Wing public key must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
-  try {
-    ml_kem768.encapsulate(publicKey.subarray(0, MLKEM_PUBLIC_KEY_SIZE));
-  } catch {
-    throw new ACEError(code, 'X-Wing public key is not a valid ML-KEM-768 key');
-  }
-}
-
-/**
- * A content `prekey` member (04 § Peer prekeys): canonical Base64 of an X-Wing public key, else `code`. Checked here, at
- * decode, so a key that cannot be encapsulated to is never held (03 § Private content).
- */
+/** A content `prekey` member (04 § Peer prekeys): canonical Base64 of a 1216-byte X-Wing public key, else `code`. */
 export function decodePrekeyPublicKey(b64: unknown, code: ACEErrorCode): Uint8Array {
   const pk = decodeB64(b64, code, 'prekey', KEM_PUBLIC_KEY_SIZE);
   if (pk.length !== KEM_PUBLIC_KEY_SIZE) throw new ACEError(code, `prekey must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
-  checkXWingPublicKey(pk, code);
   return pk;
 }
 
@@ -214,10 +193,7 @@ export class StorePrekeyVault implements PrekeyVault {
     const held = (v: unknown): Held | null => {
       if (v === null) return null;
       if (!closedKeys(v, ['publicKey', 'timestamp', 'pin']) || wireInt(v.timestamp) === null || !isHex64(v.pin)) throw bad();
-      // The vault trusts its own document: the key was validated before hold() (decryptPacket's content decode), so a
-      // load re-checks only the length and re-derives the ID, as for seeds (no trial encapsulation per load).
-      const publicKey = decodeB64(v.publicKey, 'storage_failed', 'held.publicKey', KEM_PUBLIC_KEY_SIZE);
-      if (publicKey.length !== KEM_PUBLIC_KEY_SIZE) throw bad();
+      const publicKey = decodePrekeyPublicKey(v.publicKey, 'storage_failed');
       return { id: prekeyId(publicKey), publicKey, timestamp: v.timestamp as number, pin: v.pin };
     };
     if (!closedKeys(d, ['version', 'current', 'retained', 'peers']) || d.version !== VERSION || !Array.isArray(d.retained) || !isObj(d.peers)) throw bad();
@@ -338,8 +314,6 @@ export class StorePrekeyVault implements PrekeyVault {
     checkPeer(peer);
     checkInt(timestamp, 'timestamp');
     if (!isHex64(pin)) throw new ACEError('invalid_argument', 'pin must be 64 lowercase hex');
-    // Length and ID only: the key comes from a content `prekey` that decryptPacket already checked as an X-Wing public
-    // key (decodePrekeyPublicKey), so no second trial encapsulation here.
     const publicKey = decodePrekey(prekey, 'invalid_argument');
     return this.#update((s) => {
       const p = s.peers[peer] ?? NO_PEER;

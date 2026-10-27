@@ -21,7 +21,7 @@ export {
   type PrekeyVault, type Prekey, type PrekeyInfo, type PrekeySecret, type SecretProtector,
 } from './prekey.js';
 export {
-  createPacket, decodePacket, parsePacket, verifyPacketSignature, checkPacketTime, decryptPacket, padPlaintext, unpadPlaintext, plaintextBucket,
+  createPacket, decodePacket, parsePacket, verifyPacketSignature, checkPacketTime, decryptPacket,
   type Packet, type CreatePacketInput,
 } from './packet.js';
 export {

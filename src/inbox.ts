@@ -326,7 +326,7 @@ export class Inbox {
     }
     // 5. time window
     try { checkPacketTime(packet, this.#now()); } catch (e) { return drop(asACEError(e)); }
-    // 6. decrypt and unpad: a failure (bad padding included) is a drop
+    // 6. decrypt: a failure is a drop
     let plaintext: Uint8Array;
     try {
       plaintext = await openPacketPlaintext(packet, this.#o.vault);
@@ -395,7 +395,7 @@ export class Inbox {
 
   /** The holder rule: hold the key a pinned sender offered, bound to its pin `state` (newer timestamps win). */
   async #holdOffer(packet: Packet, offered: string, state: KelState): Promise<void> {
-    const id = prekeyId(fromBase64(offered)); // decryptPacket checked it as an X-Wing public key
+    const id = prekeyId(fromBase64(offered)); // step 7 decoded it (1216 bytes, canonical Base64)
     await this.#o.vault.hold(packet.from, { id, publicKey: offered }, packet.timestamp, state.lastHash);
   }
 

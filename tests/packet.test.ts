@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  MemoryStore, PLAINTEXT_BUCKETS, ProfileSet, StorePrekeyVault, canonicalStateBytes, createPacket, decodePacket, decodePrivateContent, decryptPacket,
-  encodePrivateContent, padPlaintext, plaintextBucket, signingMessage, toBase64, parsePacket, unpadPlaintext,
-  MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, MIN_PLAINTEXT_BUCKET, OFFLINE_WINDOW_SECONDS, type PrivateContent,
+  MemoryStore, ProfileSet, StorePrekeyVault, canonicalStateBytes, createPacket, decodePacket, decodePrivateContent, decryptPacket,
+  encodePrivateContent, fromBase64, signingMessage, toBase64, parsePacket,
+  MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, OFFLINE_WINDOW_SECONDS, type PrivateContent,
 } from './sdk.js';
 import { packetSignPayload } from '../src/packet.js';
 import { NOW, identity, stateOf } from './helpers.js';
@@ -16,12 +16,6 @@ const content = (message: string): PrivateContent => ({ type: 'ace:text:1', sche
 const code = (fn: () => unknown): string | null => {
   try { fn(); } catch (e) { return (e as { code?: string }).code ?? String(e); }
   return null;
-};
-/** A padded plaintext of `size` bytes whose length prefix is `n`, `fill` bytes after the prefix. */
-const framed = (size: number, n: number, fill = 0): Uint8Array => {
-  const out = new Uint8Array(size).fill(fill, 4);
-  new DataView(out.buffer).setUint32(0, n);
-  return out;
 };
 
 async function setup() {
@@ -73,47 +67,23 @@ describe('packet', () => {
   });
 });
 
-describe('padding (03 § Encryption)', () => {
-  it.each([[0, 4096], [4092, 4096], [4093, 8192], [2 ** 20 - 4, 2 ** 20], [2 ** 20 - 3, 1_179_652], [MAX_PLAINTEXT_BYTES, 1_179_652]])(
-    'bucket of %i content bytes is %i', (n, b) => { expect(plaintextBucket(n)).toBe(b); },
-  );
-
-  it('the buckets are the powers of two from MIN_PLAINTEXT_BUCKET to 2^20, then MAX_PLAINTEXT_BYTES + 4', () => {
-    expect(MIN_PLAINTEXT_BUCKET).toBe(4096);
-    expect([...PLAINTEXT_BUCKETS].sort((a, b) => a - b)).toEqual([4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 1179652]);
-  });
-
-  it('pads u32be(len) ‖ content ‖ zeros and unpads back', () => {
-    const c = new Uint8Array(5000).fill(0x78);
-    const p = padPlaintext(c);
-    expect(p.length).toBe(8192);
-    expect([...p.subarray(0, 4)]).toEqual([0, 0, 0x13, 0x88]);
-    expect(p.subarray(5004).every((x) => x === 0)).toBe(true);
-    expect(unpadPlaintext(p)).toEqual(c);
-  });
-
-  it.each([
-    ['a length that is not a bucket', framed(4095, 5)],
-    ['a prefix past the plaintext', framed(4096, 4093)],
-    ['a prefix of 5000 inside 4096 bytes', framed(4096, 5000)],
-    ['a prefix above MAX_PLAINTEXT_BYTES', framed(1_179_652, 0xffffffff)],
-    ['a bucket the prefix does not imply', framed(8192, 10)],
-    ['a non-zero padding byte', (() => { const p = padPlaintext(new Uint8Array(5)); p[4095] = 1; return p; })()],
-  ])('unpadding %s is invalid_body', (_n, pt) => {
-    expect(code(() => unpadPlaintext(pt))).toBe('invalid_body');
-  });
-
-  it('a decoded payload must be nonce + tag + a bucket (invalid_packet)', async () => {
+describe('payload bounds (03 § Decoding)', () => {
+  it('a decoded payload is at least nonce + tag (invalid_packet)', async () => {
     const { alice, bob, prekey } = await setup();
     const p = await createPacket({ identity: alice, to: bob.getACEId(), prekey, content: content('x'), timestamp: NOW });
     expect(decodePacket(JSON.parse(JSON.stringify(p))).encryption.payload).toBe(p.encryption.payload);
     const withPayload = (n: number) => ({ ...p, encryption: { ...p.encryption, payload: toBase64(new Uint8Array(n)) } });
     expect(code(() => decodePacket(withPayload(27)))).toBe('invalid_packet');
-    expect(code(() => decodePacket(withPayload(4096 + 27)))).toBe('invalid_packet');
-    expect(code(() => decodePacket(withPayload(4096 + 28)))).toBeNull();
+    expect(code(() => decodePacket(withPayload(28)))).toBeNull();
   });
 
-  it('a packet in the top bucket fits MAX_PACKET_BYTES', async () => {
+  it('the payload is the content plus nonce and tag', async () => {
+    const { alice, bob, prekey } = await setup();
+    const p = await createPacket({ identity: alice, to: bob.getACEId(), prekey, content: content('x'), timestamp: NOW });
+    expect(fromBase64(p.encryption.payload).length).toBe(encodePrivateContent(content('x')).length + 28);
+  });
+
+  it('the largest content fits MAX_PACKET_BYTES', async () => {
     const { alice, bob, vault, prekey } = await setup();
     const base = content('');
     const c = content('x'.repeat(MAX_PLAINTEXT_BYTES - canonicalStateBytes(base).length));
@@ -142,12 +112,6 @@ describe('private content prekey (04 § Peer prekeys)', () => {
     expect(code(() => decodePrivateContent(canonicalStateBytes(without)))).toBe('invalid_body');
     expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: 'QQ==' })))).toBe('invalid_body');
     expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: null })))).toBe('invalid_body');
-  });
-  it('a 1216-byte prekey that is not an X-Wing public key is invalid_body (03 § Private content)', () => {
-    // 0xFF everywhere: the ML-KEM-768 half fails the FIPS 203 modulus check, so nothing can be encapsulated to it.
-    const bad = toBase64(new Uint8Array(1216).fill(0xff));
-    expect(code(() => decodePrivateContent(canonicalStateBytes({ ...without, prekey: bad })))).toBe('invalid_body');
-    expect(code(() => encodePrivateContent({ ...without, prekey: bad }))).toBe('invalid_argument');
   });
   it('a prekey in non-canonical Base64 is invalid_body', () => {
     // 1216 bytes leave one byte in the last quantum: its second character carries 4 zero bits.

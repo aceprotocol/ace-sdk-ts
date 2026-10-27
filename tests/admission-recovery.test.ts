@@ -11,14 +11,14 @@ import {
 import { Clock, FakeRelay, NOW, RELAY, agent, type TestAgent } from './helpers.js';
 import { inboxWorld, msg, text, withPrekey } from './helpers2.js';
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
-import { packetHeader, padPlaintext, sealPayload } from '../src/packet.js';
+import { packetHeader, sealPayload } from '../src/packet.js';
 import { decodePrekey } from '../src/prekey.js';
 
 /** A signed packet whose plaintext is `content` as is (`createPacket` refuses content its decoding would refuse). */
 async function packRaw(from: SoftwareIdentity, to: string, prekey: Prekey, content: unknown, timestamp: number) {
   const { cipherText, sharedSecret } = ml_kem768_x25519.encapsulate(decodePrekey(prekey));
   const messageId = crypto.randomUUID(), sender = from.getACEId(), seq = from.getSigningSeq();
-  const payload = await sealPayload(sharedSecret, packetHeader(sender, to, messageId, timestamp, prekey.id, cipherText), padPlaintext(canonicalStateBytes(content)));
+  const payload = await sealPayload(sharedSecret, packetHeader(sender, to, messageId, timestamp, prekey.id, cipherText), canonicalStateBytes(content));
   const m = signingMessage(sender, timestamp, seq, encodePayload(to, messageId, prekey.id, cipherText, payload));
   return {
     ace: '1', messageId, from: sender, to, timestamp,

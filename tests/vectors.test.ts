@@ -17,7 +17,7 @@ import {
 } from './sdk.js';
 import { authPayload } from '../src/auth.js';
 import { checkJsonValue, parseJSONBytes, wireInt } from '../src/encoding.js';
-import { packetHeader, padPlaintext, sealPayload } from '../src/packet.js';
+import { packetHeader, sealPayload } from '../src/packet.js';
 import { relayErrorFor } from '../src/relay.js';
 import { openPacket } from './helpers2.js';
 
@@ -173,8 +173,7 @@ describe('vectors: packet', () => {
     expect(bytesToHex(header)).toBe(d.headerHex);
     expect(d.saltHex).toBe(''); // 03: the HKDF salt is the empty string
     expect(bytesToHex(hkdf(sha256, ss, new Uint8Array(0), header, 32))).toBe(d.keyHex);
-    expect(bytesToHex(canonicalStateBytes(d.content))).toBe(d.contentHex);
-    expect(bytesToHex(padPlaintext(canonicalStateBytes(d.content)))).toBe(d.plaintextHex);
+    expect(bytesToHex(canonicalStateBytes(d.content))).toBe(d.plaintextHex);
     const payload = await sealPayload(ss, header, hexToBytes(d.plaintextHex), nonce);
     expect(bytesToHex(payload)).toBe(d.payloadHex);
     expect(bytesToHex(encodePayload(to, d.messageId, d.prekey.id, kem, payload))).toBe(d.signPayloadHex);
