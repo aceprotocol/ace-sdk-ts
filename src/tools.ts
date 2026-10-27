@@ -124,7 +124,7 @@ const AGENT_UNTRUSTED = ['relays', 'ext'];
 const under = (prefix: string, paths: readonly string[]) => paths.map((p) => `${prefix}.${p}`);
 
 /** The agent-facing view of a verified PublishedAgent (the full signed document only comes from `publish`). */
-export async function agentView(_client: NetworkClient, a: PublishedAgent) {
+export function agentView(a: PublishedAgent) {
   const d = a.descriptor;
   return { aceId: d.aceId, profiles: d.profiles, relays: d.relays, expiresAt: d.expiresAt, ...(d.ext ? { ext: d.ext } : {}) };
 }
@@ -164,7 +164,7 @@ export function manifestView(m: ProfileManifest) {
 /** Pending incoming contact requests, with the verified requester view. Notes and cards are remote content. */
 export async function requests(client: NetworkClient) {
   const list = await client.requests();
-  return Promise.all(list.map(async (r) => ({ from: r.from, profile: r.profile, note: r.note, receivedAt: r.receivedAt, agent: await agentView(client, r.source) })));
+  return list.map((r) => ({ from: r.from, profile: r.profile, note: r.note, receivedAt: r.receivedAt, agent: agentView(r.source) }));
 }
 
 const DECIDED = { accept: 'admitted', reject: 'rejected', block: 'blocked', unblock: 'unblocked' } as const;
@@ -281,12 +281,12 @@ export const AGENT_TOOLS: AgentTool[] = [
         case 'lookup': {
           const found = await client.lookupWithCard(need(args.peer as string | undefined, 'peer'));
           const agent = found.agent, card = found.card && cardView(found.card);
-          return result({ agent: await agentView(client, agent), ...(card ? { card } : {}) }, [...under('agent', AGENT_UNTRUSTED), ...(card ? ['card'] : [])]);
+          return result({ agent: agentView(agent), ...(card ? { card } : {}) }, [...under('agent', AGENT_UNTRUSTED), ...(card ? ['card'] : [])]);
         }
-        case 'import': return result({ agent: await agentView(client, await client.importAgent(need(args.source, 'source'))) }, under('agent', AGENT_UNTRUSTED));
+        case 'import': return result({ agent: agentView(await client.importAgent(need(args.source, 'source'))) }, under('agent', AGENT_UNTRUSTED));
         case 'import_invitation': {
           const agent = await client.importInvitation(need(args.invitation, 'invitation'));
-          return result({ agent: await agentView(client, agent), permit: true, status: 'not admitted: connect to request contact' }, under('agent', AGENT_UNTRUSTED));
+          return result({ agent: agentView(agent), permit: true, status: 'not admitted: connect to request contact' }, under('agent', AGENT_UNTRUSTED));
         }
         case 'invite': {
           const { target, profile } = targetOf(args);

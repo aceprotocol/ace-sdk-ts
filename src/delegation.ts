@@ -8,10 +8,9 @@
  * A `NetworkClient` with the profile installed (`profiles: [..., 'delegation']`) runs `delegationRules` itself.
  */
 import { ACEError } from './errors.js';
-import { canonicalStateBytes, closedKeys, isACEId, nowOf, wireInt } from './encoding.js';
-import { signClaims, type ACEIdentity } from './identity.js';
-import { atLogTail, checkSignatureShape, verifyOperationalSignature, type KelState, type OperationalSignature } from './kel.js';
-import { TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import { canonicalStateBytes, closedKeys, isACEId } from './encoding.js';
+import { checkLifetime, claimsOf, docWindow, signClaims, type ACEIdentity } from './identity.js';
+import { checkSignatureShape, verifyOperationalSignature, type KelState, type OperationalSignature } from './kel.js';
 import type { PeerStore } from './peer-store.js';
 import type { ProfileRules } from './rules.js';
 
@@ -34,12 +33,7 @@ const bad = (m: string) => new ACEError('invalid_authorization', m);
  */
 export async function createDelegationCredential(issuer: ACEIdentity, subject: string, o: { now?: number; ttl?: number } = {}): Promise<DelegationCredential> {
   if (!isACEId(subject) || subject === issuer.getACEId()) throw new ACEError('invalid_argument', 'subject must be another ACE ID');
-  const ttl = o.ttl ?? MAX_DELEGATION_CREDENTIAL_LIFETIME;
-  if (wireInt(ttl) === null || ttl < 1 || ttl > MAX_DELEGATION_CREDENTIAL_LIFETIME) {
-    throw new ACEError('invalid_argument', `ttl must be 1..${MAX_DELEGATION_CREDENTIAL_LIFETIME}`);
-  }
-  const issuedAt = atLogTail(issuer.getKel(), o.now ?? nowOf());
-  return signClaims(issuer, DELEGATION_TYPE, { issuer: issuer.getACEId(), subject, issuedAt, expiresAt: issuedAt + ttl });
+  return signClaims(issuer, DELEGATION_TYPE, { issuer: issuer.getACEId(), subject, ...docWindow(issuer.getKel(), o, MAX_DELEGATION_CREDENTIAL_LIFETIME) });
 }
 
 /**
@@ -52,10 +46,7 @@ export function checkCredential(value: unknown, now: number): DelegationCredenti
     || !isACEId(value.issuer) || !isACEId(value.subject) || value.issuer === value.subject) {
     throw bad('credential must be {issuer, subject, issuedAt, expiresAt, signature} with issuer != subject');
   }
-  const i = wireInt(value.issuedAt), e = wireInt(value.expiresAt);
-  if (i === null || e === null || i > now + TIMESTAMP_WINDOW_SECONDS || i >= e || e - i > MAX_DELEGATION_CREDENTIAL_LIFETIME) {
-    throw bad('invalid credential lifetime');
-  }
+  checkLifetime(value, now, MAX_DELEGATION_CREDENTIAL_LIFETIME, 'credential', { requireLive: false });
   checkSignatureShape(value.signature, 'invalid_authorization');
   return value as unknown as DelegationCredential;
 }
@@ -86,8 +77,7 @@ export function verifyDelegationCredential(value: unknown, issuer: KelState, now
   const c = checkCredential(value, now);
   if (c.issuer !== issuer.aceId) throw bad('the credential names another issuer');
   if (c.expiresAt <= now) throw bad('credential expired');
-  const { signature, ...claims } = c;
-  verifyOperationalSignature(issuer, DELEGATION_TYPE, c.issuedAt, canonicalStateBytes(claims), signature, now, 'invalid_authorization');
+  verifyOperationalSignature(issuer, DELEGATION_TYPE, c.issuedAt, canonicalStateBytes(claimsOf(c)), c.signature, now, 'invalid_authorization');
   return structuredClone(c);
 }
 
@@ -95,9 +85,9 @@ export function verifyDelegationCredential(value: unknown, issuer: KelState, now
  * The `ace:delegation:1` message rule: the issuer hands a credential to its subject. `check` requires the credential to
  * be the sender's, about the recipient and live, and on receive signed under the sender's pin in `peers` (no pin is a
  * failure); any failure is `invalid_body`. `commit` changes no state: the application stores the credential and
- * publishes it in its `ext`. `peers` also supplies the clock; `localAceId` is the identity the rule runs for.
+ * publishes it in its `ext`. `peers` also supplies the clock.
  */
-export function delegationRules(peers: PeerStore, localAceId: string): ProfileRules {
+export function delegationRules(peers: PeerStore): ProfileRules {
   return {
     types: [DELEGATION_TYPE],
     async check(e, body) {
@@ -112,8 +102,8 @@ export function delegationRules(peers: PeerStore, localAceId: string): ProfileRu
           verifyDelegationCredential(c, pinned, now);
         }
       } catch (err) {
-        if (err instanceof ACEError && err.code === 'storage_failed') throw err;
-        throw new ACEError('invalid_body', `delegation: ${err instanceof Error ? err.message : 'invalid credential'}`, { cause: err });
+        if (!(err instanceof ACEError) || err.code === 'storage_failed') throw err;
+        throw new ACEError('invalid_body', `delegation: ${err.message}`, { cause: err });
       }
     },
     commit() {},

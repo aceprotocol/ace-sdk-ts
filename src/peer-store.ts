@@ -49,7 +49,7 @@ export class PeerStore {
     return (await this.#pin(aceId))?.kelLive ?? false;
   }
 
-  /** The pin record; one written before `kelLive` existed counts as live (it was pinned through a descriptor). */
+  /** The pin record (`storage_failed` when malformed). */
   async #pin(aceId: string): Promise<{ state: KelState; kelLive: boolean } | null> {
     if (!isACEId(aceId)) throw new ACEError('invalid_argument', 'aceId must be an ACE ID');
     const key = peerKey(aceId);
@@ -62,11 +62,11 @@ export class PeerStore {
     try {
       const d = parseStateBytes(raw, key);
       if (!isObj(d) || d.version !== 1 || d.aceId !== aceId) throw new Error('invalid pin');
-      if (d.kelLive !== undefined && typeof d.kelLive !== 'boolean') throw new Error('invalid pin');
+      if (typeof d.kelLive !== 'boolean') throw new Error('invalid pin');
       const kel = d.kel as KelEvent[];
       const state = verifyKel(kel, atLogTail(kel, nowOf(this.#clock)));
       if (state.aceId !== aceId) throw new Error('pin names another identity');
-      pin = { state, kelLive: d.kelLive !== false };
+      pin = { state, kelLive: d.kelLive };
     } catch (e) {
       throw new ACEError('storage_failed', `${key}: ${e instanceof Error ? e.message : 'invalid pin'}`);
     }

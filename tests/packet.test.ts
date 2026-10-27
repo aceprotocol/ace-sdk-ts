@@ -90,7 +90,7 @@ describe('payload bounds (03 § Decoding)', () => {
     expect(encodePrivateContent(c).length).toBe(MAX_PLAINTEXT_BYTES);
     const p = await createPacket({ identity: alice, to: bob.getACEId(), prekey, content: c, timestamp: NOW });
     expect(canonicalStateBytes(p).length).toBeLessThanOrEqual(MAX_PACKET_BYTES);
-    expect(await decryptPacket(decodePacket(JSON.parse(JSON.stringify(p))), vault)).toEqual(c);
+    expect(decodePrivateContent(await decryptPacket(decodePacket(JSON.parse(JSON.stringify(p))), vault))).toEqual(c);
   });
 });
 

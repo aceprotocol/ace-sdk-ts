@@ -78,8 +78,7 @@ export function prekeyPublicKey(seed: Uint8Array): Uint8Array {
 /** Decode and check a descriptor prekey (`code` on failure); returns the raw public key. */
 export function decodePrekey(value: unknown, code: 'invalid_authorization' | 'invalid_argument' = 'invalid_authorization'): Uint8Array {
   if (!closedKeys(value, ['id', 'publicKey']) || !isHex64(value.id)) throw new ACEError(code, 'prekey must be {id, publicKey}');
-  const pk = decodeB64(value.publicKey, code, 'prekey.publicKey', KEM_PUBLIC_KEY_SIZE);
-  if (pk.length !== KEM_PUBLIC_KEY_SIZE) throw new ACEError(code, `prekey.publicKey must be ${KEM_PUBLIC_KEY_SIZE} bytes`);
+  const pk = decodePrekeyPublicKey(value.publicKey, code);
   if (prekeyId(pk) !== value.id) throw new ACEError(code, 'prekey.id is not SHA-256(publicKey)');
   return pk;
 }
@@ -105,15 +104,16 @@ const retained = (r: Entry, now: number): boolean => r.supersededAt! + OFFLINE_W
 const keepRetained = (list: Entry[], now: number): Entry[] => list.filter((r) => retained(r, now)).slice(-MAX_RETAINED_PREKEYS);
 const seedLive = (e: PeerSeed | null, now: number): e is PeerSeed => e !== null && now < e.offeredAt + OFFLINE_WINDOW_SECONDS;
 const heldLive = (h: Held | null, now: number): h is Held => h !== null && now < h.timestamp + OFFLINE_WINDOW_SECONDS;
+const isEmptyPeer = (p: PeerState): boolean => p.offered === null && p.inUse === null && p.held === null;
 /** `p` without the seeds and held key whose window ended at `now`, or null when nothing is left. */
 function prunedPeer(p: PeerState, now: number): PeerState | null {
   const q = { offered: seedLive(p.offered, now) ? p.offered : null, inUse: seedLive(p.inUse, now) ? p.inUse : null, held: heldLive(p.held, now) ? p.held : null };
-  return q.offered === null && q.inUse === null && q.held === null ? null : q;
+  return isEmptyPeer(q) ? null : q;
 }
 /** `s` with `peer`'s state set to `p` (removed when empty). */
 function withPeer(s: VaultState, peer: string, p: PeerState): VaultState {
   const peers = { ...s.peers };
-  if (p.offered === null && p.inUse === null && p.held === null) delete peers[peer];
+  if (isEmptyPeer(p)) delete peers[peer];
   else peers[peer] = p;
   return { ...s, peers };
 }

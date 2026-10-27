@@ -82,7 +82,7 @@ async function reinstall(t: TestAgent, relay: FakeRelay, clock: Clock, o: Partia
 
 /** The private content of a packet the relay accepted, decrypted with `t`'s vault. */
 async function sentContent(relay: FakeRelay, index: number, t: TestAgent): Promise<PrivateContent> {
-  return decryptPacket(decodePacket(relay.sent[index].packet), t.client.vault);
+  return decodePrivateContent(await decryptPacket(decodePacket(relay.sent[index].packet), t.client.vault));
 }
 
 describe('05 § Admission recovery: a reinstalled endpoint', () => {

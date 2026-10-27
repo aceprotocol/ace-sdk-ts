@@ -3,14 +3,14 @@
  * ERC-8004 accounts, whether strangers may request contact and whether it is listed — published as the closed CardBundle `{kel, card}`
  * and signed with action `card-record` over `canonicalStateBytes(claims)`. It has no expiry.
  */
-import { claimsOf, validateCard, validateNetworkRelay, type AgentCard, type VerifyOptions } from './descriptor.js';
+import { validateCard, validateNetworkRelay, type AgentCard, type VerifyOptions } from './descriptor.js';
 import { ACEError } from './errors.js';
 import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isCaip10, isHandle, isObj, nowOf, parseJSONBytes, utf8, wireInt } from './encoding.js';
-import { signClaims, type ACEIdentity } from './identity.js';
+import { claimsOf, signClaims, type ACEIdentity } from './identity.js';
 import {
   atLogTail, checkSignatureShape, isUsable, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature,
 } from './kel.js';
-import { MAX_CARD_RECORD_BYTES, MAX_PAY_ACCOUNTS, MAX_PUBLISHED_AGENT_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
+import { MAX_CARD_ERC8004, MAX_CARD_RECORD_BYTES, MAX_PAY_ACCOUNTS, MAX_PUBLISHED_AGENT_BYTES, TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 
 /** Whether strangers' contact requests are processed (05 § Flow). No card record means `closed`. */
 export type Contact = 'open' | 'closed';
@@ -44,9 +44,6 @@ export interface VerifiedCard { aceId: string; kelState: KelState; record: CardR
 
 const R_REQUIRED = ['aceId', 'issuedAt', 'home', 'card', 'contact', 'listed', 'signature'];
 const R_OPTIONAL = ['handle', 'pay', 'erc8004'];
-/** Entries of a card record `erc8004`. */
-export const MAX_CARD_ERC8004 = 4;
-
 /** A CAIP-10 account id (`namespace:reference:address`). */
 export const isCaip10Account: (s: unknown) => s is string = isCaip10;
 

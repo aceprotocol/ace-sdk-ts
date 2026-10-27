@@ -25,7 +25,7 @@ import type { KelState } from './kel.js';
 import { DEFAULT_REPLAY_CAPACITY, MAX_FETCH_ATTEMPTS, OFFLINE_WINDOW_SECONDS, PIN_REFRESH_INTERVAL_SECONDS } from './limits.js';
 import { CONTACT_TYPE, RECEIPT_TYPE, type ProfileSet } from './manifest.js';
 import {
-  checkPacketTime, decodePacket, decodePrivateContent, openPacketPlaintext, parsePacket, verifyPacketSignature, type Packet,
+  checkPacketTime, decodePacket, decodePrivateContent, decryptPacket, parsePacket, verifyPacketSignature, type Packet,
 } from './packet.js';
 import { PeerStore } from './peer-store.js';
 import { prekeyId, type PrekeyVault } from './prekey.js';
@@ -140,17 +140,13 @@ const settle = (error: ACEError): ReceiveOutcome => error.isTransient ? defer(er
 /**
  * Whether content bytes that failed step 7 name a receipt or contact type (peeked with the strict JSON parser before
  * validation): such packets are never receipted, only dropped (06 § Receive pipeline). Bytes the strict parser refuses
- * (duplicate keys, excess depth, ...) are not core content, so they are rejected.
+ * (not UTF-8 JSON, excess depth, ...) are not core content, so they are rejected.
  */
 function isCoreContent(plaintext: Uint8Array): boolean {
   let c: unknown;
   try { c = parseJSONBytes(plaintext, 'invalid_body', 'plaintext'); } catch { return false; }
   return isObj(c) && (c.type === RECEIPT_TYPE || c.type === CONTACT_TYPE);
 }
-/**
- * Deferrals of a packet already delivered (or a duplicate) whose `delivered` receipt failed to send, mapped to the
- * outcome it had: past the fetch budget it is acknowledged as that, without a quarantine record (06 § Acknowledgement).
- */
 /**
  * Strip the carried `prekey` from decoded `content` (it is never validated as part of the body nor handed over) and
  * return it.
@@ -160,6 +156,10 @@ function takeOffer(content: PrivateContent): string {
   delete content.prekey;
   return offered;
 }
+/**
+ * Deferrals of a packet already delivered (or a duplicate) whose `delivered` receipt failed to send, mapped to the
+ * outcome it had: past the fetch budget it is acknowledged as that, without a quarantine record (06 § Acknowledgement).
+ */
 const RECEIPT_ONLY = new WeakMap<ReceiveOutcome, ReceiveOutcome>();
 
 /** A persisted journal entry, validated: anything malformed is `storage_failed`, never read as done. */
@@ -339,7 +339,7 @@ export class Inbox {
     // 6. decrypt: a failure is a drop
     let plaintext: Uint8Array;
     try {
-      plaintext = await openPacketPlaintext(packet, this.#o.vault);
+      plaintext = await decryptPacket(packet, this.#o.vault);
     } catch (e) {
       const err = asACEError(e, 'decryption_failed');
       if (err.code === 'unknown_prekey') return this.#reject(packet, err, packet.encryption.prekey);
@@ -427,7 +427,7 @@ export class Inbox {
     let plaintext: Uint8Array;
     try {
       checkPacketTime(packet, this.#now());
-      plaintext = await openPacketPlaintext(packet, this.#o.vault);
+      plaintext = await decryptPacket(packet, this.#o.vault);
     } catch (e) {
       return settle(asACEError(e, 'not_permitted'));
     }

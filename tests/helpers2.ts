@@ -1,7 +1,7 @@
 // Extra helpers for the pipeline, outbox and admission tests (helpers.ts stays untouched).
 import { vi } from 'vitest';
 import {
-  ACEError, AdmissionBook, Inbox, prekeyPublicKey, toBase64, StorePrekeyVault, MemoryStore, PeerStore, ProfileSet, checkPacketTime, createPacket, decodePacket, decryptPacket,
+  ACEError, AdmissionBook, Inbox, prekeyPublicKey, toBase64, StorePrekeyVault, MemoryStore, PeerStore, ProfileSet, checkPacketTime, createPacket, decodePacket, decodePrivateContent, decryptPacket,
   verifyPacketSignature, type KelState, type PrekeyVault, type InboxOptions, type ParsedMessage, type Prekey, type PrivateContent, type ReceiptBody, type SoftwareIdentity,
 } from './sdk.js';
 import { Clock, NOW, identity } from './helpers.js';
@@ -14,7 +14,7 @@ export async function openPacket(value: unknown, o: { recipient: string; sender:
   if (packet.to !== o.recipient) throw new ACEError('wrong_recipient', 'packet is not addressed to this identity');
   verifyPacketSignature(packet, o.sender, o.now);
   checkPacketTime(packet, o.now);
-  return { packet, content: await decryptPacket(packet, o.vault) };
+  return { packet, content: decodePrivateContent(await decryptPacket(packet, o.vault)) };
 }
 /** A peer prekey for private content: the Base64 X-Wing public key of a random seed (04 § Peer prekeys). */
 export const somePrekey = (): string => toBase64(prekeyPublicKey(crypto.getRandomValues(new Uint8Array(32))));

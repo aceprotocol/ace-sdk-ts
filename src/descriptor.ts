@@ -8,7 +8,7 @@ import { ACEError } from './errors.js';
 import {
   canonicalStateBytes, checkJsonValue, closedKeys, codePointLength, CONTROL_CHAR_RE, isACEId, isHex64, isHttpsUrl, isObj, nowOf, sha256Hex, wireInt,
 } from './encoding.js';
-import { signClaims, type ACEIdentity } from './identity.js';
+import { checkLifetime, claimsOf, docWindow, signClaims, type ACEIdentity } from './identity.js';
 import {
   atLogTail, checkSignatureShape, isUsable, lastEventHash, reconcileKel, verifyKel, verifyOperationalSignature, type KelEvent, type KelState, type OperationalSignature,
 } from './kel.js';
@@ -22,31 +22,6 @@ import { isCanonicalRelayUrl } from './relay-url.js';
 import { isMessageType, type JSONObject } from './types.js';
 
 // --- shared ------------------------------------------------------------------------------------
-
-/** `doc` without its `signature`: the bytes a signature and a digest cover. */
-export function claimsOf<T extends { signature?: unknown }>(doc: T): Omit<T, 'signature'> {
-  const { signature: _s, ...claims } = doc;
-  return claims;
-}
-
-/** Lifetime bounds of a signed document (`invalid_authorization`). */
-function lifetime(d: Record<string, unknown>, now: number, max: number, what: string): void {
-  const i = wireInt(d.issuedAt), e = wireInt(d.expiresAt);
-  if (i === null || e === null || i > now + TIMESTAMP_WINDOW_SECONDS || i >= e || e <= now || e - i > max) {
-    throw new ACEError('invalid_authorization', `invalid ${what} lifetime`);
-  }
-}
-
-/**
- * `issuedAt` (the signer's `t`: `o.now` or the clock, moved up to the ts of the last event of `kel`, 01 § Operational
- * signatures) and `expiresAt = issuedAt + ttl` (`o.ttl` or `fallback`, default `max`), ttl in 1..max.
- */
-function docWindow(kel: unknown, o: { now?: number; ttl?: number }, max: number, fallback = max): { issuedAt: number; expiresAt: number } {
-  const issuedAt = atLogTail(kel, o.now ?? nowOf());
-  const ttl = o.ttl ?? fallback;
-  if (wireInt(ttl) === null || ttl < 1 || ttl > max) throw new ACEError('invalid_argument', `ttl must be 1..${max}`);
-  return { issuedAt, expiresAt: issuedAt + ttl };
-}
 
 /** A stable digest of a document's claims (signature excluded): revision comparison only. */
 export function documentDigest(doc: { signature?: unknown }): string {
@@ -123,7 +98,7 @@ export function verifyPermit(value: unknown, issuer: KelState, subject?: string,
     || (subject !== undefined && value.subject !== subject)) {
     throw new ACEError('invalid_authorization', 'invalid permit binding');
   }
-  lifetime(value, now, MAX_PERMIT_LIFETIME, 'permit');
+  checkLifetime(value, now, MAX_PERMIT_LIFETIME, 'permit');
   verifyOperationalSignature(issuer, 'delivery-permit', value.issuedAt as number, canonicalStateBytes(claimsOf(value)), value.signature, now, 'invalid_authorization');
   return structuredClone(value) as unknown as DeliveryPermit;
 }
@@ -195,7 +170,7 @@ export function verifyPublishedAgent(value: unknown, now: number = nowOf(), o: V
   const d = value.descriptor;
   if (!closedKeys(d, D_REQUIRED, D_OPTIONAL) || !isACEId(d.aceId)) throw bad('invalid descriptor shape');
   checkSignatureShape(d.signature, 'invalid_authorization');
-  lifetime(d, now, MAX_DESCRIPTOR_LIFETIME, 'descriptor');
+  checkLifetime(d, now, MAX_DESCRIPTOR_LIFETIME, 'descriptor');
   if (!Array.isArray(d.relays) || d.relays.length < 1 || d.relays.length > MAX_DESCRIPTOR_RELAYS || new Set(d.relays).size !== d.relays.length) throw bad('relays must be 1-4 distinct URLs');
   d.relays.forEach((r) => validateNetworkRelay(r, o));
   decodePrekey(d.prekey);

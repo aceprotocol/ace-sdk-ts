@@ -105,7 +105,7 @@ describe('delegation profile', () => {
     const [dave, bob, carol] = await Promise.all([identity(clock), identity(clock), identity(clock)]);
     const D = dave.getACEId(), B = bob.getACEId(), C = carol.getACEId();
     const bobPeers = new PeerStore({ store: new MemoryStore(), clock: clock.now });
-    const rules = delegationRules(bobPeers, B);
+    const rules = delegationRules(bobPeers);
     expect(rules.types).toEqual([DELEGATION_TYPE]);
     const c = await createDelegationCredential(dave, B, { now: NOW });
     await expect(rules.check(event('receive', D, B), { credential: c } as never)).rejects.toThrow(code('invalid_body')); // the sender is not pinned
@@ -121,7 +121,7 @@ describe('delegation profile', () => {
     clock.t = c.expiresAt;
     await expect(rules.check(event('receive', D, B), { credential: c } as never)).rejects.toThrow(code('invalid_body')); // expired
     // on send: the sender is the issuer (its own credential), no pin needed
-    const senderRules = delegationRules(new PeerStore({ store: new MemoryStore(), clock: clock.now }), D);
+    const senderRules = delegationRules(new PeerStore({ store: new MemoryStore(), clock: clock.now }));
     clock.t = NOW;
     await senderRules.check(event('send', D, B), { credential: c } as never);
     await expect(senderRules.check(event('send', D, C), { credential: c } as never)).rejects.toThrow(code('invalid_body'));

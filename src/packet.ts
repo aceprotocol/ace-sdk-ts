@@ -237,7 +237,12 @@ export async function createPacket(input: CreatePacketInput): Promise<Packet> {
   if (input._deterministic) {
     ({ kemCiphertext, sharedSecret: ss, nonce } = input._deterministic);
   } else {
-    const e = ml_kem768_x25519.encapsulate(pk);
+    let e: { cipherText: Uint8Array; sharedSecret: Uint8Array };
+    try {
+      e = ml_kem768_x25519.encapsulate(pk);
+    } catch {
+      throw new ACEError('invalid_argument', 'X-Wing encapsulation failed');
+    }
     kemCiphertext = e.cipherText; ss = e.sharedSecret;
   }
   try {
@@ -279,7 +284,7 @@ export function checkPacketTime(packet: Packet, now: number): void {
  * plaintext: `unknown_prekey` when the vault does not hold it for this sender, `decryption_failed` on AEAD/KEM failure.
  * The content is not decoded (step 7, `decodePrivateContent`).
  */
-export async function openPacketPlaintext(packet: Packet, vault: PrekeyVault): Promise<Uint8Array> {
+export async function decryptPacket(packet: Packet, vault: PrekeyVault): Promise<Uint8Array> {
   const secret = await vault.open(packet.encryption.prekey, packet.from);
   if (secret === null) throw new ACEError('unknown_prekey', 'the referenced prekey is unknown or deleted');
   const { kem, payload } = encryptionBytes(packet);
@@ -292,11 +297,3 @@ export async function openPacketPlaintext(packet: Packet, vault: PrekeyVault): P
   }
 }
 
-/**
- * Decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`) and decode:
- * `unknown_prekey` when the vault does not hold it for this sender,
- * `decryption_failed` on AEAD/KEM failure, `invalid_body` on bad content.
- */
-export async function decryptPacket(packet: Packet, vault: PrekeyVault): Promise<PrivateContent> {
-  return decodePrivateContent(await openPacketPlaintext(packet, vault));
-}

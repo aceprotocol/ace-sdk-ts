@@ -2,7 +2,7 @@
 // receiver a peer prekey; a first-attempt application message goes to the key the peer offered, every retry, receipt
 // and contact packet to the published prekey.
 import {
-  MemoryStore, NetworkClient, ACEError, canonicalStateBytes, createPacket, decodePacket, decryptPacket, prekeyId,
+  MemoryStore, NetworkClient, ACEError, canonicalStateBytes, createPacket, decodePacket, decodePrivateContent, decryptPacket, prekeyId,
   prekeyPublicKey, toBase64, fromBase64, type PrivateContent, type Packet,
   checkUsable, packetHeader, packetSignPayload, sealPayload, signingMessage, type Prekey, type SoftwareIdentity,
 } from './sdk.js';
@@ -33,7 +33,7 @@ type Pair = Awaited<ReturnType<typeof pair>>;
 const since = (relay: FakeRelay, n: number, from: TestAgent, to: TestAgent): Packet[] =>
   relay.sent.slice(n).map((s) => decodePacket(s.packet)).filter((p) => p.from === idOf(from) && p.to === idOf(to));
 /** A packet's private content, decrypted by its recipient (`prekey` included). */
-const contentOf = (p: Packet, recipient: TestAgent): Promise<PrivateContent> => decryptPacket(p, recipient.client.vault);
+const contentOf = async (p: Packet, recipient: TestAgent): Promise<PrivateContent> => decodePrivateContent(await decryptPacket(p, recipient.client.vault));
 /** The ID of the peer prekey a packet offers its recipient. */
 const offeredBy = async (p: Packet, recipient: TestAgent) => prekeyId(fromBase64((await contentOf(p, recipient)).prekey!));
 const published = async (t: TestAgent) => (await t.client.vault.current())!.id;

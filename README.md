@@ -15,7 +15,8 @@ Spec: `ace-spec` chapters 00–08 (packet version `"1"`). Every signature is ML-
 - **Prekeys** — `PrekeyVault` (`current`, `rotate`, `open`, `prune`): X-Wing prekeys published in the descriptor,
   superseded seeds retained for `OFFLINE_WINDOW_SECONDS` (at most 16). `StorePrekeyVault` persists them in an
   `ACEStore` (a 0600 file with `FileStore`, a `MemoryStore` for ephemeral agents; optional `protect` sealing hook).
-- **Packet** — `createPacket`, `decodePacket`, `verifyPacketSignature`, `decryptPacket`: X-Wing → HKDF-SHA256 (empty
+- **Packet** — `createPacket`, `decodePacket`, `verifyPacketSignature`, `decryptPacket` (the content bytes) and
+  `decodePrivateContent`: X-Wing → HKDF-SHA256 (empty
   salt, info = header binding `from`, `to`, `messageId`, `timestamp`, prekey and KEM ciphertext) → AES-256-GCM, signed
   with ML-DSA-65 (action `packet`). The recipient need not be online.
 - **Card record** — `createCardRecord` / `verifyCardBundle`: the durable identity record `{kel, card}` with its home

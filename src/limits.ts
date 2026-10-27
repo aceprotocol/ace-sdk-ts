@@ -24,6 +24,8 @@ export const MAX_RETAINED_PREKEYS = 16;
 export const MAX_EXT_BYTES = 32_768;
 /** Entries of a card record `pay`. */
 export const MAX_PAY_ACCOUNTS = 8;
+/** Entries of a card record `erc8004`. */
+export const MAX_CARD_ERC8004 = 4;
 export const MAX_NOTE_BYTES = 512;
 /** Maximum and default `limit` of inbox and directory pages. */
 export const MAX_INBOX_PAGE = 100;

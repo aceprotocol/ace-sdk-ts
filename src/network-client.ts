@@ -15,7 +15,7 @@ import {
 } from './descriptor.js';
 import { ACEError, isUnknownPeer } from './errors.js';
 import { canonicalStateBytes, isACEId, isHandle, isHex64, isObj, nowOf, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
-import type { KelEvent, KelState } from './kel.js';
+import { atLogTail, type KelEvent, type KelState } from './kel.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
 import { Inbox, type ContactEvent, type ReceiveOutcome } from './inbox.js';
 import { verifyInvitation, type Invitation } from './invitation.js';
@@ -214,7 +214,7 @@ export class NetworkClient {
     const delegation = this.profiles.has(DELEGATION_PROFILE_ID) && !own.some((r) => r.types.includes(DELEGATION_TYPE));
     return [
       ...(this.threads ? [commerceRules(this.threads)] : []),
-      ...(delegation ? [delegationRules(this.peers, this.identity.getACEId())] : []),
+      ...(delegation ? [delegationRules(this.peers)] : []),
       ...own,
     ];
   }
@@ -637,7 +637,8 @@ export class NetworkClient {
     } else {
       agent = await this.agent(to, { refresh: o.refresh });
     }
-    const now = this.#now();
+    // The signer's `t` (createPacket's timestamp), so the offered seed's window starts with the packet's (04 § Peer prekeys).
+    const now = atLogTail(this.identity.getKel(), this.#now());
     const publishedPrekey: Prekey = agent.descriptor.prekey;
     let prekey = publishedPrekey;
     if (o.needPermit) { // an Outbox attempt
@@ -649,14 +650,13 @@ export class NetworkClient {
     if (o.avoidPrekey !== undefined && prekey.id === o.avoidPrekey) throw new ACEError('unknown_prekey', 'the peer still publishes the rejected prekey');
     content = { ...content, prekey: (await this.vault.offer(to, now)).publicKey };
     const create = (c: PrivateContent) => createPacket({ identity: this.identity, to, prekey, content: c, ...(o.messageId ? { messageId: o.messageId } : {}), timestamp: now });
-    // A held key is only checked as an X-Wing key (its ML-KEM half), so noble may still refuse to encapsulate to it (a
-    // low-order X25519 half; noble throws a plain Error, createPacket's own checks throw ACEError). Drop it and encrypt
-    // to the published prekey in the same attempt; a failure with the published prekey is unchanged.
+    // A held key that does not encapsulate (`invalid_argument`, e.g. noble refuses its X25519 half) is dropped and the
+    // same attempt goes to the published prekey; a failure with the published prekey is reported as before.
     const pack = async (c: PrivateContent): Promise<Packet> => {
       try {
         return await create(c);
       } catch (e) {
-        if (prekey === publishedPrekey || e instanceof ACEError) throw e;
+        if (prekey === publishedPrekey || !(e instanceof ACEError) || e.code !== 'invalid_argument') throw e;
         await this.vault.dropHeld(to);
         prekey = publishedPrekey;
         return await create(c);
@@ -922,13 +922,16 @@ export class NetworkClient {
   /**
    * Block a peer: locally first (the endpoint is the authoritative enforcement point; its held request is discarded),
    * allocating the relay revision with the local record, then at the home relay. If the relay is unreachable the record
-   * keeps that revision as `unsyncedRevision` and `maintain` re-sends exactly it. Survives restart.
+   * keeps that revision as `unsyncedRevision` and `maintain` re-sends exactly it. Survives restart. The peer prekey held
+   * for it is dropped last.
    */
   async block(aceId: string): Promise<void> {
     if (!isACEId(aceId) || aceId === this.identity.getACEId()) throw new ACEError('invalid_argument', 'peer must be another ACE ID');
     const revision = await this.admission.block(aceId, this.#now());
-    await this.vault.dropHeld(aceId); // 04 § Peer prekeys
     await this.#syncBlock(aceId, revision);
+    // 04 § Peer prekeys: the key held for it is not kept. Dropped after the block is registered, so a vault failure
+    // (reported) never delays it.
+    await this.vault.dropHeld(aceId);
   }
 
   /**

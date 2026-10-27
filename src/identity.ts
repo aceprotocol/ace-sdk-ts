@@ -4,6 +4,7 @@ import { ACEError } from './errors.js';
 import { bytesEqual, canonicalStateBytes, decodeB64, isObj, nowOf, toBase64, wireInt } from './encoding.js';
 import { type KelEvent, type KelState, type OperationalSignature, atLogTail, createDelegation, createInception, createRotation, isUsable, verifyKel } from './kel.js';
 import { SoftwareKey, generateSoftwareKey, keyDigest, keyDigestHex } from './keys.js';
+import { TIMESTAMP_WINDOW_SECONDS } from './limits.js';
 import { signingMessage } from './signing.js';
 
 /**
@@ -94,6 +95,34 @@ export async function signOperational(identity: ACEIdentity, signedAt: number, p
 /** `claims` plus `signature` over `canonicalStateBytes(claims)` at `issuedAt`. */
 export async function signClaims<T extends { issuedAt: number }>(identity: ACEIdentity, action: string, claims: T): Promise<T & { signature: OperationalSignature }> {
   return { ...claims, signature: await signOperational(identity, claims.issuedAt, canonicalStateBytes(claims), action) };
+}
+
+/** `doc` without its `signature`: the bytes a signature and a digest cover. */
+export function claimsOf<T extends { signature?: unknown }>(doc: T): Omit<T, 'signature'> {
+  const { signature: _s, ...claims } = doc;
+  return claims;
+}
+
+/**
+ * Lifetime bounds of a signed document (`invalid_authorization`): `issuedAt <= now + 300`,
+ * `issuedAt < expiresAt <= issuedAt + max` and, unless `o.requireLive` is false, `now < expiresAt`.
+ */
+export function checkLifetime(d: Record<string, unknown>, now: number, max: number, what: string, o: { requireLive?: boolean } = {}): void {
+  const i = wireInt(d.issuedAt), e = wireInt(d.expiresAt);
+  if (i === null || e === null || i > now + TIMESTAMP_WINDOW_SECONDS || i >= e || (o.requireLive !== false && e <= now) || e - i > max) {
+    throw new ACEError('invalid_authorization', `invalid ${what} lifetime`);
+  }
+}
+
+/**
+ * `issuedAt` (the signer's `t`: `o.now` or the clock, moved up to the ts of the last event of `kel`, 01 § Operational
+ * signatures) and `expiresAt = issuedAt + ttl` (`o.ttl` or `fallback`, default `max`), ttl in 1..max.
+ */
+export function docWindow(kel: unknown, o: { now?: number; ttl?: number }, max: number, fallback = max): { issuedAt: number; expiresAt: number } {
+  const issuedAt = atLogTail(kel, o.now ?? nowOf());
+  const ttl = o.ttl ?? fallback;
+  if (wireInt(ttl) === null || ttl < 1 || ttl > max) throw new ACEError('invalid_argument', `ttl must be 1..${max}`);
+  return { issuedAt, expiresAt: issuedAt + ttl };
 }
 
 const clone = (k: readonly KelEvent[]): KelEvent[] => JSON.parse(JSON.stringify(k)) as KelEvent[];

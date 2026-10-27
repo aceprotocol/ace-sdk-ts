@@ -281,7 +281,7 @@ describe('P2: deleted surface', () => {
       'relayAuthPayload', 'STRANGER_ALLOWANCE_ENTRIES', 'DEFAULT_DIRECTORY_LIMIT', 'PACKET_VERSION',
       // internals no host imports (fix round 1)
       'checkStrangerSource', 'eventBytes', 'computeACEId', 'checkUsable', 'signOperational', 'parseSSE', 'encodePrivateContent',
-      'decodePrivateContent', 'ReplayDetector', 'categoryOf', 'prekeyId', 'decodePrekey', 'MemoryPrekeyVault', 'isCaip19',
+      'ReplayDetector', 'categoryOf', 'prekeyId', 'decodePrekey', 'MemoryPrekeyVault', 'isCaip19',
       'validateCommerceExt', 'decideCommerce', 'checkCommerceBody', 'checkContactBody', 'isUsable', 'createInception',
       'createRotation', 'createDelegation', 'isCaip10', 'isStreamId', 'validateNetworkRelay', 'verifyInvitation',
       // descriptor delegations and ERC-8004 left the core (ace:delegation:1, card record); one page default

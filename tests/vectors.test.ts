@@ -237,7 +237,7 @@ describe('vectors: descriptor, delegation, permit, ERC-8004', () => {
     const peers = new PeerStore({ store: new MemoryStore(), clock: () => c.now });
     if (c.senderPinned) await peers.adopt(kelOf(c.from));
     const from = idOf(c.from), to = idOf(c.to);
-    const rules = delegationRules(peers, c.direction === 'receive' ? to : from);
+    const rules = delegationRules(peers);
     const e = { direction: c.direction, from, to, messageId: '8a4f6a2e-3c0b-4d1e-9f7a-1b2c3d4e5f60', timestamp: c.now, type: DELEGATION_TYPE };
     expect(await codeOf(() => rules.check(e, c.body))).toBe(c.error);
   });

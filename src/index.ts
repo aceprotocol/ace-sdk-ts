@@ -21,7 +21,7 @@ export {
   type PrekeyVault, type Prekey, type PrekeyInfo, type PrekeySecret, type SecretProtector,
 } from './prekey.js';
 export {
-  createPacket, decodePacket, parsePacket, verifyPacketSignature, checkPacketTime, decryptPacket,
+  createPacket, decodePacket, parsePacket, verifyPacketSignature, checkPacketTime, decryptPacket, decodePrivateContent,
   type Packet, type CreatePacketInput,
 } from './packet.js';
 export {
@@ -30,7 +30,7 @@ export {
   type DeliveryPermit,
 } from './descriptor.js';
 export {
-  createCardRecord, verifyCardBundle, isCaip10Account, validateErc8004Binding, verifyErc8004Registration, MAX_CARD_ERC8004,
+  createCardRecord, verifyCardBundle, isCaip10Account, validateErc8004Binding, verifyErc8004Registration,
   type CardRecord, type CardBundle, type VerifiedCard, type Contact, type Erc8004Binding,
 } from './card-record.js';
 export {
