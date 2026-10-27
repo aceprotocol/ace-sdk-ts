@@ -1,5 +1,12 @@
 // PrekeyVault lifecycle (ace-spec/04 § Prekey), mirroring sdk-py tests/test_packet.py prekey cases.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { ml_kem768 } from '@noble/post-quantum/ml-kem.js';
+
+// Count ML-KEM encapsulations (noble's objects are frozen, so wrap the module instead of spying on it).
+vi.mock('@noble/post-quantum/ml-kem.js', async (importOriginal) => {
+  const orig = await importOriginal<typeof import('@noble/post-quantum/ml-kem.js')>();
+  return { ...orig, ml_kem768: { ...orig.ml_kem768, encapsulate: vi.fn(orig.ml_kem768.encapsulate) } };
+});
 import { MemoryStore, OFFLINE_WINDOW_SECONDS, StorePrekeyVault, MAX_RETAINED_PREKEYS, checkXWingPublicKey, prekeyId, prekeyPublicKey, toBase64, type Prekey } from './sdk.js';
 import { NOW } from './helpers.js';
 
@@ -222,12 +229,28 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     await expect(v.held(A, PIN, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
   });
 
-  it('a held.publicKey that is not an X-Wing public key is storage_failed', async () => {
+  it('a held.publicKey of the wrong length is storage_failed', async () => {
     const { store, v } = vaultAt();
-    const notXWing = toBase64(new Uint8Array(1216).fill(0xff));
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [], peers: { [A]: { offered: null, inUse: null, held: { publicKey: notXWing, timestamp: NOW, pin: PIN } } } })));
+    const short = toBase64(new Uint8Array(1215).fill(1));
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [], peers: { [A]: { offered: null, inUse: null, held: { publicKey: short, timestamp: NOW, pin: PIN } } } })));
     await expect(v.held(A, PIN, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
     await expect(v.current()).rejects.toMatchObject({ code: 'storage_failed' });
+  });
+
+  it('loading a document with held keys performs no encapsulation (the vault trusts its own document)', async () => {
+    const { store, v } = vaultAt();
+    for (const peer of [A, B, C]) {
+      const pk = prekeyPublicKey(crypto.getRandomValues(new Uint8Array(32)));
+      await v.hold(peer, { id: prekeyId(pk), publicKey: toBase64(pk) }, NOW, PIN);
+    }
+    const encapsulate = vi.mocked(ml_kem768.encapsulate);
+    encapsulate.mockClear();
+    const again = new StorePrekeyVault(store, { clock: () => NOW });
+    for (let i = 0; i < 20; i++) expect(await again.held(A, PIN, NOW)).not.toBeNull();
+    expect(encapsulate).not.toHaveBeenCalled();
+    // the counter is live: the receive-side check does encapsulate
+    checkXWingPublicKey(prekeyPublicKey(crypto.getRandomValues(new Uint8Array(32))));
+    expect(encapsulate).toHaveBeenCalledTimes(1);
   });
 
   it('checkXWingPublicKey: a real key passes; a bad ML-KEM half or a wrong length fails; any X25519 half is accepted', () => {

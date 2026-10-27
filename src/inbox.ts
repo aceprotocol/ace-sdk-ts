@@ -19,14 +19,14 @@ import { checkContactBody, checkReceiptBody, type ContactBody, type ReceiptBody 
 import { checkStrangerSource, delegationIssuers, verifyPermit, verifyPublishedAgent, type DeliveryPermit, type VerifiedAgent } from './descriptor.js';
 import type { Contact } from './card-record.js';
 import { ACEError, asACEError } from './errors.js';
-import { canonicalStateBytes, conversationKey, isACEId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
+import { canonicalStateBytes, conversationKey, fromBase64, isACEId, isMessageId, isObj, nowOf, pairKey, parseStateBytes, sha256Hex, wireInt } from './encoding.js';
 import { checkUsable, type ACEIdentity } from './identity.js';
 import type { KelState } from './kel.js';
 import { DEFAULT_REPLAY_CAPACITY, MAX_FETCH_ATTEMPTS, OFFLINE_WINDOW_SECONDS, PIN_REFRESH_INTERVAL_SECONDS } from './limits.js';
 import { CONTACT_TYPE, RECEIPT_TYPE, type ProfileSet } from './manifest.js';
 import { checkPacketTime, decodePacket, decryptPacket, parsePacket, verifyPacketSignature, type Packet } from './packet.js';
 import { PeerStore } from './peer-store.js';
-import { decodePrekeyPublicKey, prekeyId, type PrekeyVault } from './prekey.js';
+import { prekeyId, type PrekeyVault } from './prekey.js';
 import type { RelayClient } from './relay.js';
 import { ReplayDetector, SEEN_FLOOR_SECONDS, type ReplayState } from './replay.js';
 import { checkRules, commitRules, ruleEvent, rulesFor, type ProfileRules, type RuleEvent } from './rules.js';
@@ -375,7 +375,7 @@ export class Inbox {
 
   /** The holder rule: hold the key a pinned sender offered, bound to its pin `state` (newer timestamps win). */
   async #holdOffer(packet: Packet, offered: string, state: KelState): Promise<void> {
-    const id = prekeyId(decodePrekeyPublicKey(offered, 'invalid_body'));
+    const id = prekeyId(fromBase64(offered)); // decryptPacket checked it as an X-Wing public key
     await this.#o.vault.hold(packet.from, { id, publicKey: offered }, packet.timestamp, state.lastHash);
   }
 

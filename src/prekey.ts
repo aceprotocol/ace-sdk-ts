@@ -214,7 +214,10 @@ export class StorePrekeyVault implements PrekeyVault {
     const held = (v: unknown): Held | null => {
       if (v === null) return null;
       if (!closedKeys(v, ['publicKey', 'timestamp', 'pin']) || wireInt(v.timestamp) === null || !isHex64(v.pin)) throw bad();
-      const publicKey = decodePrekeyPublicKey(v.publicKey, 'storage_failed');
+      // The vault trusts its own document: the key was validated before hold() (decryptPacket's content decode), so a
+      // load re-checks only the length and re-derives the ID, as for seeds (no trial encapsulation per load).
+      const publicKey = decodeB64(v.publicKey, 'storage_failed', 'held.publicKey', KEM_PUBLIC_KEY_SIZE);
+      if (publicKey.length !== KEM_PUBLIC_KEY_SIZE) throw bad();
       return { id: prekeyId(publicKey), publicKey, timestamp: v.timestamp as number, pin: v.pin };
     };
     if (!closedKeys(d, ['version', 'current', 'retained', 'peers']) || d.version !== VERSION || !Array.isArray(d.retained) || !isObj(d.peers)) throw bad();
@@ -335,6 +338,8 @@ export class StorePrekeyVault implements PrekeyVault {
     checkPeer(peer);
     checkInt(timestamp, 'timestamp');
     if (!isHex64(pin)) throw new ACEError('invalid_argument', 'pin must be 64 lowercase hex');
+    // Length and ID only: the key comes from a content `prekey` that decryptPacket already checked as an X-Wing public
+    // key (decodePrekeyPublicKey), so no second trial encapsulation here.
     const publicKey = decodePrekey(prekey, 'invalid_argument');
     return this.#update((s) => {
       const p = s.peers[peer] ?? NO_PEER;
