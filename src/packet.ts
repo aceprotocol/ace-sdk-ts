@@ -312,11 +312,12 @@ export function checkPacketTime(packet: Packet, now: number): void {
 }
 
 /**
- * Decrypt with the referenced prekey, unpad and decode: `unknown_prekey` when the vault does not hold it,
+ * Decrypt with the referenced prekey (published, or a peer prekey offered to `packet.from`), unpad and decode:
+ * `unknown_prekey` when the vault does not hold it for this sender,
  * `decryption_failed` on AEAD/KEM failure, `invalid_body` on bad padding or content.
  */
 export async function decryptPacket(packet: Packet, vault: PrekeyVault): Promise<PrivateContent> {
-  const secret = await vault.open(packet.encryption.prekey); // Task 8: pass packet.from (peer prekeys)
+  const secret = await vault.open(packet.encryption.prekey, packet.from);
   if (secret === null) throw new ACEError('unknown_prekey', 'the referenced prekey is unknown or deleted');
   const { kem, payload } = encryptionBytes(packet);
   const ss = secret.decapsulate(kem);

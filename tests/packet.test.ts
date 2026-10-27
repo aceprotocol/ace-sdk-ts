@@ -10,6 +10,8 @@ import { openPacket, somePrekey } from './helpers2.js';
 
 const text = new ProfileSet(['text']);
 const PEER_PREKEY = somePrekey();
+/** The packet sender `open` is asked for (peer prekeys are looked up under it). */
+const SENDER = `ace:sha256:${'a'.repeat(64)}`;
 const content = (message: string): PrivateContent => ({ type: 'ace:text:1', schemaDigest: text.digestOf('ace:text:1')!, body: { message }, prekey: PEER_PREKEY });
 const code = (fn: () => unknown): string | null => {
   try { fn(); } catch (e) { return (e as { code?: string }).code ?? String(e); }
@@ -150,15 +152,15 @@ describe('PrekeyVault', () => {
     const first = await vault.rotate(NOW);
     const second = await vault.rotate(NOW + 10);
     expect((await vault.current())!.id).toBe(second.id);
-    expect(await vault.open(first.id)).not.toBeNull();
+    expect(await vault.open(first.id, SENDER)).not.toBeNull();
     expect(await vault.prune(NOW + 10 + OFFLINE_WINDOW_SECONDS - 1)).toBe(0);
     expect(await vault.prune(NOW + 10 + OFFLINE_WINDOW_SECONDS)).toBe(1);
-    expect(await vault.open(first.id)).toBeNull();
+    expect(await vault.open(first.id, SENDER)).toBeNull();
     const ids: string[] = [];
     for (let i = 0; i < 20; i++) ids.push((await vault.rotate(NOW + 100 + i)).id);
-    expect(await vault.open(ids[0])).toBeNull();
-    expect(await vault.open(ids[2])).toBeNull();
-    expect(await vault.open(ids[3])).not.toBeNull();
+    expect(await vault.open(ids[0], SENDER)).toBeNull();
+    expect(await vault.open(ids[2], SENDER)).toBeNull();
+    expect(await vault.open(ids[3], SENDER)).not.toBeNull();
   });
 
   it('persists through a store, optionally sealed', async () => {

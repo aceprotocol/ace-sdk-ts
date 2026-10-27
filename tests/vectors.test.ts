@@ -149,12 +149,18 @@ describe('vectors: X-Wing (draft-11)', () => {
   });
 });
 
-/** A vault holding only the vector prekey seed, through the vault's store document. */
-async function bobVault(): Promise<StorePrekeyVault> {
+/**
+ * A vault holding the vector prekey seed as its published current prekey and, per `peerSeeds` entry, that seed as the
+ * peer prekey offered to that peer (offeredAt = the vectors' now), through the vault's store document (`version: 2`).
+ */
+async function bobVault(peerSeeds: Record<string, string> = {}, clock: () => number = () => NOW, store = new MemoryStore()): Promise<StorePrekeyVault> {
   const d = V.packet.deterministic;
-  const store = new MemoryStore();
-  await store.write('prekeys.json', canonicalStateBytes({ version: 1, current: { id: d.prekey.id, seed: toBase64(hexToBytes(d.prekeySeed)), createdAt: 0 }, retained: [] }));
-  return new StorePrekeyVault(store, { clock: () => NOW });
+  const seed = (hex: string) => toBase64(hexToBytes(hex));
+  await store.write('prekeys.json', canonicalStateBytes({
+    version: 2, current: { id: d.prekey.id, seed: seed(d.prekeySeed), createdAt: 0 }, retained: [],
+    peers: Object.fromEntries(Object.entries(peerSeeds).map(([peer, s]) => [peer, { offered: { seed: seed(s), offeredAt: NOW }, inUse: null, held: null }])),
+  }));
+  return new StorePrekeyVault(store, { clock });
 }
 
 describe('vectors: packet', () => {
@@ -189,11 +195,10 @@ describe('vectors: packet', () => {
     const value = c.json !== undefined ? JSON.parse(c.json) : c.packet;
     expect(await codeOf(() => decodePacket(value))).toBe(c.error);
   });
-  // Task 8: cases with `peerSeeds` need a vault holding peer prekeys.
-  it.each(p.open.filter((c: Any) => c.peerSeeds === undefined).map((c: Any) => [c.name, c]))('open: %s', async (_n, c: Any) => {
-    expect(await codeOf(async () => openPacket(c.packet, { recipient: idOf(c.recipient), sender: stateOf(c.sender, c.now), vault: await bobVault(), now: c.now }))).toBe(c.error);
+  it.each(p.open.map((c: Any) => [c.name, c]))('open: %s', async (_n, c: Any) => {
+    const vault = await bobVault(c.peerSeeds, () => c.now);
+    expect(await codeOf(async () => openPacket(c.packet, { recipient: idOf(c.recipient), sender: stateOf(c.sender, c.now), vault, now: c.now }))).toBe(c.error);
   });
-  it.skip.each(p.open.filter((c: Any) => c.peerSeeds !== undefined).map((c: Any) => [c.name, c]))('open: %s', () => {});
   it.each(V.privateContent.cases.map((c: Any) => [c.name, c]))('private content: %s', async (_n, c: Any) => {
     const raw = c.text !== undefined ? enc.encode(c.text) : hexToBytes(c.hex);
     expect(await codeOf(() => decodePrivateContent(raw))).toBe(c.error);
@@ -372,9 +377,8 @@ describe('vectors: receive pipeline', () => {
   const names: Record<ReceiveOutcome['kind'], string> = {
     delivered: 'delivered', contact: 'delivered', duplicate: 'duplicate', dropped: 'drop', rejected: 'reject', receipt: 'delivered', deferred: 'retry',
   };
-  // Task 8: cases with `peerSeeds` need a vault holding peer prekeys.
-  it.skip.each(V.pipeline.cases.filter((c: Any) => c.peerSeeds !== undefined).map((c: Any) => [c.name, c]))('%s', () => {});
-  it.each(V.pipeline.cases.filter((c: Any) => c.peerSeeds === undefined).map((c: Any) => [c.name, c]))('%s', async (_n, c: Any) => {
+  /** Run the case's steps, checking each outcome; returns the receiver vault, its store and the final clock. */
+  const run = async (c: Any) => {
     let t = NOW;
     const clock = () => t;
     const me = SoftwareIdentity.fromExport(V.agents[c.receiver].export, NOW);
@@ -386,8 +390,10 @@ describe('vectors: receive pipeline', () => {
       await admission.update(idOf(name), () => ({ aceId: idOf(name), status: 'admitted', updatedAt: NOW }));
     }
     const receipts: ReceiptBody[] = [];
+    const vaultStore = new MemoryStore();
+    const vault = await bobVault(c.peerSeeds, clock, vaultStore);
     const inbox = await Inbox.open({
-      identity: me, store, vault: await bobVault(), profiles: new ProfileSet(['text', 'commerce']), peers, admission, clock,
+      identity: me, store, vault, profiles: new ProfileSet(['text', 'commerce']), peers, admission, clock,
       capacity: c.capacity, contact: () => c.contact, onMessage: () => {}, sendReceipt: async (_to, b) => { receipts.push(b); },
     });
     for (const step of c.steps) {
@@ -400,6 +406,29 @@ describe('vectors: receive pipeline', () => {
       expect(receipts.map((r) => r.outcome), label).toEqual(step.expect.receipt === null ? [] : [step.expect.receipt]);
     }
     await inbox.close();
+    return { vault, vaultStore, t };
+  };
+  it.each(V.pipeline.cases.map((c: Any) => [c.name, c]))('%s', async (_n, c: Any) => { await run(c); });
+  // Task 9: the Inbox records used() / hold() after step 6.
+  it.skip.each(V.pipeline.cases.filter((c: Any) => c.vaultAfter !== undefined).map((c: Any) => [c.name, c]))('vault after: %s', async (_n, c: Any) => {
+    const { vault, vaultStore, t } = await run(c);
+    {
+      const after = c.vaultAfter;
+      const other = Object.values<Any>(V.agents).map((a) => a.aceId).find((id) => id !== after.peer);
+      const doc = JSON.parse(new TextDecoder().decode((await vaultStore.read('prekeys.json'))!));
+      const peer = doc.peers[after.peer];
+      const idOfSeed = (s: string) => bytesToHex(sha256(ml_kem768_x25519.getPublicKey(fromBase64(s))));
+      expect(peer.inUse === null ? null : idOfSeed(peer.inUse.seed)).toBe(after.inUse);
+      if (peer.offered !== null) expect(idOfSeed(peer.offered.seed)).not.toBe(after.inUse);
+      expect(await vault.open(after.inUse, after.peer)).not.toBeNull();
+      expect(await vault.open(after.inUse, other)).toBeNull();
+      if (after.held !== undefined) { // the holder rule, under bob's pin for peer (its last KEL event digest)
+        const name = Object.keys(V.agents).find((n) => idOf(n) === after.peer)!;
+        const pin = verifyKel(c.admitted[name].kel, NOW).lastHash;
+        expect((await vault.held(after.peer, pin, t))?.publicKey).toBe(after.held.publicKey);
+        expect(peer.held.timestamp).toBe(after.held.timestamp);
+      }
+    }
   });
 });
 

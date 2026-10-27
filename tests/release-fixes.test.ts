@@ -121,7 +121,7 @@ describe('sdk-py review findings, checked here', () => {
     const [x, y] = await Promise.all([a.rotate(NOW + 1), b.rotate(NOW + 1)]);
     const cur = (await a.current())!.id;
     expect([x.id, y.id]).toContain(cur);
-    for (const id of [first.id, x.id, y.id]) expect(await a.open(id)).not.toBeNull();
+    for (const id of [first.id, x.id, y.id]) expect(await a.open(id, `ace:sha256:${'a'.repeat(64)}`)).not.toBeNull();
   });
 
   it('a delivered receipt that lands during an attempt is never overwritten by that attempt\'s outcome', async () => {
