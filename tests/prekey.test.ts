@@ -77,7 +77,7 @@ describe('PrekeyVault lifecycle', () => {
     await store.write('prekeys.json', enc.encode('{not json'));
     await expect(again.current()).rejects.toMatchObject({ code: 'storage_failed' });
     // a seed that does not derive its id
-    const doc = { version: 2, current: { id: 'a'.repeat(64), seed: btoa('x'.repeat(32)), createdAt: NOW }, retained: [], peers: {} };
+    const doc = { version: 1, current: { id: 'a'.repeat(64), seed: btoa('x'.repeat(32)), createdAt: NOW }, retained: [], peers: {} };
     await store.write('prekeys.json', enc.encode(JSON.stringify(doc)));
     await expect(again.open('a'.repeat(64), A)).rejects.toMatchObject({ code: 'storage_failed' });
   });
@@ -189,7 +189,7 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     expect(await v.current()).not.toBeNull();
   });
 
-  it('stores the version 2 document of 04 § Peer prekeys', async () => {
+  it('stores the version 1 document of 04 § Peer prekeys', async () => {
     const { store, v } = vaultAt();
     const k = await v.offer(A, NOW);
     await v.used(A, k.id);
@@ -198,7 +198,7 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     await v.hold(A, p, NOW + 2, PIN);
     const d = await docOf(store);
     expect(Object.keys(d).sort()).toEqual(['current', 'peers', 'retained', 'version']);
-    expect(d.version).toBe(2);
+    expect(d.version).toBe(1);
     expect(Object.keys(d.peers[A]).sort()).toEqual(['held', 'inUse', 'offered']);
     expect(Object.keys(d.peers[A].offered).sort()).toEqual(['offeredAt', 'seed']);
     expect(d.peers[A].offered.offeredAt).toBe(NOW + 1);
@@ -210,38 +210,22 @@ describe('PrekeyVault peer prekeys (04 § Peer prekeys)', () => {
     expect(await again.held(A, PIN, NOW)).toEqual(p);
   });
 
-  it('a version 1 document is read as version 2 with no peers', async () => {
-    const { t, store, v } = vaultAt();
-    const first = await v.rotate(NOW);
-    const second = await v.rotate(NOW + 10);
-    const doc = await docOf(store);
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: doc.current, retained: doc.retained })));
-    t.now = NOW + 20;
-    const again = new StorePrekeyVault(store, { clock: () => t.now });
-    expect((await again.current())?.id).toBe(second.id);
-    expect(await again.open(first.id, A)).not.toBeNull();
-    await again.offer(A, NOW + 20);
-    expect((await docOf(store)).version).toBe(2);
-  });
-
-  it('another version or a malformed document is storage_failed', async () => {
+  it('an unknown version or malformed document is storage_failed', async () => {
     const { store, v } = vaultAt();
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 3, current: null, retained: [], peers: {} })));
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [], peers: {} })));
     await expect(v.current()).rejects.toMatchObject({ code: 'storage_failed' });
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: null, retained: [], peers: {} })));
-    await expect(v.current()).rejects.toMatchObject({ code: 'storage_failed' });
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [] })));
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: null, retained: [] })));
     await expect(v.offer(A, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [], peers: { 'not-an-ace-id': { offered: null, inUse: null, held: null } } })));
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: null, retained: [], peers: { 'not-an-ace-id': { offered: null, inUse: null, held: null } } })));
     await expect(v.offer(A, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [], peers: { [A]: { offered: null, inUse: null, held: { publicKey: 'QQ==', timestamp: NOW, pin: PIN } } } })));
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: null, retained: [], peers: { [A]: { offered: null, inUse: null, held: { publicKey: 'QQ==', timestamp: NOW, pin: PIN } } } })));
     await expect(v.held(A, PIN, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
   });
 
   it('a held.publicKey of the wrong length is storage_failed', async () => {
     const { store, v } = vaultAt();
     const short = toBase64(new Uint8Array(1215).fill(1));
-    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 2, current: null, retained: [], peers: { [A]: { offered: null, inUse: null, held: { publicKey: short, timestamp: NOW, pin: PIN } } } })));
+    await store.write('prekeys.json', enc.encode(JSON.stringify({ version: 1, current: null, retained: [], peers: { [A]: { offered: null, inUse: null, held: { publicKey: short, timestamp: NOW, pin: PIN } } } })));
     await expect(v.held(A, PIN, NOW)).rejects.toMatchObject({ code: 'storage_failed' });
     await expect(v.current()).rejects.toMatchObject({ code: 'storage_failed' });
   });

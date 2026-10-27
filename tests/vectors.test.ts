@@ -152,13 +152,13 @@ describe('vectors: X-Wing (draft-11)', () => {
 
 /**
  * A vault holding the vector prekey seed as its published current prekey and, per `peerSeeds` entry, that seed as the
- * peer prekey offered to that peer (offeredAt = the vectors' now), through the vault's store document (`version: 2`).
+ * peer prekey offered to that peer (offeredAt = the vectors' now), through the vault's store document (`version: 1`).
  */
 async function bobVault(peerSeeds: Record<string, string> = {}, clock: () => number = () => NOW, store = new MemoryStore()): Promise<StorePrekeyVault> {
   const d = V.packet.deterministic;
   const seed = (hex: string) => toBase64(hexToBytes(hex));
   await store.write('prekeys.json', canonicalStateBytes({
-    version: 2, current: { id: d.prekey.id, seed: seed(d.prekeySeed), createdAt: 0 }, retained: [],
+    version: 1, current: { id: d.prekey.id, seed: seed(d.prekeySeed), createdAt: 0 }, retained: [],
     peers: Object.fromEntries(Object.entries(peerSeeds).map(([peer, s]) => [peer, { offered: { seed: seed(s), offeredAt: NOW }, inUse: null, held: null }])),
   }));
   return new StorePrekeyVault(store, { clock });
