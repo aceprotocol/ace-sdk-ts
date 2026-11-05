@@ -113,7 +113,7 @@ describe('vectors: KEL', () => {
   it('valid logs', () => {
     for (const c of k.valid) {
       const st = verifyKel(kelOf(c.agent).slice(0, c.events ?? undefined), c.now);
-      expect([st.aceId, st.seq, st.lastHash, st.rootScheme, st.next]).toEqual([c.aceId, c.seq, c.lastHash, c.rootScheme, c.next]);
+      expect([st.aceId, st.seq, st.lastHash, st.rootScheme, st.next, st.fallback]).toEqual([c.aceId, c.seq, c.lastHash, c.rootScheme, c.next, c.fallback]);
       expect(st.signing === null ? null : { seq: st.signing.seq, notAfter: st.signing.notAfter }).toEqual(c.signing);
       expect(isUsable(st, c.now)).toBe(c.usable);
     }
@@ -128,7 +128,7 @@ describe('vectors: KEL', () => {
       if (c.error) expect(await codeOf(() => extendKel(pinned, c.candidate, c.now)), c.name).toBe(c.error);
       else {
         const r = extendKel(pinned, c.candidate, c.now);
-        expect([r.outcome, r.state.seq], c.name).toEqual([c.outcome, c.seq]);
+        expect([r.outcome, r.state.seq, r.state.next, r.state.fallback], c.name).toEqual([c.outcome, c.seq, c.next, c.fallback]);
       }
     }
     for (const c of k.operational) {

@@ -12,7 +12,7 @@ export { isMessageType } from './types.js';
 
 export { SoftwareKey, generateSoftwareKey, keyDigest, type KeyProvider } from './keys.js';
 export {
-  verifyKel, extendKel, verifyOperationalSignature, eventHashes,
+  verifyKel, extendKel, verifyOperationalSignature, eventHashes, isPrimaryRotation, reclaimPoint,
   type KelState, type Signer, type KelEvent, type DelegatedKey, type ExtendOutcome, type OperationalSignature,
 } from './kel.js';
 export { SoftwareIdentity, type ACEIdentity, type SoftwareIdentityExport } from './identity.js';

@@ -14,6 +14,8 @@ export type ExtendOutcome = 'adopted' | 'unchanged' | 'extended' | 'recovered';
 export interface DelegatedKey { scheme: SigningScheme; publicKey: Uint8Array; seq: number; delegatedAt: number; notAfter: number | null }
 export interface KelState {
   aceId: string; seq: number; lastHash: string; rootScheme: SigningScheme; rootPublicKey: Uint8Array; next: string;
+  /** The committed fallback root's digest, or null (01 § Rotation and recovery). */
+  fallback: string | null;
   signing: DelegatedKey | null; events: readonly KelEvent[];
 }
 /** What an operational-signature verifier reads of a verified KEL state: the identity and its current delegation. */
@@ -41,24 +43,26 @@ export function eventBytes(event: unknown): Uint8Array {
   if (!isObj(event) || typeof event.t !== 'string' || !Object.hasOwn(KEYS, event.t)) throw bad('event must be icp, rot or dlg');
   const t = event.t;
   const required = KEYS[t];
-  const allowed = new Set([...required, 'sig', ...(t === 'dlg' ? ['notAfter'] : [])]);
+  const allowed = new Set([...required, 'sig', t === 'dlg' ? 'notAfter' : 'fallback']);
   const present = Object.keys(event);
   if (!required.every((k) => Object.hasOwn(event, k)) || !present.every((k) => allowed.has(k))) throw bad(`${t} has unknown or missing members`);
   const seq = wireInt(event.seq), ts = wireInt(event.ts);
   if (seq === null || ts === null) throw bad('seq and ts must be wire integers');
-  if (t === 'icp') {
+  const prev = t === 'icp' ? [] : [hex64(event.prev, 'prev')];
+  if (t !== 'dlg') {
     const { scheme, pk } = keyOf(event.root, 'root');
-    return encodePayload('icp', decimal(seq), decimal(ts), scheme, pk, hexToBytes(hex64(event.next, 'next')));
-  }
-  const prev = hex64(event.prev, 'prev');
-  if (t === 'rot') {
-    const { scheme, pk } = keyOf(event.root, 'root');
-    return encodePayload('rot', decimal(seq), decimal(ts), prev, scheme, pk, hexToBytes(hex64(event.next, 'next')));
+    const commits = [hexToBytes(hex64(event.next, 'next'))];
+    if (Object.hasOwn(event, 'fallback')) {
+      const fallback = hex64(event.fallback, 'fallback');
+      if (fallback === event.next) throw bad('fallback must differ from next');
+      commits.push(hexToBytes(fallback));
+    }
+    return encodePayload(t, decimal(seq), decimal(ts), ...prev, scheme, pk, ...commits);
   }
   const { scheme, pk } = keyOf(event.key, 'key');
   let na = '';
   if (Object.hasOwn(event, 'notAfter')) { const n = wireInt(event.notAfter); if (n === null) throw bad('notAfter must be a wire integer'); na = decimal(n); }
-  return encodePayload('dlg', decimal(seq), decimal(ts), prev, scheme, pk, na);
+  return encodePayload('dlg', decimal(seq), decimal(ts), ...prev, scheme, pk, na);
 }
 
 /** The hash of a log's last event: `KelState.lastHash` of that log, without verifying it. */
@@ -80,17 +84,26 @@ function checkSig(s: unknown, aceId: string, ts: number, eb: Uint8Array, scheme:
   if (!verifySignature(signingMessage(aceId, ts, null, eb), 'kel', raw, pk)) throw new ACEError('invalid_signature', `${who} signature does not verify`);
 }
 
-export async function createInception(root: KeyProvider, nextDigest: Uint8Array, ts: number): Promise<KelEvent> {
+/** `icp` committing `nextDigest` and, optionally, `fallbackDigest`. */
+export async function createInception(root: KeyProvider, nextDigest: Uint8Array, ts: number, fallbackDigest: Uint8Array | null = null): Promise<KelEvent> {
   const ev: KelEvent = { t: 'icp', seq: 0, ts, root: { scheme: root.scheme, publicKey: toBase64(root.publicKey()) }, next: bytesToHex(nextDigest) };
+  if (fallbackDigest !== null) ev.fallback = bytesToHex(fallbackDigest);
   const eb = eventBytes(ev);
   ev.sig = await sig(root, computeACEId(eb), ts, eb);
   return ev;
 }
 
-/** `rot` revealing the committed `newRoot`, signed by it alone (pre-rotation). */
-export async function createRotation(state: KelState, newRoot: KeyProvider, nextDigest: Uint8Array, ts: number): Promise<KelEvent> {
-  if (keyDigestHex(newRoot.scheme, newRoot.publicKey()) !== state.next) throw bad('new root does not match the committed next digest');
+/**
+ * `rot` revealing the committed next or fallback `newRoot`, signed by it alone (pre-rotation), committing `nextDigest`
+ * and `fallbackDigest`. A commitment it does not reveal is kept only when passed again (`state.next`, `state.fallback`).
+ */
+export async function createRotation(
+  state: KelState, newRoot: KeyProvider, nextDigest: Uint8Array, ts: number, fallbackDigest: Uint8Array | null = null,
+): Promise<KelEvent> {
+  const d = keyDigestHex(newRoot.scheme, newRoot.publicKey());
+  if (d !== state.next && d !== state.fallback) throw bad('new root does not match a committed digest');
   const ev: KelEvent = { t: 'rot', seq: state.seq + 1, ts, prev: state.lastHash, root: { scheme: newRoot.scheme, publicKey: toBase64(newRoot.publicKey()) }, next: bytesToHex(nextDigest) };
+  if (fallbackDigest !== null) ev.fallback = bytesToHex(fallbackDigest);
   const eb = eventBytes(ev);
   ev.sig = await sig(newRoot, state.aceId, ts, eb);
   return ev;
@@ -98,12 +111,13 @@ export async function createRotation(state: KelState, newRoot: KeyProvider, next
 
 /**
  * `dlg` delegating an `ml-dsa-65` signing key (the only delegated role). The signer refuses a key equal to the current
- * root or committed as the next root (01 § Rotation and recovery): a verifier cannot detect that reuse.
+ * root or committed as the next or fallback root (01 § Rotation and recovery): a verifier cannot detect that reuse.
  */
 export async function createDelegation(state: KelState, root: KeyProvider, keyPublic: Uint8Array, ts: number, notAfter?: number): Promise<KelEvent> {
   if (notAfter !== undefined && !(ts < notAfter && notAfter <= ts + MAX_SIGNING_KEY_LIFETIME)) throw bad('notAfter must be in (ts, ts + 31622400]');
-  if (bytesEqual(keyPublic, state.rootPublicKey) || keyDigestHex('ml-dsa-65', keyPublic) === state.next) {
-    throw new ACEError('invalid_argument', 'the signing key must differ from the current and the next root');
+  const d = keyDigestHex('ml-dsa-65', keyPublic);
+  if (bytesEqual(keyPublic, state.rootPublicKey) || d === state.next || d === state.fallback) {
+    throw new ACEError('invalid_argument', 'the signing key must differ from the current and the committed roots');
   }
   const ev: KelEvent = { t: 'dlg', seq: state.seq + 1, ts, prev: state.lastHash, key: { scheme: 'ml-dsa-65', publicKey: toBase64(keyPublic) } };
   if (notAfter !== undefined) ev.notAfter = notAfter;
@@ -206,21 +220,23 @@ function verifyKelUncached(events: unknown, now: number, resume?: KelState): Kel
   if (!isValidSigningPublicKey(r0.scheme, r0.pk)) throw bad('root key must be an ml-dsa-65 key');
   let state: KelState = resume !== undefined
     ? structuredClone(resume)
-    : { aceId, seq: 0, lastHash: sha256Hex(eb0), rootScheme: 'ml-dsa-65', rootPublicKey: r0.pk, next: events[0].next as string, signing: null, events: [] };
+    : { aceId, seq: 0, lastHash: sha256Hex(eb0), rootScheme: 'ml-dsa-65', rootPublicKey: r0.pk, next: events[0].next as string,
+      fallback: (events[0].fallback as string | undefined) ?? null, signing: null, events: [] };
   const owned = state.events as KelEvent[];   // the state owns its events (a fresh copy when resumed)
   for (let i = owned.length; i < events.length; i++) {
     const ev = events[i] as KelEvent;
     const eb = bytes[i];
     const ts = wireInt(ev.ts)!;
-    let { signing, rootScheme, rootPublicKey, next } = state;
+    let { signing, rootScheme, rootPublicKey, next, fallback } = state;
     if (ev.t === 'icp') {
       checkSig(ev.sig, aceId, ts, eb, rootScheme, rootPublicKey, 'icp');
     } else if (ev.t === 'rot') {
       const r = keyOf(ev.root, 'root');
       if (!isValidSigningPublicKey(r.scheme, r.pk)) throw bad(`event ${i}: root key must be an ml-dsa-65 key`);
-      if (keyDigestHex(r.scheme, r.pk) !== state.next) throw bad(`event ${i}: revealed root does not match commitment`);
+      const d = keyDigestHex(r.scheme, r.pk);
+      if (d !== state.next && d !== state.fallback) throw bad(`event ${i}: revealed root does not match a commitment`);
       checkSig(ev.sig, aceId, ts, eb, r.scheme, r.pk, 'rot');   // the revealed root alone
-      rootPublicKey = r.pk; next = ev.next as string; signing = null;
+      rootPublicKey = r.pk; next = ev.next as string; fallback = (ev.fallback as string | undefined) ?? null; signing = null;
     } else {
       checkSig(ev.sig, aceId, ts, eb, state.rootScheme, state.rootPublicKey, 'dlg');
       const k = keyOf(ev.key, 'key');
@@ -230,7 +246,7 @@ function verifyKelUncached(events: unknown, now: number, resume?: KelState): Kel
       signing = { scheme: 'ml-dsa-65', publicKey: k.pk, seq: i, delegatedAt: ts, notAfter: na };
     }
     owned.push(structuredClone(ev));
-    state = { aceId, seq: i, lastHash: sha256Hex(eb), rootScheme, rootPublicKey, next, signing, events: owned };
+    state = { aceId, seq: i, lastHash: sha256Hex(eb), rootScheme, rootPublicKey, next, fallback, signing, events: owned };
   }
   return state;
 }
@@ -293,6 +309,43 @@ export function extendKel(pinned: KelState | null, events: unknown, now: number)
   return reconcileKel(pinned, verifyKel(events, now));
 }
 
+const rootDigest = (ev: KelEvent): string => { const r = keyOf(ev.root, 'root'); return keyDigestHex(r.scheme, r.pk); };
+
+/** The `next` committed before `events[k]`: by the last `icp` or `rot` before it. */
+function nextBefore(events: readonly KelEvent[], k: number): string {
+  let j = k - 1;
+  while (events[j].t === 'dlg') j--;
+  return events[j].next as string;
+}
+
+/** Whether `events[k]` of a verified log is a primary `rot`: it reveals the `next` committed before it. */
+export function isPrimaryRotation(events: readonly KelEvent[], k: number): boolean {
+  return k > 0 && events[k].t === 'rot' && rootDigest(events[k]) === nextBefore(events, k);
+}
+
+/** Whether no event of `events` from `k` on reveals the root committed as `digest`. */
+const unrevealedFrom = (events: readonly KelEvent[], k: number, digest: string): boolean =>
+  events.slice(k).every((e) => e.t === 'dlg' || rootDigest(e) !== digest);
+
+/**
+ * The reclaim point of a verified log (07 § Registration), or null: the first fallback `rot` whose preceding committed
+ * `next` no event from it on reveals, where a primary `rot` of that next root supersedes the log (01 rule 6).
+ */
+export function reclaimPoint(events: readonly KelEvent[]): number | null {
+  for (let k = 1; k < events.length; k++) {
+    if (events[k].t === 'rot' && !isPrimaryRotation(events, k) && unrevealedFrom(events, k, nextBefore(events, k))) return k;
+  }
+  return null;
+}
+
+/**
+ * 01 rule 6 reclaim at fork point `k` (both logs verified, equal before `k`): the candidate's `rot` reveals the `next`
+ * committed before `k`, the pinned event there is a (fallback) `rot`, and no pinned event from `k` on reveals that root.
+ */
+function reclaims(pinned: readonly KelEvent[], cand: readonly KelEvent[], k: number): boolean {
+  return pinned[k].t === 'rot' && isPrimaryRotation(cand, k) && unrevealedFrom(pinned, k, nextBefore(cand, k));
+}
+
 /** `extendKel` over a candidate state that `verifyKel` produced. */
 export function reconcileKel(pinned: KelState | null, cand: KelState): { state: KelState; outcome: ExtendOutcome } {
   if (pinned === null) return { state: cand, outcome: 'adopted' };
@@ -302,9 +355,11 @@ export function reconcileKel(pinned: KelState | null, cand: KelState): { state: 
   const ch = eventHashes(cand);
   for (let k = 0; k < Math.min(ph.length, ch.length); k++) {
     if (ph[k] !== ch[k]) {
-      // a rot supersedes the pinned events from the fork point only when none of them is a rot:
-      // otherwise a holder of a revealed root could re-reveal it (01 rule 6)
-      if (cand.events[k].t === 'rot' && pinned.events.slice(k).every((e) => e.t !== 'rot')) return { state: cand, outcome: 'recovered' };
+      // a rot supersedes the pinned events from the fork point when none of them is a rot (otherwise a holder of a
+      // revealed root could re-reveal it), or when the next root reclaims the identity from a fallback rot (01 rule 6)
+      if ((cand.events[k].t === 'rot' && pinned.events.slice(k).every((e) => e.t !== 'rot')) || reclaims(pinned.events, cand.events, k)) {
+        return { state: cand, outcome: 'recovered' };
+      }
       throw new ACEError('kel_conflict', `conflicting event at seq ${k}`);
     }
   }

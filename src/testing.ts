@@ -11,6 +11,9 @@ import { decodePacket } from './packet.js';
 import { verifyRegistrationRequest } from './registration.js';
 import { compareStreamIds, RelayClient } from './relay.js';
 
+/** KEL event builders, for tests that need a log the identities here never write (e.g. a fallback root, 01). */
+export { createDelegation, createInception, createRotation } from './kel.js';
+
 export const RELAY = 'https://relay.test';
 
 class HTTPError extends Error {

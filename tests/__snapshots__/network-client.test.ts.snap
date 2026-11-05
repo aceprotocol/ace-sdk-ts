@@ -118,6 +118,7 @@ exports[`public surface > the package entry points export exactly these names 1`
     "isMessageId",
     "isMessageType",
     "isOutcomeCode",
+    "isPrimaryRotation",
     "isThreadId",
     "keyDigest",
     "lockTimeoutError",
@@ -132,6 +133,7 @@ exports[`public surface > the package entry points export exactly these names 1`
     "publicHttpsFetch",
     "publicRelay",
     "receiptContent",
+    "reclaimPoint",
     "sha256Hex",
     "signingMessage",
     "toBase64",
@@ -155,6 +157,9 @@ exports[`public surface > the package entry points export exactly these names 1`
   "testing": [
     "FakeRelay",
     "RELAY",
+    "createDelegation",
+    "createInception",
+    "createRotation",
   ],
   "tools": [
     "AGENT_TOOLS",
