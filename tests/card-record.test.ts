@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   MemoryStore, NetworkClient, canonicalStateBytes, contactContent, createCardRecord, createPacket, verifyCardBundle, isCaip10Account, MAX_CARD_RECORD_BYTES,
-  createDescriptor, sha256Hex, type CardBundle,
+  createDescriptor, sha256Hex, type CardBundle, SoftwareIdentity, createDelegation, createInception, generateSoftwareKey, keyDigest, toBase64,
+  verifyKel,
 } from './sdk.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import { Clock, FakeRelay, NOW, RELAY, agent, identity, withPrekey } from './helpers.js';
 
 const code = (c: string) => expect.objectContaining({ code: c });
@@ -504,5 +506,25 @@ describe('card pins', () => {
         await expect(bob.client.lookupCard(A)).rejects.toMatchObject({ code: 'storage_failed' });
       }
     } finally { await alice.client.close(); await bob.client.close(); }
+  });
+});
+
+describe('fallback bindings (07 § Registration)', () => {
+  it('finds the log a fallback commitment is bound to, verified to commit it', async () => {
+    const clock = new Clock();
+    const relay = new FakeRelay(clock.now);
+    const [root, next, fb, signing] = [generateSoftwareKey(), generateSoftwareKey(), generateSoftwareKey(), generateSoftwareKey()];
+    const fbDigest = bytesToHex(keyDigest(fb.scheme, fb.publicKey()));
+    const icp = await createInception(root, keyDigest(next.scheme, next.publicKey()), clock.now(), keyDigest(fb.scheme, fb.publicKey()));
+    const kel = [icp, await createDelegation(verifyKel([icp], clock.now()), root, signing.publicKey(), clock.now())];
+    const id = SoftwareIdentity.fromExport({ rootSeed: toBase64(root.seed), signingSeed: toBase64(signing.seed), kel });
+    await relay.client().register(id);
+    const st = await relay.client().fallbackKel(fbDigest);
+    expect(st.aceId).toBe(id.getACEId());
+    await expect(relay.client().fallbackKel('ab'.repeat(32))).rejects.toThrow(code('unknown_peer'));
+    await expect(relay.client().fallbackKel('AB'.repeat(32))).rejects.toThrow(code('invalid_argument'));
+    // A relay serving a log that does not commit the digest is relay_protocol_error.
+    relay.fallbacks.set('cd'.repeat(32), id.getACEId());
+    await expect(relay.client().fallbackKel('cd'.repeat(32))).rejects.toThrow(code('relay_protocol_error'));
   });
 });

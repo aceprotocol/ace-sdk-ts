@@ -1,13 +1,13 @@
 /** Relay HTTP client for the minimal relay binding (opaque packets, descriptors, card records, blocks, inbox), with an SSE parser over `fetch`. */
 
 import { ACEError, categoryOf, type ACEErrorCode } from './errors.js';
-import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isHandle, isObj, isStreamId, nowOf, pairKey, parseJSONBytes, parseStateBytes, utf8, wireInt } from './encoding.js';
+import { canonicalStateBytes, checkJsonValue, closedKeys, isACEId, isHandle, isHex64, isObj, isStreamId, nowOf, pairKey, parseJSONBytes, parseStateBytes, utf8, wireInt } from './encoding.js';
 import { withLock, type ACEStore } from './store.js';
 import { createAuthHeaders, type AuthHeaders, type RelayAuthRequest } from './auth.js';
 import { verifyCardBundle, type CardBundle, type VerifiedCard } from './card-record.js';
 import { TAG_RE, verifyPublishedAgent, type DeliveryPermit, type PublishedAgent } from './descriptor.js';
 import type { ACEIdentity } from './identity.js';
-import { atLogTail } from './kel.js';
+import { atLogTail, verifyKel, type KelState } from './kel.js';
 import { MAX_INBOX_PAGE, MAX_JSON_DEPTH, MAX_PACKET_BYTES, MAX_PAGE_BYTES } from './limits.js';
 import type { Packet } from './packet.js';
 import { readLimited } from './pinned-https.js';
@@ -333,6 +333,21 @@ export class RelayClient {
     const card = this.#card(await this.#request('GET', this.#url(`/v1/handles/${handle}`)));
     if (card.record.home !== this.baseUrl || card.record.handle !== handle) throw new ACEError('unknown_peer', 'the record does not hold this handle at this relay');
     return card;
+  }
+
+  /**
+   * `GET /v1/fallbacks/{digest}`: the registered log of the identity the fallback commitment `digest` (64 lowercase hex)
+   * is bound to at this relay (07 § Registration), verified, and required to commit `digest` as a `fallback`.
+   */
+  async fallbackKel(digest: string): Promise<KelState> {
+    if (!isHex64(digest)) throw new ACEError('invalid_argument', 'digest must be 64 lowercase hex');
+    const res = await this.#request('GET', this.#url(`/v1/fallbacks/${digest}`));
+    const state = this.#verified(res, (v) => {
+      if (!closedKeys(v, ['kel'])) throw new ACEError('relay_protocol_error', 'expected {kel}');
+      return verifyKel(v.kel, nowOf(this.#clock));
+    }, (st) => st.aceId, 'log');
+    if (!state.events.some((e) => e.fallback === digest)) throw protocolError('the log does not commit this fallback');
+    return state;
   }
 
   /**

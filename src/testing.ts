@@ -36,6 +36,8 @@ export class FakeRelay {
   cards = new Map<string, CardBundle>();
   /** Handle bindings (permanent, set once per identity). */
   handles = new Map<string, string>();
+  /** Fallback bindings: digest → the first identity whose registered log committed it (permanent). */
+  fallbacks = new Map<string, string>();
   blocks = new Map<string, { blocked: boolean; revision: number }>();
   wakes = new Map<string, { gateway: string; token: string }>();
   queues = new Map<string, Entry[]>();
@@ -130,6 +132,7 @@ export class FakeRelay {
     if (method === 'POST' && path === '/v1/register') {
       const { state } = verifyRegistrationRequest(body, { audience: this.baseUrl, clock: this.clock });
       this.kels.set(state.aceId, state);
+      for (const e of state.events) if (typeof e.fallback === 'string' && !this.fallbacks.has(e.fallback)) this.fallbacks.set(e.fallback, state.aceId);
       this.registrations++;
       return { ok: true, status: 'registered' };
     }
@@ -185,6 +188,13 @@ export class FakeRelay {
       const c = owner !== undefined && this.kels.has(owner) ? this.cards.get(owner) : undefined;
       if (!c || c.card.home !== this.baseUrl) throw new HTTPError(404, 'unknown_peer');
       return c;
+    }
+    m = /^\/v1\/fallbacks\/(.+)$/.exec(path);
+    if (method === 'GET' && m) {
+      const owner = this.fallbacks.get(m[1]);
+      const st = owner === undefined ? undefined : this.kels.get(owner);
+      if (!st) throw new HTTPError(404, 'unknown_peer');
+      return { kel: st.events };
     }
     if (method === 'GET' && path === '/v1/cards') {
       // Listed records naming this relay as home whose descriptor is unexpired, by ACE ID; `profile` reads the descriptor.
