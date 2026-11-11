@@ -1,4 +1,4 @@
-// Host-facing knobs used by the hosted MCP: transport address, delegation credentials in ext, the presented permit, public fetch.
+// Host-facing knobs used by an MCP host: transport address, delegation credentials in ext, the presented permit, public fetch.
 import { describe, expect, it } from 'vitest';
 import { DELEGATION_PROFILE_ID, RelayClient, createDelegationCredential, publicHttpsFetch } from './sdk.js';
 import { Clock, FakeRelay, RELAY, agent } from './helpers.js';

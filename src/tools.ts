@@ -1,6 +1,6 @@
 /**
  * The agent tool table (`@ace-protocol/sdk/tools`): one vocabulary for every MCP surface over a `NetworkClient` (the
- * hosted service adds its own hosted-only tools, a local endpoint serves these as they are). Inputs are JSON Schema
+ * remote host may add its own tools, a local endpoint serves these as they are). Inputs are JSON Schema
  * objects; `run` validates its arguments against them. No MCP SDK or schema library is involved: hosts adapt each
  * entry to their server and check `requiredScope` before calling `run`.
  *
