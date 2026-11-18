@@ -20,5 +20,16 @@
         ]
       }
     ]
+  },
+  "extraKnownMarketplaces": {
+    "matrix": {
+      "source": {
+        "source": "github",
+        "repo": "TigerPassNet/matrix-guard"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "matrix-guard@matrix": true
   }
 }
